@@ -383,6 +383,21 @@ git pull
 | Dashboard `tidak tersedia` di saldo | key belum di-export di sesi dashboard |
 | Bot berhenti saat HP sleep | `termux-wake-lock` + matikan battery optimization |
 
+## Arsitektur data: sinyal dari OKX, eksekusi di Binance
+
+- **OKX perpetual (public API, tanpa key)** — satu-satunya sumber data sinyal:
+  klines, live price, 24h volume, order book, funding rate, open interest,
+  long/short ratio retail & top-trader, taker flow, data likuidasi.
+  Tidak ada fallback provider: kalau OKX unreachable, engine fail-closed
+  (tidak ada sinyal), tidak pernah trading dari tape venue lain.
+- **Binance Futures (API key)** — khusus eksekusi: balance, posisi, order,
+  TP/SL algo, leverage, margin mode. Tidak dipakai untuk data sinyal.
+
+Konsekuensi: threshold veto derivatif (funding extreme, whale divergence,
+dsb) yang semula dikalibrasi dari data Binance/Gate kini membaca data OKX —
+semantiknya ekuivalen (ratio, funding, OI) tapi angkanya bisa sedikit beda;
+re-kalibrasi berkala disarankan.
+
 ## Setup & usage (developer)
 
 ```bash
@@ -600,7 +615,7 @@ jalan 24/7 di Termux.
 
 ### Pre-deploy checklist (from the quant-trading skill)
 
-- [ ] Full test suite green (`pytest tests/ -q`) — currently 225 passed.
+- [ ] Full test suite green (`pytest tests/ -q`) — currently 233 passed.
 - [ ] Paper-mode smoke run completed with no errors.
 - [ ] Testnet key created by the user; `--testnet --once` places/cancels cleanly.
 - [ ] Kill switch verified on testnet (force a >3% day or lower the cap temporarily).
