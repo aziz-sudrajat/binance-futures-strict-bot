@@ -165,8 +165,10 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
             blocks.append((code, kind, reason))
 
     # V15 — BTC circuit breaker (GAS: deepCheckBtcBreadth_ L3634).
-    # The breaker guards LONG exposure only (GAS comment L3655-3656).
-    # Runs on real historical klines in backtest — never skipped.
+    # Guards the traded direction: a BTC dump kills new LONGs, a vertical
+    # BTC pump kills new SHORTs (shorting alts into a BTC squeeze is the
+    # mirrored hostile regime). Runs on real historical klines in backtest —
+    # never skipped.
     try:
         chg = btc_1h_change_pct(market)
     except Exception as e:  # noqa: BLE001 - unevaluable breaker -> hold
@@ -177,6 +179,10 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
             _block("btc_breaker", "veto",
                            f"BTC dump {chg:.2f}%/1h <= -{config.BTC_DUMP_VETO_PCT:g}% "
                            f"— circuit breaker, LONG held")
+        elif direction == "BEARISH" and chg >= config.BTC_DUMP_VETO_PCT:
+            _block("btc_breaker", "veto",
+                           f"BTC pump +{chg:.2f}%/1h >= +{config.BTC_DUMP_VETO_PCT:g}% "
+                           f"— circuit breaker, SHORT held")
 
     if skip_deriv_vetoes:
         return blocks  # V9-V12, V13 skipped: no historical feed (documented)
