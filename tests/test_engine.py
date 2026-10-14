@@ -191,6 +191,28 @@ def test_mtf_cascade_check():
 
 
 # ---------------------------------------------------------- STRICT pipeline
+def _inject_pattern(candles: list, bullish: bool) -> None:
+    """Rewrite the last candle as a hammer (bullish) or shooting star
+    (bearish) so the ketat pattern review passes on synthetic data."""
+    c = candles[-1]
+    o, cl = float(c["open"]), float(c["close"])
+    mid = (o + cl) / 2
+    body = abs(cl - o) * 0.2 + mid * 0.0005  # small body
+    if bullish:
+        # hammer: small body at top, long lower wick
+        c["close"] = mid + body / 2
+        c["open"] = mid - body / 2
+        c["high"] = mid + body
+        c["low"] = mid - body * 6
+    else:
+        # shooting star: small body at bottom, long upper wick
+        c["close"] = mid - body / 2
+        c["open"] = mid + body / 2
+        c["high"] = mid + body * 6
+        c["low"] = mid - body
+    c["volume"] = float(c.get("volume", 1000.0))
+
+
 class FakeMarket:
     """Duck-typed stand-in for data.MarketData."""
 
@@ -205,11 +227,18 @@ class FakeMarket:
 
     def __init__(self, bullish=True):
         gen = bull_candles if bullish else bear_candles
-        self.klines = {tf: gen() for tf in ("15m", "30m", "4h", "1d")}
-        # BTC 1h for the circuit breaker: last two closes flat (0%/1h).
-        self.btc_1h = candles_from_closes([100.0] * 10)
+        self.klines = {tf: gen() for tf in ("15m", "30m", "4h", "1d", "1h")}
+        # Inject a supporting candlestick pattern into the last 15m candle
+        # so the ketat pattern review passes on synthetic data.
+        _inject_pattern(self.klines["15m"], bullish)
+        # BTC 1h override for the circuit breaker (None = use bullish 1h).
+        # Tests set this explicitly to simulate a BTC dump.
+        self.btc_1h = None
         self.adv = dict(self.BENIGN_ADV)
         self.raise_adv = False
+        # News feed: benign (no headlines) by default.
+        self.news_ok = True
+        self.news_items = []
         # Benign book: small sizes, nothing near the $250k wall threshold.
         px = self.klines["15m"][-1]["close"]
         self.book = {
@@ -222,9 +251,15 @@ class FakeMarket:
         self.raise_live_price = False  # simulate ticker failure
 
     def get_klines(self, symbol, interval, limit=220):
-        if symbol == "BTCUSDT" and interval == "1h":
+        if symbol == "BTCUSDT" and interval == "1h" and self.btc_1h is not None:
             return self.btc_1h
         return self.klines[interval]
+
+    def news_feed_ok(self):
+        return self.news_ok
+
+    def get_coin_news(self, symbol, hours=24):
+        return list(self.news_items)
 
     def get_advanced_derivatives(self, symbol, period="4h"):
         if self.raise_adv:
@@ -262,7 +297,7 @@ def test_evaluate_symbol_strict_pass():
                 "tp1", "tp2", "tp3", "strength", "rsi", "regime"):
         assert key in signal, key
     assert signal["stop_loss"] < signal["entry"] < signal["tp1"]
-    assert "STRICT PASS" in note
+    assert "KETAT PASS" in note
 
 
 def test_evaluate_symbol_bearish_rejected():
@@ -348,11 +383,11 @@ def test_volume_unavailable_rejected():
 
 
 def test_mtf_exception_rejected():
-    # T13: a 1d fetch blowing up rejects the symbol — never skip-and-pass.
+    # T13: a 1h fetch blowing up rejects the symbol — never skip-and-pass.
     m = FakeMarket(bullish=True)
 
     def klines(symbol, interval, limit=220):
-        if interval == "1d":
+        if interval == "1h":
             raise RuntimeError("provider timeout")
         return m.klines[interval]
 
@@ -505,6 +540,190 @@ def test_mtf_1d_delta_soft_scoring():
 
 
 def test_biasa_preset_relaxes_1d_leg():
+    # User spec 2026-10-15: MTF is 4h/1h/30m/15m — no 1d leg in any mode.
     assert config.SIGNAL_MODE_PRESETS["ketat"]["mtf_require_1d"] is True
-    assert config.SIGNAL_MODE_PRESETS["sedang"]["mtf_require_1d"] is True
+    assert config.SIGNAL_MODE_PRESETS["sedang"]["mtf_require_1d"] is False
     assert config.SIGNAL_MODE_PRESETS["biasa"]["mtf_require_1d"] is False
+    assert config.SIGNAL_MODE_PRESETS["sedang"]["mtf_require_1h"] is True
+    assert config.SIGNAL_MODE_PRESETS["ketat"]["mtf_require_1h"] is True
+    assert config.SIGNAL_MODE_PRESETS["biasa"]["mtf_require_1h"] is False
+
+
+# ------------------------------------------------- mode layers (2026-10-15)
+@pytest.fixture
+def _mode(monkeypatch):
+    def _set(mode):
+        monkeypatch.setattr(config, "SIGNAL_MODE", mode)
+        # apply the preset knobs so the engine sees a coherent bundle
+        bundle = dict(config.SIGNAL_MODE_PRESETS[mode])
+        for k, v in bundle.items():
+            attr = {"bullish_only": "BULLISH_ONLY",
+                    "mtf_require_1d": "MTF_REQUIRE_1D",
+                    "mtf_require_1h": "MTF_REQUIRE_1H",
+                    "btc_align_required": "BTC_ALIGN_REQUIRED",
+                    "pattern_required": "PATTERN_REQUIRED",
+                    "news_check": "NEWS_CHECK",
+                    "liq_review": "LIQ_REVIEW",
+                    "whale_review": "WHALE_REVIEW"}.get(k)
+            if attr:
+                monkeypatch.setattr(config, attr, v)
+        monkeypatch.setattr(config, "MIN_QUALITY_SCORE",
+                            bundle["min_quality_score"])
+    return _set
+
+
+def test_biasa_mode_15m_only(_mode):
+    # biasa: 15m setup alone passes — no MTF/BTC/pattern/news needed.
+    _mode("biasa")
+    m = FakeMarket(bullish=True)
+    # break everything above 15m: flat 1h/4h, no pattern, no news feed
+    m.klines["1h"] = candles_from_closes([100.0] * 220)
+    m.klines["4h"] = candles_from_closes([100.0] * 220)
+    m.klines["15m"] = bull_candles()  # no injected pattern
+    signal, note = evaluate_symbol("ETHUSDT", m)
+    assert signal is not None, note
+    assert "BIASA PASS" in note
+    assert signal["direction"] == "LONG"
+
+
+def test_biasa_mode_bearish_short(_mode):
+    _mode("biasa")
+    m = FakeMarket(bullish=False)
+    signal, note = evaluate_symbol("ETHUSDT", m)
+    assert signal is not None, note
+    assert signal["direction"] == "SHORT"
+
+
+def test_sedang_rejects_mtf_misalignment(_mode):
+    _mode("sedang")
+    m = FakeMarket(bullish=True)
+    m.klines["1h"] = candles_from_closes([100.0] * 220)  # flat -> neutral
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert "MTF tak selaras" in reason
+
+
+def test_sedang_rejects_btc_misalignment(_mode):
+    _mode("sedang")
+    m = FakeMarket(bullish=True)
+    # BTC bearish while coin is bullish
+    m.klines["15m"] = bull_candles()
+    orig = m.get_klines
+
+    def klines(symbol, interval, limit=220):
+        if symbol == "BTCUSDT" and interval == "15m":
+            return bear_candles()
+        return orig(symbol, interval, limit)
+    m.get_klines = klines
+    _inject_pattern(m.klines["15m"], True)
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert "arah BTC tak selaras" in reason
+
+
+def test_sedang_passes_when_aligned(_mode):
+    _mode("sedang")
+    m = FakeMarket(bullish=True)
+    signal, note = evaluate_symbol("ETHUSDT", m)
+    assert signal is not None, note
+    assert "SEDANG PASS" in note
+    assert "MTF selaras" in note and "BTC selaras" in note
+
+
+def test_ketat_rejects_no_pattern(_mode):
+    _mode("ketat")
+    m = FakeMarket(bullish=True)
+    m.klines["15m"] = bull_candles()  # no injected pattern
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert "pattern" in reason
+
+
+def test_ketat_rejects_bearish_news(_mode):
+    _mode("ketat")
+    m = FakeMarket(bullish=True)
+    m.news_items = [
+        {"title": "Ethereum hacked in major exploit, funds stolen",
+         "ts": 9999999999, "sentiment": -6},
+        {"title": "ETH crash as lawsuit filed against foundation",
+         "ts": 9999999999, "sentiment": -3},
+    ]
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert "news bearish" in reason
+
+
+def test_ketat_rejects_news_feed_down(_mode):
+    _mode("ketat")
+    m = FakeMarket(bullish=True)
+    m.news_ok = False
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert "news feed tak tersedia" in reason
+
+
+def test_ketat_rejects_liq_spike_against(_mode):
+    _mode("ketat")
+    m = FakeMarket(bullish=True)
+    m.adv["spike"] = 5.0
+    m.adv["long_liq_usd"] = 9_000_000.0
+    m.adv["short_liq_usd"] = 1_000_000.0
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert "likuidasi" in reason
+
+
+def test_ketat_rejects_whale_against(_mode):
+    _mode("ketat")
+    m = FakeMarket(bullish=True)
+    m.adv["top_long"] = 5.0    # whales extremely short
+    m.adv["divergence"] = -30.0
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert "whale melawan" in reason
+
+
+def test_detect_pattern_unit():
+    from signal_engine import detect_pattern
+    # hammer
+    candles = candles_from_closes([100.0] * 10)
+    c = candles[-1]
+    c["open"] = 100.0; c["close"] = 100.1
+    c["high"] = 100.15; c["low"] = 99.0
+    assert detect_pattern(candles, "BULLISH") == "hammer"
+    assert detect_pattern(candles, "BEARISH") is None
+    # shooting star
+    c["high"] = 101.0; c["low"] = 99.95
+    c["open"] = 100.0; c["close"] = 99.9
+    assert detect_pattern(candles, "BEARISH") == "shooting-star"
+    # bullish engulfing
+    cs = candles_from_closes([100.0, 99.0, 101.0])
+    cs[-2]["open"] = 100.0; cs[-2]["close"] = 99.0
+    cs[-1]["open"] = 98.9; cs[-1]["close"] = 100.5
+    assert detect_pattern(cs, "BULLISH") == "bullish-engulfing"
+
+
+def test_news_sentiment_unit():
+    from data import _news_sentiment
+    assert _news_sentiment("Bitcoin hacked, funds stolen in exploit") < -4
+    assert _news_sentiment("Ethereum ETF approval drives rally") > 0
+    assert _news_sentiment("Bitcoin price dips below $82K on CPI data") == 0
+
+
+def test_mtf_alignment_check_unit():
+    from signal_engine import mtf_alignment_check
+    m = FakeMarket(bullish=True)
+    ok, note = mtf_alignment_check("ETHUSDT", m, "BULLISH")
+    assert ok, note
+    m.klines["1h"] = candles_from_closes([100.0] * 220)
+    ok, note = mtf_alignment_check("ETHUSDT", m, "BULLISH")
+    assert not ok and "1h=neutral" in note
+
+
+def test_btc_direction_check_unit():
+    from signal_engine import btc_direction_check
+    m = FakeMarket(bullish=True)
+    ok, note = btc_direction_check(m, "BULLISH")
+    assert ok, note
+    ok, note = btc_direction_check(m, "BEARISH")
+    assert not ok and "tak selaras" in note

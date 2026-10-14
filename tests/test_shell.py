@@ -152,8 +152,20 @@ def test_apply_signal_mode_preset():
     assert s["signal_mode"] == "biasa"
     assert s["min_quality_score"] == 50
     assert s["bullish_only"] is False  # biasa = bidirectional (LONG+SHORT)
-    assert s["mtf_require_1d"] is False  # 1d leg relaxed to a soft delta
-    assert s["veto_funding"] is True  # core veto stays on
+    assert s["mtf_require_1d"] is False
+    assert s["mtf_require_1h"] is False  # biasa = 15m indicators only
+    assert s["btc_align_required"] is False
+    assert s["veto_funding"] is False  # biasa: no vetoes, indicators only
+    assert s["news_check"] is False
+    dashboard.apply_signal_mode_preset(s, "sedang")
+    assert s["mtf_require_1h"] is True  # sedang: 4h/1h/30m/15m + BTC
+    assert s["btc_align_required"] is True
+    assert s["pattern_required"] is False
+    dashboard.apply_signal_mode_preset(s, "ketat")
+    assert s["pattern_required"] is True  # ketat: full review stack
+    assert s["news_check"] is True
+    assert s["liq_review"] is True
+    assert s["whale_review"] is True
     with __import__("pytest").raises(ValueError):
         dashboard.apply_signal_mode_preset({}, "ngawur")
 

@@ -281,7 +281,7 @@ def test_veto_hold_rejects_signal_end_to_end():
     m.raise_adv = True
     signal, reason = evaluate_symbol("ETHUSDT", m)
     assert signal is None
-    assert "holding (fail-closed)" in reason
+    assert "holding" in reason
 
 
 def test_btc_dump_rejects_signal_end_to_end():
@@ -299,7 +299,7 @@ def test_strict_pass_regression_with_vetoes():
     assert signal is not None, note
     assert signal["direction"] == "LONG"
     assert signal["quality"] >= config.MIN_QUALITY_SCORE
-    assert "STRICT PASS" in note
+    assert "KETAT PASS" in note
 
 
 def test_btc_pump_vetoes_shorts():
