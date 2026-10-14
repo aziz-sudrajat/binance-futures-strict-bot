@@ -58,6 +58,7 @@ from quality_deltas import (
     liq_event_delta,
     liq_wall_warn_delta,
     market_regime,
+    mtf_1d_delta,
     mtf_30m_delta,
     mtf_4h_delta,
     smart_money_delta,
@@ -403,8 +404,10 @@ def mtf_confirm(c30: dict, mode: str | None = None,
 
 def mtf_cascade_check(klines_4h: list, klines_1d: list, a30: dict,
                       direction: str = "BULLISH") -> dict:
-    """GAS: mtfCascadeCheck_ (L3156). 4h + 1d trend aligned with the signal
-    direction, 30m per MTF_30M_MODE."""
+    """GAS: mtfCascadeCheck_ (L3156). 4h trend aligned with the signal
+    direction (hard gate) + 1d trend aligned (hard gate when
+    config.MTF_REQUIRE_1D, else soft-scored via quality_deltas.mtf_1d_delta)
+    + 30m per MTF_30M_MODE."""
     want = "BEARISH" if direction == "BEARISH" else "BULLISH"
     try:
         t4 = mtf_trend_direction([float(c["close"]) for c in klines_4h])
@@ -412,7 +415,7 @@ def mtf_cascade_check(klines_4h: list, klines_1d: list, a30: dict,
             return {"pass": False, "stage": "4h",
                     "reason": f"4h trend {t4.lower()} (need {want.lower()})"}
         t1 = mtf_trend_direction([float(c["close"]) for c in klines_1d])
-        if t1 != want:
+        if t1 != want and config.MTF_REQUIRE_1D:
             return {"pass": False, "stage": "1d",
                     "reason": f"1d trend {t1.lower()} (need {want.lower()})"}
         chk = mtf_confirm(a30, direction=direction)
@@ -421,7 +424,8 @@ def mtf_cascade_check(klines_4h: list, klines_1d: list, a30: dict,
         # The 30m check result is threaded through so the quality gate can
         # apply its delta (deepCheckMtf_ L3292-3298). In GAS STRICT the cascade
         # boost reaches scoreDelta only via this leg — there is no separate
-        # cascade +8 in the delta sum.
+        # cascade +8 in the delta sum. t1d is threaded for the soft 1d delta
+        # in relaxed modes (when the 1d leg is not a hard gate).
         return {"pass": True, "t4h": t4, "t1d": t1, "chk": chk,
                 "boost": config.MTF_CASCADE_BOOST}
     except Exception as e:  # noqa: BLE001
@@ -532,6 +536,11 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
         delta_notes.append(f"{name}: {note}")
 
     _add("mtf_30m", mtf_30m_delta(casc["chk"], direction))
+    if not config.MTF_REQUIRE_1D:
+        # Relaxed cascade (biasa mode): the 1d leg is soft-scored instead of
+        # a hard gate — major-trend alignment still moves the quality score
+        # (bonus when aligned, penalty when opposed).
+        _add("mtf_1d", mtf_1d_delta(casc.get("t1d"), direction))
     try:
         a4h = analyze_candles(symbol, "4h", k4h)
     except Exception as e:  # noqa: BLE001 - soft scoring (GAS L3304)

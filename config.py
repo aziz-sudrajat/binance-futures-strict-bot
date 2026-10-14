@@ -19,6 +19,12 @@ MTF_30M_MODE = "STRICT"        # 30m leg mode (see note below).
 MTF_CASCADE_BOOST = 8           # GAS: mtfCascadeCheck_ returns boost: 8 (L3156)
 MTF_CONFIRM_BOOST = 8           # GAS: mtfConfirmPass_ STRICT returns boost: 8 (L2097)
 MTF_LEAN_BOOST = 3             # GAS: mtfConfirmPass_ LEAN returns boost: 3 on lean (L2107)
+MTF_REQUIRE_1D = True          # STRICT cascade: 1d trend alignment is a hard gate.
+                               # Relaxed modes (biasa) turn the 1d leg into a soft
+                               # quality delta (bonus when aligned, penalty when
+                               # opposed) instead of a hard reject.
+MTF_CONFIRM_1D_BOOST = 6       # soft 1d delta: major trend aligned (relaxed cascade)
+MTF_CONFIRM_1D_PENALTY = 10    # soft 1d delta: major trend opposed (relaxed cascade)
 
 # ------------------------------------------------- indicator / setup constants
 KLINES_LIMIT = 220              # GAS: CFG.KLINES_LIMIT (L97)
@@ -208,6 +214,7 @@ DASH_NUMERIC_OVERRIDES = {
 # Boolean engine knobs: setting name -> config attribute.
 DASH_BOOL_OVERRIDES = {
     "bullish_only": "BULLISH_ONLY",
+    "mtf_require_1d": "MTF_REQUIRE_1D",
     "breakeven_after_tp1": "EXEC_BREAKEVEN_AFTER_TP1",
 }
 # MTF 30m leg mode: STRICT (default) or LEAN (GAS default behavior).
@@ -218,9 +225,12 @@ DASH_VETO_CODES = ("leverage_risk", "funding", "squeeze", "whale",
                    "liq_wall", "btc_breaker")
 # Signal strictness presets: ketat | sedang | biasa.
 # Choosing a mode applies its bundle to the individual dashboard settings
-# (quality gate, MTF 30m leg, bullish-only, volume gate, freshness drift,
-# veto toggles). ketat/sedang are LONG-only (GAS parity). biasa is
-# bidirectional: the engine runs a fully mirrored SHORT pipeline
+# (quality gate, MTF 30m leg, 1d cascade leg, bullish-only, volume gate,
+# freshness drift, veto toggles). ketat/sedang are LONG-only (GAS parity)
+# with the full 4h+1d cascade as a hard gate. biasa is bidirectional and
+# relaxes the 1d cascade leg to a soft quality delta (bonus/penalty) instead
+# of a hard reject — the major-trend information still moves the score.
+# The engine runs a fully mirrored SHORT pipeline for biasa
 # (BEARISH WATCH -> SHORT with bearish cascade, bearish vetoes/deltas,
 # mirrored freshness, short-capable executor).
 # The user can still fine-tune knobs afterwards — the mode is a preset,
@@ -230,6 +240,7 @@ SIGNAL_MODE_PRESETS = {
     "ketat": {  # today's behavior — GAS STRICT parity
         "min_quality_score": 70,
         "mtf_30m_mode": "STRICT",
+        "mtf_require_1d": True,
         "bullish_only": True,
         "min_24h_volume_usd": 2_000_000.0,
         "freshness_max_drift_pct": 0.4,
@@ -243,6 +254,7 @@ SIGNAL_MODE_PRESETS = {
     "sedang": {  # relaxed: lower bar, LEAN 30m, drops the noisiest veto
         "min_quality_score": 60,
         "mtf_30m_mode": "LEAN",
+        "mtf_require_1d": True,
         "bullish_only": True,
         "min_24h_volume_usd": 1_000_000.0,
         "freshness_max_drift_pct": 0.6,
@@ -253,9 +265,11 @@ SIGNAL_MODE_PRESETS = {
         "veto_liq_wall": False,
         "veto_btc_breaker": True,
     },
-    "biasa": {  # permissive: quality floor, bidirectional, core vetoes only
+    "biasa": {  # permissive: quality floor, bidirectional, core vetoes only,
+        # 1d cascade leg relaxed to a soft delta
         "min_quality_score": 50,
         "mtf_30m_mode": "LEAN",
+        "mtf_require_1d": False,
         "bullish_only": False,
         "min_24h_volume_usd": 500_000.0,
         "freshness_max_drift_pct": 1.0,
@@ -287,6 +301,7 @@ DASHBOARD_DEFAULTS = {
     "freshness_max_drift_pct": 0.4,
     "bullish_only": True,
     "mtf_30m_mode": "STRICT",
+    "mtf_require_1d": True,     # 1d trend alignment: hard gate (ketat/sedang)
     # TP / SL
     "tp1_rr": 1.5,
     "tp2_rr": 2.25,
