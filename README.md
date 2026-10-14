@@ -28,6 +28,7 @@ Framework-style shell — ketik perintah, bukan hafal tombol:
 | `balance` | Saldo + PnL harian + kill switch |
 | `signals` | Signal fresh dari database scanner |
 | `scanner start|stop|status|once` | Kontrol all-coin scanner (OKX → DB) |
+| `signal-mode [ketat|sedang|biasa]` | Mode sinyal: preset ketat/sedang/biasa |
 | `mode [live|demo|paper]` | Ganti/lihat mode |
 | `events [--limit N]` | Event lifecycle terakhir |
 | `kill` | Status kill-switch |
@@ -36,6 +37,23 @@ Framework-style shell — ketik perintah, bukan hafal tombol:
 Bisa juga sekali jalan: `./binance position`, `./binance scan --top 10`.
 Tampilan pakai `rich`: tabel berwarna, panel status, live view saat
 auto-trade jalan. TUI curses lama (`tui.py`) tetap ada sebagai alternatif.
+
+## Mode sinyal: ketat / sedang / biasa
+
+`signal-mode` (atau dropdown "Mode sinyal" di web dashboard, atau
+`set signal_mode <mode>`) menerapkan preset ke knob-knob signal & veto:
+
+| | ketat | sedang | biasa |
+|---|---|---|---|
+| Min quality | 70 | 60 | 50 |
+| MTF 30m | STRICT | LEAN | LEAN |
+| Bullish only | ya | ya | tidak (SHORT ok) |
+| Min volume 24h | $2jt | $1jt | $500rb |
+| Freshness drift | 0.4% | 0.6% | 1.0% |
+| Veto aktif | semua (6) | semua kecuali liq-wall | leverage + funding saja |
+
+Mode adalah preset, bukan kunci — knob individual tetap bisa di-fine-tune
+manual setelahnya (`set` / editor `setting`). Berlaku tanpa restart.
 
 Port of the **decision pipeline** from the GAS signal bot
 (`workspace/user/files/AZZATSSINS-20261013-imageperf-v4_5_02o2.gs`, 8.659 lines)
@@ -671,7 +689,7 @@ jalan 24/7 di Termux.
 
 ### Pre-deploy checklist (from the quant-trading skill)
 
-- [ ] Full test suite green (`pytest tests/ -q`) — currently 254 passed.
+- [ ] Full test suite green (`pytest tests/ -q`) — currently 258 passed.
 - [ ] Paper-mode smoke run completed with no errors.
 - [ ] Testnet key created by the user; `--testnet --once` places/cancels cleanly.
 - [ ] Kill switch verified on testnet (force a >3% day or lower the cap temporarily).
