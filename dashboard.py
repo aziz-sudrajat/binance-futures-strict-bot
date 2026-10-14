@@ -178,6 +178,23 @@ def validate_settings(data: dict) -> dict:
             raise ValueError("fixed_usdt must be 1-100000")
         out["fixed_usdt"] = v
 
+    # ---- universe ----
+    if "universe_mode" in data:
+        v = data["universe_mode"]
+        if v not in ("curated", "top_volume"):
+            raise ValueError("universe_mode must be curated or top_volume")
+        out["universe_mode"] = v
+
+    if "universe_top_n" in data:
+        try:
+            v = int(data["universe_top_n"])
+        except (TypeError, ValueError):
+            raise ValueError("universe_top_n must be an integer")
+        if not 10 <= v <= config.UNIVERSE_TOP_N_MAX:
+            raise ValueError(
+                f"universe_top_n must be 10-{config.UNIVERSE_TOP_N_MAX}")
+        out["universe_top_n"] = v
+
     return out
 
 
@@ -247,16 +264,24 @@ def _fmt_ts(ts_ms: int) -> str:
         return "-"
 
 
-def run_radar() -> list[dict]:
+def run_radar(mode: str = "live") -> list[dict]:
     """Signal Radar: evaluate the whole universe with the CURRENT studio
     settings and rank by quality (approved first). Uses the real engine —
-    the same pipeline the executor runs. Takes ~30-60s for 9 symbols."""
+    the same pipeline the executor runs. Respects the universe mode
+    (curated / top_volume); ~1s per symbol."""
     from data import MarketData
     from signal_engine import evaluate_symbol
-    config.apply_dashboard_overrides(load_settings())
+    from executor import resolve_universe
+    settings = load_settings(mode=mode)
+    config.apply_dashboard_overrides(settings)
+    try:
+        exchange = _exchange_for_mode(mode)
+    except SystemExit:
+        exchange = None  # no keys -> curated fallback inside resolve
+    universe = resolve_universe(exchange, settings)
     market = MarketData()
     out = []
-    for symbol in config.UNIVERSE:
+    for symbol in universe:
         try:
             signal, note = evaluate_symbol(symbol, market)
         except Exception as e:  # noqa: BLE001 - one symbol never kills radar
@@ -441,6 +466,19 @@ th{color:#8b949e;font-weight:600}
   <div class="setrow"><label>Interval scan (menit)</label>
     <input type="number" id="s-int" step="1" min="1" max="60"></div>
 </div>
+<div class="card"><h2>🌐 Universe</h2>
+  <div class="setrow"><label>Mode universe<br>
+    <span class="dim" style="font-size:12px">curated = 55 coin liquid;
+    top_volume = top-N volume 24h</span></label>
+    <select id="s-umode">
+      <option value="curated">curated</option>
+      <option value="top_volume">top_volume</option>
+    </select></div>
+  <div class="setrow"><label>Top N (10–100)<br>
+    <span class="dim" style="font-size:12px">dipakai kalau top_volume</span></label>
+    <input type="number" id="s-topn" step="5" min="10" max="100"></div>
+  <div class="dim" style="font-size:12px" id="u-count"></div>
+</div>
 <div class="card"><h2>🎯 Signal — Quality &amp; Filter</h2>
   <div class="setrow"><label>Min quality score<br>
     <span class="dim" style="font-size:12px">STRICT default 70</span></label>
@@ -563,6 +601,11 @@ async function refresh(){
     $('s-sp3').value = st.tp_split_3;
     $('s-be').checked = !!st.breakeven_after_tp1;
     $('s-margin').value = st.margin_mode || 'ISOLATED';
+    $('s-umode').value = st.universe_mode || 'curated';
+    $('s-topn').value = st.universe_top_n;
+    $('u-count').innerHTML = st.universe_mode === 'top_volume'
+      ? 'scan <b class="cyan">' + st.universe_top_n + '</b> coin top volume'
+      : 'scan <b class="cyan">55</b> coin curated';
     $('s-levmode').value = st.leverage_mode || 'auto';
     $('s-levx').value = st.leverage;
     $('s-entrymode').value = st.entry_mode || 'risk';
@@ -655,6 +698,8 @@ $('save').onclick = ()=>{
     tp_split_3:parseFloat($('s-sp3').value),
     breakeven_after_tp1:$('s-be').checked,
     margin_mode:$('s-margin').value,
+    universe_mode:$('s-umode').value,
+    universe_top_n:parseInt($('s-topn').value),
     leverage_mode:$('s-levmode').value,
     leverage:parseInt($('s-levx').value),
     entry_mode:$('s-entrymode').value,
@@ -729,7 +774,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, load_settings(mode=self._mode()))
         elif path == "/api/radar":
             try:
-                self._json(200, run_radar())
+                self._json(200, run_radar(mode=self._mode()))
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"error": str(e)})
         else:
