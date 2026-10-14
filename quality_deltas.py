@@ -52,7 +52,8 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 
 # ------------------------------------------------------------- MTF components
-def mtf_30m_delta(chk: dict | None) -> tuple[int, str]:
+def mtf_30m_delta(chk: dict | None,
+                direction: str = "BULLISH") -> tuple[int, str]:
     """GAS: deepCheckMtf_ (L3292-3298): delta = penalty when set, else boost."""
     chk = chk or {}
     pen = int(chk.get("penalty") or 0)
@@ -60,38 +61,49 @@ def mtf_30m_delta(chk: dict | None) -> tuple[int, str]:
         return pen, f"mtf 30m {pen}: weak 30m lean"
     boost = int(chk.get("boost") or 0)
     lean = " lean" if chk.get("lean") else ""
-    return boost, f"mtf +{boost}: 15m & 30m bullish{lean}"
+    side = "bearish" if direction == "BEARISH" else "bullish"
+    return boost, f"mtf +{boost}: 15m & 30m {side}{lean}"
 
 
-def mtf_4h_delta(a4h: dict | None) -> tuple[int, str]:
+def mtf_4h_delta(a4h: dict | None,
+                 direction: str = "BULLISH") -> tuple[int, str]:
     """GAS: mtfConfirm4hPass_ (L2074-2085), wired via deepCheckMtf_ (L3302-3316).
 
     BULLISH WATCH + plan -> +6; BEARISH -> -10; neutral bull-lean -> +3 lean;
     neutral bear-lean -> -5 weak. Soft scoring: missing data -> 0, never a veto.
+    Mirrored for BEARISH direction (shorts): BEARISH WATCH + plan -> +6,
+    BULLISH -> -10.
     """
     if not a4h:
         return 0, "mtf 4h: data tidak tersedia"
     sig = str(a4h.get("signal") or "")
-    if sig.startswith("BULL") and a4h.get("trade_plan"):
+    is_bull = sig.startswith("BULL")
+    is_bear = sig.startswith("BEAR")
+    want_bear = direction == "BEARISH"
+    aligned = (is_bear if want_bear else is_bull) and a4h.get("trade_plan")
+    opposed = is_bull if want_bear else is_bear
+    if aligned:
         b = config.MTF_CONFIRM_4H_BOOST
         return b, f"mtf 4h +{b}: 15m/30m/4h searah"
-    if sig.startswith("BEAR"):
+    if opposed:
         p = config.MTF_CONFIRM_4H_PENALTY
         return -p, f"mtf 4h -{p}: 4h {sig.lower()}"
     bull = float(a4h.get("bull_score") or 0)
     bear = float(a4h.get("bear_score") or 0)
-    if bull >= bear:
+    if (bear >= bull) if want_bear else (bull >= bear):
         return 3, "mtf 4h +3: lean"
     return -5, "mtf 4h -5: weak"
 
 
 # ------------------------------------------------------------------ 1h trend
-def h1_trend_delta(closes: list | None) -> tuple[int, str]:
+def h1_trend_delta(closes: list | None,
+                   direction: str = "BULLISH") -> tuple[int, str]:
     """GAS: deepCheckH1Trend_ (L3605-3632).
 
-    >= 55 closes; EMA50; bullish-aligned -> +H1_TREND_BONUS (8),
-    bearish-opposed -> -H1_TREND_PENALTY (10), mixed -> 0.
+    >= 55 closes; EMA50; aligned -> +H1_TREND_BONUS (8),
+    opposed -> -H1_TREND_PENALTY (10), mixed -> 0.
     Insufficient data -> 0 with a note (GAS behavior), never a bonus.
+    Mirrored for BEARISH direction (shorts).
     """
     bonus, penalty = config.H1_TREND_BONUS, config.H1_TREND_PENALTY
     if not closes or len(closes) < 55:
@@ -99,25 +111,43 @@ def h1_trend_delta(closes: list | None) -> tuple[int, str]:
     xs = [float(c) for c in closes]
     e = ema_series(xs, 50)
     last, ema_now, ema_prev = xs[-1], e[-1], e[-11]
-    if last > ema_now and ema_now >= ema_prev:
+    bull_aligned = last > ema_now and ema_now >= ema_prev
+    bear_aligned = last < ema_now and ema_now <= ema_prev
+    if direction == "BEARISH":
+        if bear_aligned:
+            return bonus, f"1h trend bearish selaras (+{bonus})"
+        if bull_aligned:
+            return -penalty, f"1h trend bullish berlawanan (-{penalty})"
+        return 0, "1h trend mixed (netral)"
+    if bull_aligned:
         return bonus, f"1h trend bullish selaras (+{bonus})"
-    if last < ema_now and ema_now <= ema_prev:
+    if bear_aligned:
         return -penalty, f"1h trend bearish berlawanan (-{penalty})"
     return 0, "1h trend mixed (netral)"
 
 
 # ------------------------------------------------------- BTC breadth (warn)
-def btc_breadth_warn_delta(chg: float | None) -> tuple[int, str]:
+def btc_breadth_warn_delta(chg: float | None,
+                           direction: str = "BULLISH") -> tuple[int, str]:
     """GAS: deepCheckBtcBreadth_ warn tier (L3634-3662).
 
-    BTC <= -BTC_DUMP_VETO_PCT (3%) is the V15 circuit-breaker veto and stays
-    in vetoes.py. The warn tier (<= -BTC_DUMP_WARN_PCT, 2%) subtracts
-    -BTC_DUMP_PENALTY (15) from quality. LONG context only (this engine is
-    bullish-only by construction).
+    BULLISH: BTC <= -BTC_DUMP_VETO_PCT (3%) is the V15 circuit-breaker veto
+    and stays in vetoes.py. The warn tier (<= -BTC_DUMP_WARN_PCT, 2%)
+    subtracts -BTC_DUMP_PENALTY (15) from quality.
+    BEARISH (shorts): mirrored — a vertical BTC pump (+2%/+3% per 1h) is the
+    hostile regime; the veto tier lives in vetoes.py V15.
     """
     if not _finite(chg):
         return 0, "btc breadth: data tidak valid"
     chg = float(chg)
+    if direction == "BEARISH":
+        if chg >= config.BTC_DUMP_VETO_PCT:
+            return 0, (f"BTC +{chg:.2f}%/1h at veto tier — veto handled by "
+                       f"vetoes.py V15")
+        if chg >= config.BTC_DUMP_WARN_PCT:
+            p = config.BTC_DUMP_PENALTY
+            return -p, f"BTC menguat +{chg:.2f}%/1h (-{p})"
+        return 0, f"BTC breadth OK ({chg:.2f}%/1h)"
     if chg <= -config.BTC_DUMP_VETO_PCT:
         return 0, (f"BTC {chg:.2f}%/1h at veto tier — veto handled by "
                    f"vetoes.py V15")
