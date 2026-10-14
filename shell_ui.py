@@ -102,11 +102,17 @@ def suggest_command(name: str, n: int = 3) -> list[str]:
 
 
 def parse_line(line: str) -> tuple[str, list[str]]:
-    """Split a shell line into (command, args) with shlex."""
+    """Split a shell line into (command, args) with shlex.
+
+    A leading ':' is tolerated (vim-style ':command' habit).
+    """
+    line = line.strip()
+    if line.startswith(":"):
+        line = line[1:].lstrip()
     try:
-        parts = shlex.split(line.strip())
+        parts = shlex.split(line)
     except ValueError:
-        parts = line.strip().split()
+        parts = line.split()
     if not parts:
         return "", []
     return parts[0].lower(), parts[1:]
