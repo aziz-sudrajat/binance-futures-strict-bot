@@ -40,9 +40,7 @@ def erig(tmp_path, dash_env):
 
 # ------------------------------------------------------------ validation
 def test_defaults_when_missing(dash_env):
-    s = load_settings(dash_env)
-    assert s == {"auto_trade": True, "risk_pct_per_trade": 1.0,
-                "max_leverage": 3, "poll_interval_min": 5}
+    assert load_settings(dash_env) == config.DASHBOARD_DEFAULTS
 
 
 def test_save_load_roundtrip(dash_env):
@@ -153,3 +151,117 @@ def test_read_events_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "EXEC_LIVE_LIFECYCLE_FILE",
                         str(tmp_path / "nope.jsonl"))
     assert read_events("live") == []
+
+
+# ------------------------------------------------- studio overrides (config)
+@pytest.fixture(autouse=True)
+def _reset_config():
+    yield
+    config.reset_dashboard_overrides()
+
+
+def test_apply_numeric_overrides(dash_env):
+    save_settings({"min_quality_score": 80, "tp1_rr": 2.0,
+                   "stop_atr_min": 1.0}, dash_env)
+    from executor import Executor as _E  # noqa
+    import executor as exmod
+    e = object.__new__(exmod.Executor)
+    config.apply_dashboard_overrides(e._dash_settings())
+    assert config.MIN_QUALITY_SCORE == 80
+    assert config.TP1_RR == 2.0
+    assert config.STOP_ATR_MIN == 1.0
+
+
+def test_apply_clamps_out_of_range(dash_env):
+    with open(dash_env, "w", encoding="utf-8") as f:
+        json.dump({"min_quality_score": 200, "tp1_rr": 99.0}, f)
+    import executor as exmod
+    e = object.__new__(exmod.Executor)
+    config.apply_dashboard_overrides(e._dash_settings())
+    assert config.MIN_QUALITY_SCORE == 95
+    assert config.TP1_RR == 5.0
+
+
+def test_apply_tp_split_normalized(dash_env):
+    save_settings({"tp_split_1": 1.0, "tp_split_2": 1.0, "tp_split_3": 2.0},
+                  dash_env)
+    import executor as exmod
+    e = object.__new__(exmod.Executor)
+    config.apply_dashboard_overrides(e._dash_settings())
+    assert config.TP_SPLIT == pytest.approx((0.25, 0.25, 0.5))
+    assert abs(sum(config.TP_SPLIT) - 1.0) < 1e-9
+
+
+def test_apply_veto_toggles(dash_env):
+    save_settings({"veto_funding": False, "veto_whale": False}, dash_env)
+    import executor as exmod
+    e = object.__new__(exmod.Executor)
+    config.apply_dashboard_overrides(e._dash_settings())
+    assert config.DISABLED_VETOES == frozenset({"funding", "whale"})
+
+
+def test_apply_mtf_and_bools(dash_env):
+    save_settings({"mtf_30m_mode": "LEAN", "bullish_only": False,
+                   "breakeven_after_tp1": False}, dash_env)
+    import executor as exmod
+    e = object.__new__(exmod.Executor)
+    config.apply_dashboard_overrides(e._dash_settings())
+    assert config.MTF_30M_MODE == "LEAN"
+    assert config.BULLISH_ONLY is False
+    assert config.EXEC_BREAKEVEN_AFTER_TP1 is False
+
+
+def test_apply_ignores_invalid_mtf(dash_env):
+    with open(dash_env, "w", encoding="utf-8") as f:
+        json.dump({"mtf_30m_mode": "YOLO"}, f)
+    import executor as exmod
+    e = object.__new__(exmod.Executor)
+    config.apply_dashboard_overrides(e._dash_settings())
+    assert config.MTF_30M_MODE == "STRICT"
+
+
+def test_scan_once_applies_studio_settings(erig):
+    executor, _ = erig
+    save_settings({"min_quality_score": 95, "tp2_rr": 3.0},
+                  config.DASHBOARD_SETTINGS_FILE)
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor.scan_once()
+    assert config.MIN_QUALITY_SCORE == 95
+    assert config.TP2_RR == 3.0
+
+
+def test_vetoes_disabled_param():
+    from unittest.mock import MagicMock
+    import vetoes
+    m = MagicMock()
+    m.get_advanced_derivatives.side_effect = Exception("no feed")
+    snap = {"aggregate_funding": 0.0001}
+    full = vetoes.run_vetoes("BTCUSDT", "BULLISH", m, snap, book={"a": 1})
+    codes = {b[0] for b in full}
+    assert "adv_deriv" in codes  # hold present when vetoes enabled
+    off = vetoes.run_vetoes("BTCUSDT", "BULLISH", m, snap, book={"a": 1},
+                            disabled={"leverage_risk", "squeeze", "whale"})
+    assert "adv_deriv" not in {b[0] for b in off}
+
+
+def test_studio_validation_accepts_full_settings(dash_env):
+    full = dict(config.DASHBOARD_DEFAULTS)
+    full.update({"min_quality_score": 80, "mtf_30m_mode": "LEAN",
+                 "tp1_rr": 2.0, "veto_funding": False})
+    out = save_settings(full, dash_env)
+    assert out["min_quality_score"] == 80
+    assert out["veto_funding"] is False
+
+
+@pytest.mark.parametrize("bad", [
+    {"mtf_30m_mode": "YOLO"},
+    {"tp_split_1": 0.0}, {"tp_split_2": 50.0},
+    {"veto_funding": "yes"},
+    {"bullish_only": 1},
+    {"min_quality_score": 49}, {"min_quality_score": 96},
+    {"tp1_rr": 0.1}, {"stop_atr_min": 10},
+])
+def test_studio_validation_rejects(dash_env, bad):
+    with pytest.raises(ValueError):
+        save_settings(bad, dash_env)
