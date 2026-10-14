@@ -405,16 +405,64 @@ def test_evaluate_symbol_weak_strength_rejected():
     assert "strength" in reason
 
 
-def test_bearish_rejected_even_when_bullish_only_off():
-    """Regression: the engine is LONG-only by construction. Flipping the
-    bullish_only knob must never let a BEARISH WATCH through as an inverted
-    LONG (bearish plan + direction LONG = stop above entry)."""
+def test_bearish_produces_short_when_bidirectional():
+    """Bidirectional mode (biasa): a BEARISH WATCH must produce a proper
+    SHORT signal — direction SHORT with bearish geometry (stop above entry
+    above TPs), never an inverted LONG."""
     import config
     old = config.BULLISH_ONLY
     config.BULLISH_ONLY = False
     try:
-        signal, reason = evaluate_symbol("BTCUSDT", FakeMarket(bullish=False))
+        signal, note = evaluate_symbol("BTCUSDT", FakeMarket(bullish=False))
     finally:
         config.BULLISH_ONLY = old
-    assert signal is None
-    assert "bullish-only" in reason
+    assert signal is not None, note
+    assert signal["direction"] == "SHORT"
+    assert signal["stop_loss"] > signal["entry"] > signal["tp1"]
+    assert signal["entry_low"] <= signal["entry"] <= signal["entry_high"]
+    assert signal["quality"] >= config.MIN_QUALITY_SCORE
+
+
+def test_bearish_cascade_mirrored():
+    k4h_bear = [{"close": c} for c in [100.0 * 0.998 ** i for i in range(100)]]
+    k1d_bear = [{"close": c} for c in [100.0 * 0.999 ** i for i in range(100)]]
+    a30_bear = {"signal": "BEARISH WATCH", "trade_plan": {"entry": 1}}
+    r = mtf_cascade_check(k4h_bear, k1d_bear, a30_bear, "BEARISH")
+    assert r["pass"] is True and r["boost"] == config.MTF_CASCADE_BOOST
+    # bullish higher TFs fail a SHORT cascade
+    k4h_bull = [{"close": c} for c in uptrend(100)]
+    r = mtf_cascade_check(k4h_bull, k1d_bear, a30_bear, "BEARISH")
+    assert r["pass"] is False and r["stage"] == "4h"
+    # default direction stays BULLISH (GAS parity)
+    a30_bull = {"signal": "BULLISH WATCH", "trade_plan": {"entry": 1}}
+    assert mtf_cascade_check(k4h_bull, k1d_bear, a30_bull)["pass"] is False
+
+
+def test_mtf_confirm_strict_bearish():
+    ok = {"signal": "BEARISH WATCH", "trade_plan": {"entry": 1}}
+    r = mtf_confirm_strict(ok, "BEARISH")
+    assert r["pass"] is True and r["boost"] == config.MTF_CONFIRM_BOOST
+    assert mtf_confirm_strict(
+        {"signal": "BULLISH WATCH", "trade_plan": {"entry": 1}},
+        "BEARISH")["pass"] is False
+    # default direction unchanged
+    assert mtf_confirm_strict(ok)["pass"] is False
+
+
+def test_delta_mirrors_for_shorts():
+    from quality_deltas import (mtf_4h_delta, h1_trend_delta,
+                                btc_breadth_warn_delta)
+    a4h_bear = {"signal": "BEARISH WATCH", "trade_plan": {"entry": 1}}
+    d, _ = mtf_4h_delta(a4h_bear, "BEARISH")
+    assert d == config.MTF_CONFIRM_4H_BOOST
+    d, _ = mtf_4h_delta({"signal": "BULLISH WATCH", "trade_plan": {"entry": 1}},
+                        "BEARISH")
+    assert d == -config.MTF_CONFIRM_4H_PENALTY
+    d, _ = h1_trend_delta([100.0 * 0.999 ** i for i in range(60)], "BEARISH")
+    assert d == config.H1_TREND_BONUS
+    d, _ = h1_trend_delta([100.0 * 1.001 ** i for i in range(60)], "BEARISH")
+    assert d == -config.H1_TREND_PENALTY
+    d, _ = btc_breadth_warn_delta(2.5, "BEARISH")
+    assert d == -config.BTC_DUMP_PENALTY
+    d, _ = btc_breadth_warn_delta(-2.5, "BEARISH")
+    assert d == 0  # BTC dumping is fine for shorts
