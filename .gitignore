@@ -14,3 +14,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 *.egg-info/
+
+# Live-mode runtime state — never commit (real-money position history)
+state-live.json
+lifecycle-live.jsonl
