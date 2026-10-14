@@ -398,6 +398,31 @@ dsb) yang semula dikalibrasi dari data Binance/Gate kini membaca data OKX —
 semantiknya ekuivalen (ratio, funding, OI) tapi angkanya bisa sedikit beda;
 re-kalibrasi berkala disarankan.
 
+## Two-stage pipeline: scanner (semua coin) → DB → executor
+
+**Tahap 1 — scanner** (`scanner.py`): scan SEMUA coin perpetual OKX
+(~486 USDT-margined, bukan cuma universe curated), pakai engine STRICT yang
+sama. Coin yang lolos APPROVED masuk `signals.db` (SQLite) — cache sementara
+dengan expiry (default 30 menit). Satu coin jelek tidak menghentikan pass;
+pass penuh jalan dengan ritme sendiri (default tiap 15 menit).
+
+**Tahap 2 — executor** (`run_executor.py --from-db`): tidak scan market
+sendiri. Tiap cycle baca signal fresh dari `signals.db` (terbaik dulu),
+lalu tetap lakukan freshness re-check + risk gates sebelum eksekusi di
+Binance. Signal ditandai `consumed` setelah dieksekusi/ditolak.
+
+```bash
+# terminal 1 — scanner (jalan terus)
+.venv/bin/python scanner.py --loop --interval 15
+
+# terminal 2 — executor ambil dari DB
+source switch.sh live
+.venv/bin/python run_executor.py --live --from-db --loop
+```
+
+Dashboard punya kartu "Scanner (OKX → DB)"; TUI tekan `d` untuk lihat
+signal fresh di DB.
+
 ## Setup & usage (developer)
 
 ```bash
@@ -615,7 +640,7 @@ jalan 24/7 di Termux.
 
 ### Pre-deploy checklist (from the quant-trading skill)
 
-- [ ] Full test suite green (`pytest tests/ -q`) — currently 233 passed.
+- [ ] Full test suite green (`pytest tests/ -q`) — currently 242 passed.
 - [ ] Paper-mode smoke run completed with no errors.
 - [ ] Testnet key created by the user; `--testnet --once` places/cancels cleanly.
 - [ ] Kill switch verified on testnet (force a >3% day or lower the cap temporarily).
