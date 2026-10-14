@@ -251,3 +251,34 @@ def test_cari_entry_commands_registered():
     assert shell.dispatch("cari") is True  # missing arg -> usage, no crash
     assert shell.dispatch("entry") is True
     assert shell.dispatch("entry btc") is True  # missing direction -> usage
+
+
+def test_positions_table_uses_executor_keys():
+    # Regression: state.json stores direction/entry_price; the table
+    # showed "?" because it read side/entry.
+    from shell_ui import positions_table
+    from rich.console import Console
+    status = {"positions": [
+        {"symbol": "WALUSDT", "direction": "LONG", "qty": 1008.0,
+         "entry_price": 0.0589, "mark": 0.0644, "unrealized_pnl": 5.54,
+         "leverage": 10, "stop_loss": 0.0589},
+    ]}
+    console = Console(record=True, width=100)
+    console.print(positions_table(status))
+    out = console.export_text()
+    assert "WALUSDT" in out and "LONG" in out
+    assert "0.06" in out  # entry_price rendered
+    assert "?" not in out.replace("—", "")  # no unknown markers
+
+
+def test_positions_table_missing_mark_shows_dash():
+    from shell_ui import positions_table
+    from rich.console import Console
+    status = {"positions": [
+        {"symbol": "BTCUSDT", "direction": "SHORT", "qty": 0.02,
+         "entry_price": 81950.0, "leverage": 20, "stop_loss": 83000.0},
+    ]}
+    console = Console(record=True, width=100)
+    console.print(positions_table(status))
+    out = console.export_text()
+    assert "SHORT" in out and "81,950.00" in out

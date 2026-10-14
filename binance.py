@@ -593,18 +593,25 @@ class BinanceShell:
                                "kembali ke prompt[/yellow]")
 
     def _sleep_countdown(self, seconds: int) -> None:
-        """Sleep that shows a one-line countdown; Ctrl+C aborts."""
+        """Sleep that shows a one-line countdown; Ctrl+C aborts.
+
+        Writes directly to stdout with \\r — Rich's print() does not do
+        reliable in-place updates on Termux (it piled up hundreds of lines).
+        """
+        import sys
         try:
             for remaining in range(seconds, 0, -1):
                 mins, secs = divmod(remaining, 60)
-                self.console.print(
-                    f"\r[dim]cycle berikutnya dalam {mins}:{secs:02d} — "
-                    f"Ctrl+C berhenti[/dim]",
-                    end="")
+                sys.stdout.write(
+                    f"\rcycle berikutnya dalam {mins}:{secs:02d} "
+                    f"— Ctrl+C berhenti   ")
+                sys.stdout.flush()
                 time.sleep(1)
-            self.console.print()
+            sys.stdout.write("\r" + " " * 60 + "\r")
+            sys.stdout.flush()
         except KeyboardInterrupt:
-            self.console.print()
+            sys.stdout.write("\n")
+            sys.stdout.flush()
             raise
 
     def _autotrade_view(self, executor, summary, cycle: int,

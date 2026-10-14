@@ -203,15 +203,17 @@ def positions_table(status: dict) -> Table:
                   "", "", "")
         return t
     for p in positions:
-        side = str(p.get("side", "?")).upper()
+        # executor state keys: direction (LONG/SHORT), entry_price, qty...
+        side = str(p.get("direction", p.get("side", "?"))).upper()
         upnl = p.get("unrealized_pnl", p.get("upnl"))
+        mark = p.get("mark", p.get("mark_price"))
         t.add_row(
             f"[bold]{p.get('symbol', '?')}[/bold]",
             f"[{'green' if side == 'LONG' else 'red'}]{side}[/]",
             _money(p.get("qty")),
-            _money(p.get("entry")),
-            _money(p.get("mark", p.get("mark_price"))),
-            ("?" if upnl is None
+            _money(p.get("entry_price", p.get("entry"))),
+            _money(mark) if mark else "[dim]—[/dim]",
+            ("[dim]—[/dim]" if upnl is None
              else f"[{'green' if float(upnl) >= 0 else 'red'}]"
                   f"{float(upnl):+.2f}[/]"),
             f"{p.get('leverage', '?')}x",

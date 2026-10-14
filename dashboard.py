@@ -461,6 +461,26 @@ def build_status(mode: str) -> dict:
                  if not p.get("closed")]
     for p in positions:
         p["opened"] = _fmt_ts(p.get("opened_at", 0))
+    # Live mark + unrealized PnL (public OKX data, best-effort — the
+    # terminal positions table used to show "?" for these).
+    try:
+        from data import MarketData
+        _market = MarketData()
+        for p in positions:
+            try:
+                mark = _market.get_live_price(p.get("symbol", ""))
+            except Exception:  # noqa: BLE001
+                mark = None
+            if mark and p.get("entry_price") and p.get("qty"):
+                p["mark"] = mark
+                entry = float(p["entry_price"])
+                qty = float(p["qty"])
+                if str(p.get("direction", "")).upper() == "SHORT":
+                    p["unrealized_pnl"] = (entry - mark) * qty
+                else:
+                    p["unrealized_pnl"] = (mark - entry) * qty
+    except Exception:  # noqa: BLE001 - enrichment is optional
+        pass
     balance, balance_ok = None, False
     try:
         balance = _exchange_for_mode(mode).get_balance()
