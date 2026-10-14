@@ -19,6 +19,7 @@ Safety properties (see ~/workspace/skills/quant-trading/SKILL.md):
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 
@@ -34,6 +35,15 @@ log = logging.getLogger("executor")
 
 _FEE_PCT = 0.05  # fee estimate per fill for PnL accounting (matches backtest)
 _ENTRY_TIMEOUT_HOURS = 6  # cancel an unfilled entry order after this long
+
+# Dashboard settings defaults (dashboard.py writes dashboard_settings.json;
+# the executor honors it live, without a restart).
+_DASH_DEFAULTS = {
+    "auto_trade": True,
+    "risk_pct_per_trade": 1.0,
+    "max_leverage": 3,
+    "poll_interval_min": 5,
+}
 
 
 def signal_candle_close_ms(market, symbol: str) -> int:
@@ -59,15 +69,17 @@ def make_signal_id(symbol: str, close_ms: int, direction: str) -> str:
 
 
 def compute_qty(balance: float, entry: float, stop: float,
-                filters: dict) -> tuple[float, str]:
+                filters: dict, risk_pct: float | None = None) -> tuple[float, str]:
     """Risk-based sizing. Returns (qty, note); qty == 0 means skip.
 
     qty = (balance * RISK_PCT_PER_TRADE/100) / |entry - stop|, floored to
     stepSize, honoring minQty / minNotional and the per-symbol exposure cap.
+    risk_pct overrides the config default (dashboard may only tighten it).
     """
     if balance is None or balance <= 0:
         return 0.0, "balance unavailable"
-    risk_usdt = balance * config.RISK_PCT_PER_TRADE / 100
+    rp = config.RISK_PCT_PER_TRADE if risk_pct is None else risk_pct
+    risk_usdt = balance * rp / 100
     per_unit = abs(entry - stop)
     if per_unit <= 0:
         return 0.0, "zero stop distance"
@@ -183,11 +195,49 @@ class Executor:
         self.evaluate_fn = evaluate_fn
 
     # ------------------------------------------------------------- helpers
+    def _dash_settings(self) -> dict:
+        """Dashboard settings merged over built-in defaults.
+
+        Read fresh on every call (cheap: tiny JSON file) so the dashboard
+        takes effect without restarting the loop. Missing/corrupt file ->
+        defaults (current behavior, auto-trade ON).
+        """
+        s = dict(_DASH_DEFAULTS)
+        try:
+            with open(config.DASHBOARD_SETTINGS_FILE, "r",
+                      encoding="utf-8") as f:
+                loaded = json.load(f) or {}
+            for k in s:
+                if k in loaded:
+                    s[k] = loaded[k]
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        return s
+
+    def _effective_risk_pct(self) -> float:
+        # Dashboard may only TIGHTEN risk, never exceed the code default.
+        try:
+            v = float(self._dash_settings().get("risk_pct_per_trade",
+                                                config.RISK_PCT_PER_TRADE))
+        except (TypeError, ValueError):
+            v = config.RISK_PCT_PER_TRADE
+        return max(0.1, min(v, config.RISK_PCT_PER_TRADE))
+
+    def _effective_max_leverage(self) -> int:
+        try:
+            v = int(self._dash_settings().get("max_leverage",
+                                              config.MAX_LEVERAGE))
+        except (TypeError, ValueError):
+            v = config.MAX_LEVERAGE
+        return max(1, min(v, config.MAX_LEVERAGE))
+
     def _resolve_leverage(self, symbol: str) -> int:
         """Leverage for a symbol. Resolution order:
         1. explicit single override (--leverage),
         2. per-symbol tier (test mode only),
         3. normal risk default MAX_LEVERAGE.
+        The dashboard cap tightens (never loosens) path 3 only; explicit
+        test-mode overrides are left untouched.
         """
         if self.leverage_override:
             return self.leverage_override
@@ -199,7 +249,8 @@ class Executor:
             default = (self.leverage_default if self.leverage_default is not None
                        else config.TEST_LEVERAGE_DEFAULT)
             return tiers.get(symbol, default)
-        return min(config.MAX_LEVERAGE, 125)
+        return max(1, min(config.MAX_LEVERAGE, self._effective_max_leverage(),
+                          125))
 
     def _open_positions(self) -> dict:
         return {pid: p for pid, p in self.state.get("positions", {}).items()
@@ -260,6 +311,11 @@ class Executor:
         # Idempotency mark happens ONLY on a committed open (below), so a
         # rejected signal can be reconsidered on the next scan if conditions
         # change — but the same signal candle can never open twice.
+        if not self._dash_settings().get("auto_trade", True):
+            self.lifecycle.log(sid, symbol, REJECTED,
+                               reason="auto-trade disabled (dashboard)")
+            summary["rejected"] += 1
+            return
         ok, opened = self._try_open(symbol, signal, sid, balance)
         if ok:
             summary["opened"] += 1
@@ -373,7 +429,8 @@ class Executor:
                                          filters)
         else:
             qty, note = compute_qty(balance, entry, float(signal["stop_loss"]),
-                                    filters)
+                                    filters,
+                                    risk_pct=self._effective_risk_pct())
         if qty <= 0:
             return self._reject(symbol, sid, f"sizing: {note}")
         notional = qty * entry
