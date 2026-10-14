@@ -35,12 +35,21 @@ SETTINGS_PATH = config.DASHBOARD_SETTINGS_FILE
 DEFAULTS = config.DASHBOARD_DEFAULTS
 
 
-def load_settings(path: str = SETTINGS_PATH) -> dict:
-    """Current settings merged over defaults. Missing/corrupt -> defaults."""
+def load_settings(path: str = SETTINGS_PATH,
+                  mode: str = "live") -> dict:
+    """Current settings for a mode, merged over defaults.
+
+    The file holds per-mode sections {"live": {...}, "testnet": {...}}.
+    A legacy flat file (no mode keys) is treated as the live section.
+    Missing/corrupt -> defaults.
+    """
     s = dict(DEFAULTS)
     try:
         with open(path, "r", encoding="utf-8") as f:
             loaded = json.load(f) or {}
+        if isinstance(loaded, dict) and any(
+                k in loaded for k in ("live", "testnet", "paper")):
+            loaded = loaded.get(mode) or {}
         for k in s:
             if k in loaded:
                 s[k] = loaded[k]
@@ -132,15 +141,62 @@ def validate_settings(data: dict) -> dict:
                 raise ValueError(f"{k} must be 0.01-10")
             out[k] = v
 
+    # ---- order execution (full operator control) ----
+    if "margin_mode" in data:
+        v = data["margin_mode"]
+        if v not in ("ISOLATED", "CROSS"):
+            raise ValueError("margin_mode must be ISOLATED or CROSS")
+        out["margin_mode"] = v
+
+    if "leverage_mode" in data:
+        v = data["leverage_mode"]
+        if v not in ("auto", "fixed"):
+            raise ValueError("leverage_mode must be auto or fixed")
+        out["leverage_mode"] = v
+
+    if "leverage" in data:
+        try:
+            v = int(data["leverage"])
+        except (TypeError, ValueError):
+            raise ValueError("leverage must be an integer")
+        if not 1 <= v <= 125:
+            raise ValueError("leverage must be 1-125")
+        out["leverage"] = v
+
+    if "entry_mode" in data:
+        v = data["entry_mode"]
+        if v not in ("risk", "fixed_usdt"):
+            raise ValueError("entry_mode must be risk or fixed_usdt")
+        out["entry_mode"] = v
+
+    if "fixed_usdt" in data:
+        try:
+            v = float(data["fixed_usdt"])
+        except (TypeError, ValueError):
+            raise ValueError("fixed_usdt must be a number")
+        if not 1 <= v <= 100_000:
+            raise ValueError("fixed_usdt must be 1-100000")
+        out["fixed_usdt"] = v
+
     return out
 
 
-def save_settings(data: dict, path: str = SETTINGS_PATH) -> dict:
-    """Validate + atomically persist settings. Returns the cleaned dict."""
+def save_settings(data: dict, path: str = SETTINGS_PATH,
+                  mode: str = "live") -> dict:
+    """Validate + atomically persist a mode's settings. Returns cleaned dict."""
     cleaned = validate_settings(data)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            full = json.load(f) or {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        full = {}
+    if not isinstance(full, dict) or not any(
+            k in full for k in ("live", "testnet", "paper")):
+        full = {}  # legacy flat file: start fresh per-mode sections
+    full[mode] = cleaned
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cleaned, f, indent=2)
+        json.dump(full, f, indent=2)
     os.replace(tmp, path)
     return cleaned
 
@@ -286,7 +342,7 @@ def build_status(mode: str) -> dict:
         "n_positions": len(positions),
         "daily": st.get("daily") or {},
         "kill_switch": st.get("kill_switch") or {},
-        "settings": load_settings(),
+        "settings": load_settings(mode=mode),
     }
 
 
@@ -426,6 +482,31 @@ th{color:#8b949e;font-weight:600}
     <label class="switch"><input type="checkbox" id="s-be">
     <span class="sl"></span></label></div>
 </div>
+<div class="card"><h2>⚙️ Order</h2>
+  <div class="setrow"><label>Margin mode</label>
+    <select id="s-margin">
+      <option value="ISOLATED">ISOLATED</option>
+      <option value="CROSS">CROSS</option>
+    </select></div>
+  <div class="setrow"><label>Leverage mode<br>
+    <span class="dim" style="font-size:12px">auto = ikut max leverage di atas</span></label>
+    <select id="s-levmode">
+      <option value="auto">auto</option>
+      <option value="fixed">fixed</option>
+    </select></div>
+  <div class="setrow"><label>Leverage (1–125)<br>
+    <span class="dim" style="font-size:12px">dipakai kalau mode fixed</span></label>
+    <input type="number" id="s-levx" step="1" min="1" max="125"></div>
+  <div class="setrow"><label>Entry mode<br>
+    <span class="dim" style="font-size:12px">risk = ikut risiko %; fixed = nominal tetap</span></label>
+    <select id="s-entrymode">
+      <option value="risk">risk %</option>
+      <option value="fixed_usdt">fixed USDT</option>
+    </select></div>
+  <div class="setrow"><label>Fixed USDT / posisi</label>
+    <input type="number" id="s-fixedu" step="1" min="1" max="100000"></div>
+  <div class="dim" style="font-size:12px" id="order-warn"></div>
+</div>
 <div class="card"><h2>⛔ Vetoes <span class="dim" style="font-size:12px;text-transform:none">
   (matikan = risiko sendiri)</span></h2>
   <div id="vetoes"></div>
@@ -481,6 +562,20 @@ async function refresh(){
     $('s-sp1').value = st.tp_split_1; $('s-sp2').value = st.tp_split_2;
     $('s-sp3').value = st.tp_split_3;
     $('s-be').checked = !!st.breakeven_after_tp1;
+    $('s-margin').value = st.margin_mode || 'ISOLATED';
+    $('s-levmode').value = st.leverage_mode || 'auto';
+    $('s-levx').value = st.leverage;
+    $('s-entrymode').value = st.entry_mode || 'risk';
+    $('s-fixedu').value = st.fixed_usdt;
+    const warns=[];
+    if(st.margin_mode==='CROSS') warns.push('margin CROSS');
+    if(st.leverage_mode==='fixed'&&st.leverage>3)
+      warns.push('leverage '+st.leverage+'x');
+    if(st.entry_mode==='fixed_usdt')
+      warns.push('entry fixed '+st.fixed_usdt+' USDT');
+    $('order-warn').innerHTML = warns.length
+      ? '⚠️ di luar default aman: <b class="yel">'+warns.join(', ')+'</b>'
+      : '<span class="dim">order config = default aman</span>';
     renderVetoes(st);
     const pos = $('positions');
     if(!s.positions.length){ pos.innerHTML='<span class="dim">tidak ada posisi</span>'; }
@@ -559,6 +654,11 @@ $('save').onclick = ()=>{
     tp_split_2:parseFloat($('s-sp2').value),
     tp_split_3:parseFloat($('s-sp3').value),
     breakeven_after_tp1:$('s-be').checked,
+    margin_mode:$('s-margin').value,
+    leverage_mode:$('s-levmode').value,
+    leverage:parseInt($('s-levx').value),
+    entry_mode:$('s-entrymode').value,
+    fixed_usdt:parseFloat($('s-fixedu').value),
   });
 };
 $('scan').onclick = async ()=>{
@@ -626,7 +726,7 @@ class Handler(BaseHTTPRequestHandler):
                 limit = 60
             self._json(200, read_events(self._mode(), limit))
         elif path == "/api/settings":
-            self._json(200, load_settings())
+            self._json(200, load_settings(mode=self._mode()))
         elif path == "/api/radar":
             try:
                 self._json(200, run_radar())
@@ -651,20 +751,16 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._json(400, {"error": "invalid JSON"})
             return
-        # Merge over current settings so partial updates (e.g. just the
-        # auto-trade toggle) don't reset the other knobs.
-        merged = load_settings()
+        # Merge over the mode's current settings so partial updates (e.g.
+        # just the auto-trade toggle) don't reset the other knobs.
+        mode = self._mode()
+        merged = load_settings(mode=mode)
         merged.update(data if isinstance(data, dict) else {})
         try:
-            cleaned = validate_settings(merged)
+            cleaned = save_settings(merged, path=SETTINGS_PATH, mode=mode)
         except ValueError as e:
             self._json(400, {"error": str(e)})
             return
-        tmp = SETTINGS_PATH + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(cleaned, f, indent=2)
-            os.replace(tmp, SETTINGS_PATH)
         except OSError as e:
             self._json(500, {"error": f"save failed: {e}"})
             return
@@ -679,9 +775,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--host", default="127.0.0.1",
                     help="bind address (default localhost only)")
-    ap.add_argument("--mode", default="live",
+    _env_mode = (os.environ.get("BOT_MODE") or "").strip().lower()
+    if _env_mode == "demo":
+        _env_mode = "testnet"
+    if _env_mode not in ("live", "testnet", "paper"):
+        _env_mode = "live"
+    ap.add_argument("--mode", default=_env_mode,
                     choices=["live", "testnet", "paper"],
-                    help="default mode shown on load")
+                    help="default mode shown on load (default: $BOT_MODE)")
     args = ap.parse_args(argv)
     # Rewrite the default mode into the served page.
     global PAGE
