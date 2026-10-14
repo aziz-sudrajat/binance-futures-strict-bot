@@ -135,3 +135,46 @@ def test_live_never_uses_testnet_key_env(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         build(_args(), env={"BINANCE_TESTNET_KEY": "k",
                             "BINANCE_TESTNET_SECRET": "s"})
+
+
+# ------------------------------------------------------------------ --balance
+class _FakeBalanceExchange:
+    def __init__(self, bal):
+        self._bal = bal
+
+    def get_balance(self, asset="USDT"):
+        return self._bal
+
+
+class _FakeBalanceExecutor:
+    def __init__(self, bal):
+        self.exchange = _FakeBalanceExchange(bal)
+
+
+def test_balance_live_refuses_without_keys():
+    from run_executor import main
+    with pytest.raises(SystemExit):
+        main(["--live", "--balance"])
+
+
+def test_balance_prints_live_balance(monkeypatch, capsys):
+    import run_executor
+    from run_executor import main
+    monkeypatch.setattr(run_executor, "build",
+                        lambda args, env=None: (_FakeBalanceExecutor(1234.5),
+                                                "LIVE (https://fapi.binance.com)"))
+    rc = main(["--live", "--balance"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "1234.50" in out and "USDT" in out
+
+
+def test_balance_reports_exchange_error(monkeypatch, capsys):
+    import run_executor
+    from run_executor import main
+    monkeypatch.setattr(run_executor, "build",
+                        lambda args, env=None: (_FakeBalanceExecutor(None),
+                                                "LIVE (https://fapi.binance.com)"))
+    rc = main(["--live", "--balance"])
+    assert rc == 1
+    assert "unavailable" in capsys.readouterr().out
