@@ -2,8 +2,9 @@
 
 > Phase 1: STRICT signal engine (paper mode). Phase 2: testnet executor
 > (`executor.py`, `risk.py`, `state.py`, `exchange.py`, `run_executor.py`).
-> Live trading is NOT enabled: the executor defaults to the Binance Futures
-> **testnet** and refuses to run `--testnet` without explicit env keys.
+> Phase 3: live mainnet mode (`--live`) — real orders on Binance Futures
+> mainnet, requires `BINANCE_LIVE_KEY`/`BINANCE_LIVE_SECRET`, and refuses all
+> TEST ONLY flags. Run it only from a non-geo-blocked host.
 
 Port of the **decision pipeline** from the GAS signal bot
 (`workspace/user/files/AZZATSSINS-20261013-imageperf-v4_5_02o2.gs`, 8.659 lines)
@@ -347,16 +348,34 @@ export BINANCE_TESTNET_KEY=... BINANCE_TESTNET_SECRET=...
 5. `export BINANCE_TESTNET_KEY=<key> BINANCE_TESTNET_SECRET=<secret>` —
    never paste them into chat, never commit them (see `.gitignore`).
 
-### Live deployment (mainnet) — NOT enabled yet
+### Live deployment (mainnet) — enabled via `--live`
 
 - Binance **mainnet is geo-blocked (HTTP 451) from some hosting locations**
-  (verified 2026-10-14 from this VM). The data layer already falls back to
-  OKX/Gate.io, but *order placement* needs Binance API access.
-- The executor supports a base-URL override via `BINANCE_FUTURES_BASE_URL`
-  env for a future non-blocked host (e.g. a VPS in an allowed region).
-- Do NOT point it at mainnet until: paper+testnet validation is complete,
-  the cross-validation vs GAS signals (roadmap item 5) is done, risk limits
-  are reviewed, and the user gives explicit approval.
+  (verified 2026-10-14 from this VM). Run the live executor from a
+  non-blocked host (e.g. the user's own machine in Indonesia, or a VPS in an
+  allowed region). The data layer already falls back to OKX/Gate.io.
+- Setup on the live host:
+  1. `git clone https://github.com/aziz-sudrajat/binance-futures-strict-bot`
+  2. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+  3. Create a mainnet key at https://www.binance.com (API Management:
+     enable **Futures**, DISABLE **withdrawals**, restrict IP if possible).
+  4. `export BINANCE_LIVE_KEY=<key> BINANCE_LIVE_SECRET=<secret>` —
+     never paste them into chat, never commit them (see `.gitignore`).
+  5. Dry-check without trading: `.venv/bin/python run_executor.py --live --once`
+     (a full scan cycle that opens real positions only on APPROVED signals).
+- Run continuously: `.venv/bin/python run_executor.py --live --loop`
+  (default interval 5 min), or via cron/systemd with a lock file.
+- Hard safety properties (enforced in code, tested):
+  - `--live` refuses without `BINANCE_LIVE_KEY`/`BINANCE_LIVE_SECRET`.
+  - `--live` REFUSES all TEST ONLY flags (`--fixed-margin-usdt`,
+    `--leverage`, `--leverage-tiers`, `--leverage-default`, `--manual`).
+  - Live always uses production risk defaults: 1% risk/trade, max 3x
+    leverage, TP1/TP2/TP3 + SL + breakeven, daily-loss kill switch.
+  - Live keeps separate state files (`state-live.json`,
+    `lifecycle-live.jsonl`) so testnet/paper history can never mix in.
+- Do NOT run live until: paper+testnet validation is complete, the
+  cross-validation vs GAS signals (roadmap item 5) is done, risk limits are
+  reviewed, and the user gives explicit approval.
 
 ### Pre-deploy checklist (from the quant-trading skill)
 
@@ -374,5 +393,6 @@ export BINANCE_TESTNET_KEY=... BINANCE_TESTNET_SECRET=...
 
 - No API key / secret is requested, stored, or logged anywhere. Keys live
   only in environment variables at runtime.
-- `--testnet` without keys refuses; there is no mainnet code path enabled.
+- `--testnet`/`--live` without their keys refuse to run; live never falls
+  back to testnet or paper, and refuses every TEST ONLY flag.
 - No profit promises; signals are technical setups, not financial advice.
