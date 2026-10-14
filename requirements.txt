@@ -1,0 +1,6 @@
+# Phase 1: public market data only. No exchange SDK needed — the engine uses
+# plain HTTPS against public endpoints. python-binance is the planned Phase 2
+# dependency (signed order placement on testnet/mainnet); it is deliberately
+# NOT included yet so Phase 1 stays dependency-light and cannot place orders.
+requests>=2.31
+pytest>=8.0
