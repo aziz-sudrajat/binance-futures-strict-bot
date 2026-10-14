@@ -216,6 +216,53 @@ DASH_MTF_MODES = ("STRICT", "LEAN")
 # Disabling a veto is an explicit operator choice and is logged as such.
 DASH_VETO_CODES = ("leverage_risk", "funding", "squeeze", "whale",
                    "liq_wall", "btc_breaker")
+# Signal strictness presets: ketat | sedang | biasa.
+# Choosing a mode applies its bundle to the individual dashboard settings
+# (quality gate, MTF 30m leg, bullish-only, volume gate, freshness drift,
+# veto toggles). The user can still fine-tune knobs afterwards — the mode
+# is a preset, not a lock.
+SIGNAL_MODES = ("ketat", "sedang", "biasa")
+SIGNAL_MODE_PRESETS = {
+    "ketat": {  # today's behavior — GAS STRICT parity
+        "min_quality_score": 70,
+        "mtf_30m_mode": "STRICT",
+        "bullish_only": True,
+        "min_24h_volume_usd": 2_000_000.0,
+        "freshness_max_drift_pct": 0.4,
+        "veto_leverage_risk": True,
+        "veto_funding": True,
+        "veto_squeeze": True,
+        "veto_whale": True,
+        "veto_liq_wall": True,
+        "veto_btc_breaker": True,
+    },
+    "sedang": {  # relaxed: lower bar, LEAN 30m, drops the noisiest veto
+        "min_quality_score": 60,
+        "mtf_30m_mode": "LEAN",
+        "bullish_only": True,
+        "min_24h_volume_usd": 1_000_000.0,
+        "freshness_max_drift_pct": 0.6,
+        "veto_leverage_risk": True,
+        "veto_funding": True,
+        "veto_squeeze": True,
+        "veto_whale": True,
+        "veto_liq_wall": False,
+        "veto_btc_breaker": True,
+    },
+    "biasa": {  # permissive: quality floor, shorts allowed, core vetoes only
+        "min_quality_score": 50,
+        "mtf_30m_mode": "LEAN",
+        "bullish_only": False,
+        "min_24h_volume_usd": 500_000.0,
+        "freshness_max_drift_pct": 1.0,
+        "veto_leverage_risk": True,
+        "veto_funding": True,
+        "veto_squeeze": False,
+        "veto_whale": False,
+        "veto_liq_wall": False,
+        "veto_btc_breaker": False,
+    },
+}
 # Vetoes currently disabled by the dashboard (populated by
 # apply_dashboard_overrides; read by vetoes.run_vetoes).
 DISABLED_VETOES = frozenset()
@@ -230,6 +277,7 @@ DASHBOARD_DEFAULTS = {
     "max_leverage": 3,
     "poll_interval_min": 5,
     # signal
+    "signal_mode": "ketat",  # ketat | sedang | biasa (preset bundle)
     "min_quality_score": 70,
     "min_24h_volume_usd": 2_000_000.0,
     "freshness_max_drift_pct": 0.4,
