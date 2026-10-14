@@ -654,3 +654,136 @@ def test_manual_entry_unknown_symbol(workdir):
     executor, _ = _manual_rig(workdir)
     ok, note = executor.manual_entry("!!!")
     assert not ok
+
+
+def _short_signal(symbol="BTCUSDT", entry=100.0):
+    return {"symbol": symbol, "direction": "SHORT", "interval": "15m",
+            "entry": entry, "entry_low": 99.5, "entry_high": 100.5,
+            "stop_loss": 102.0, "tp1": 97.0, "tp2": 95.5, "tp3": 94.0,
+            "quality": 80}
+
+
+@pytest.fixture
+def short_rig(workdir):
+    market = FakeMarket(live=100.0)
+    exchange = FakeExchange(balance=10_000.0)
+    exchange.market_price = {"BTCUSDT": 100.0}
+    state = StateStore(os.path.join(workdir, "state.json"))
+    lifecycle = LifecycleLogger(os.path.join(workdir, "lifecycle.jsonl"))
+    risk = RiskManager(state, exchange.get_balance)
+    ev = lambda symbol, m: (_short_signal(symbol), "stub")  # noqa: E731
+    executor = Executor(market, exchange, risk, state, lifecycle,
+                        universe=["BTCUSDT"], evaluate_fn=ev)
+    return executor, market, exchange, state, lifecycle, risk
+
+
+def test_short_open_flow_sides_and_direction(short_rig):
+    executor, market, exchange, state, lifecycle, risk = short_rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    assert summary["opened"] == 1
+    pos_id, pos = next(iter(executor._open_positions().items()))
+    assert pos["direction"] == "SHORT"
+    # entry leg is a SELL (open short)
+    entry = exchange.get_order("BTCUSDT", order_id=pos["entry_order_id"])
+    assert entry["side"] == "SELL"
+    # brackets exit with BUY
+    sl = exchange.get_algo_order("BTCUSDT", pos["sl_order_id"])
+    assert sl["side"] == "BUY"
+    for leg in ("tp1", "tp2", "tp3"):
+        o = exchange.get_order("BTCUSDT", order_id=pos["tp"][leg]["order_id"])
+        assert o["side"] == "BUY" and o["reduceOnly"] is True
+
+
+def test_short_tp_fill_pnl_sign(short_rig):
+    executor, market, exchange, state, lifecycle, risk = short_rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    pos_id, pos = next(iter(executor._open_positions().items()))
+    entry_px = pos["entry_price"]
+    # TP1 fills below the entry -> profit for a short.
+    exchange.fill(pos["tp"]["tp1"]["order_id"], entry_px - 3.0)
+    executor._manage_one(pos_id, pos, 10_000.0, summary)
+    pos = executor._open_positions()[pos_id]
+    assert pos["tp"]["tp1"]["filled"] is True
+    assert pos["realized"] > 0, pos["realized"]
+
+
+def test_short_sl_fill_pnl_sign(short_rig):
+    executor, market, exchange, state, lifecycle, risk = short_rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    pos_id, pos = next(iter(executor._open_positions().items()))
+    entry_px = pos["entry_price"]
+    qty = pos["qty"]
+    # SL fills above the entry -> loss for a short (mirrored PnL sign).
+    sl_id = pos["sl_order_id"]
+    exchange.orders[sl_id]["status"] = "FILLED"
+    exchange.orders[sl_id]["avgPrice"] = entry_px + 2.0
+    executor._close_position(pos_id, pos, pos["signal_id"], summary)
+    assert pos["realized"] < 0, pos["realized"]
+    # gross loss ~= -2.0 * qty; allow fee slippage in the bound
+    assert pos["realized"] > -(2.0 * qty) * 1.1
+
+
+def test_paper_fill_simulation_short():
+    prices = {"BTCUSDT": 100.0}
+    broker = PaperBroker(10_000.0, price_fn=lambda s: prices[s])
+    # Short entry: SELL LIMIT above the market rests until touched.
+    o = broker.place_order("BTCUSDT", "SELL", "LIMIT", quantity=1.0,
+                           price=101.0)
+    assert o["status"] == "NEW"  # rests: live 100 < 101
+    prices["BTCUSDT"] = 101.5
+    fills = broker.poll(["BTCUSDT"])
+    assert len(fills) == 1 and fills[0]["order"]["status"] == "FILLED"
+    assert broker.positions["BTCUSDT"]["qty"] == -1.0
+    assert broker.get_positions()[0]["side"] == "SHORT"
+    # Short take-profit (BUY LIMIT below) fills when price drops to it.
+    tp = broker.place_order("BTCUSDT", "BUY", "LIMIT", quantity=0.5,
+                            price=97.0, reduce_only=True)
+    assert tp["status"] == "NEW"
+    prices["BTCUSDT"] = 96.0
+    fills = broker.poll(["BTCUSDT"])
+    assert len(fills) == 1
+    assert broker.realized_pnl > 0  # short TP below entry = profit
+    assert broker.positions["BTCUSDT"]["qty"] == -0.5
+    # Short stop (BUY STOP_MARKET above) triggers when price rallies to it.
+    sl = broker.place_order("BTCUSDT", "BUY", "STOP_MARKET", quantity=0.5,
+                            stop_price=103.0, reduce_only=True)
+    prices["BTCUSDT"] = 104.0
+    fills = broker.poll(["BTCUSDT"])
+    assert len(fills) == 1
+    assert broker.positions["BTCUSDT"]["qty"] == 0.0
+
+
+def test_short_full_stack_with_paper_broker(workdir):
+    """End-to-end SHORT through the real PaperBroker: SELL entry fills,
+    BUY brackets placed, TP fills below entry books a profit."""
+    prices = {"BTCUSDT": 100.0}
+    market = FakeMarket(live=100.0)
+    broker = PaperBroker(10_000.0, price_fn=lambda s: prices[s])
+    state = StateStore(os.path.join(workdir, "state.json"))
+    lifecycle = LifecycleLogger(os.path.join(workdir, "lifecycle.jsonl"))
+    risk = RiskManager(state, broker.get_balance)
+    ev = lambda symbol, m: (_short_signal(symbol), "stub")  # noqa: E731
+    ex = Executor(market, broker, risk, state, lifecycle,
+                  universe=["BTCUSDT"], evaluate_fn=ev,
+                  fixed_margin_usdt=10.0,
+                  leverage_override=10)
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    ex._scan_symbol("BTCUSDT", 10_000.0, summary)
+    assert summary["opened"] == 1, summary
+    pos_id, pos = next(iter(ex._open_positions().items()))
+    assert pos["direction"] == "SHORT"
+    assert pos["brackets_placed"] is True
+    # Drive the simulation: TP1 (BUY LIMIT @97) fills when price drops.
+    prices["BTCUSDT"] = 96.0
+    broker.poll(["BTCUSDT"])
+    ex._manage_one(pos_id, pos, 10_000.0, summary)
+    pos = ex._open_positions()[pos_id]
+    assert pos["tp"]["tp1"]["filled"] is True
+    assert pos["realized"] > 0
