@@ -208,6 +208,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="TEST ONLY: manual market LONG entry on SYMBOL at the live "
                          "price (bypasses ALL STRICT signal gates; ATR-based SL + "
                          "RR-based TP brackets still apply). E.g. --manual GRASSUSDT.")
+    ap.add_argument("--balance", action="store_true",
+                    help="print the futures USDT balance and exit "
+                         "(needs --live or --testnet keys)")
     args = ap.parse_args(argv)
     if args.testnet or args.live:
         args.paper = False
@@ -226,6 +229,13 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     executor, mode = build(args)
     log.warning("starting executor in %s mode", mode)
+    if args.balance:
+        bal = executor.exchange.get_balance()
+        if bal is None:
+            print("balance: unavailable (exchange error)", flush=True)
+            return 1
+        print(f"futures balance: {bal:.2f} USDT ({mode})", flush=True)
+        return 0
     if args.manual:
         if not args.testnet:
             raise SystemExit("ERROR: --manual needs --testnet (TEST ONLY; "
