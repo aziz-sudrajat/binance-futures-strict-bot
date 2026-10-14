@@ -333,6 +333,72 @@ class Executor:
         self.state.save()
         return summary
 
+    def scan_from_db(self, db_path: str = "signals.db") -> dict:
+        """One cycle: manage positions, then execute fresh DB signals.
+
+        Stage 2 of the two-stage pipeline. The scanner (stage 1) already ran
+        the full STRICT engine on ALL OKX coins; here we only re-validate
+        (freshness re-check, risk gates) and execute on Binance. Signals are
+        marked consumed whether opened or rejected at execution.
+        """
+        from signals_db import SignalDB
+        summary: dict = {"approved": 0, "rejected": 0, "opened": 0,
+                         "managed": 0, "errors": []}
+        balance = self.exchange.get_balance()
+        self.risk.ensure_day()
+        # Studio settings: applied every cycle, no restart needed.
+        config.apply_dashboard_overrides(self._dash_settings())
+        self._manage_positions(balance, summary)
+        db = SignalDB(db_path)
+        try:
+            db.expire_old()
+            rows = db.get_fresh_signals(limit=config.DB_SCAN_LIMIT)
+            log.info("db signals: %d fresh", len(rows))
+            for row in rows:
+                sid = row["signal_id"]
+                symbol = row["symbol"]
+                if self.state.seen_signal(sid):
+                    self.lifecycle.log(sid, symbol, REJECTED,
+                                       reason="duplicate signal id (db)")
+                    db.mark_consumed(row["id"])
+                    summary["rejected"] += 1
+                    continue
+                signal = db.to_signal(row)
+                self.lifecycle.log(sid, symbol, APPROVED,
+                                   quality=signal.get("quality"),
+                                   entry=signal.get("entry"),
+                                   stop_loss=signal.get("stop_loss"),
+                                   tp1=signal.get("tp1"),
+                                   tp2=signal.get("tp2"),
+                                   tp3=signal.get("tp3"))
+                summary["approved"] += 1
+                if not self._dash_settings().get("auto_trade", True):
+                    self.lifecycle.log(sid, symbol, REJECTED,
+                                       reason="auto-trade disabled (dashboard)")
+                    db.mark_consumed(row["id"])
+                    summary["rejected"] += 1
+                    continue
+                ok, _note = self._try_open(symbol, signal, sid, balance)
+                db.mark_consumed(row["id"])
+                if ok:
+                    summary["opened"] += 1
+                else:
+                    summary["rejected"] += 1
+        except Exception as e:  # noqa: BLE001 - db failure never kills manage
+            log.exception("db scan failed")
+            summary["errors"].append(f"db: {e}")
+        finally:
+            db.close()
+        # Advance paper-broker fills (no-op on the real client).
+        poll = getattr(self.exchange, "poll", None)
+        if callable(poll):
+            try:
+                poll(self.universe)
+            except Exception:  # noqa: BLE001
+                log.exception("paper poll failed")
+        self.state.save()
+        return summary
+
     def _scan_symbol(self, symbol: str, balance: float | None,
                      summary: dict) -> None:
         signal, note = self.evaluate_fn(symbol, self.market)
@@ -811,8 +877,13 @@ class Executor:
         self.state.save()
 
     # ------------------------------------------------------------------ loop
-    def run_loop(self, stop_after: int | None = None) -> None:
-        """Run scan cycles forever (or stop_after cycles, for tests/smoke)."""
+    def run_loop(self, stop_after: int | None = None,
+                 from_db: bool = False, db_path: str = "signals.db") -> None:
+        """Run scan cycles forever (or stop_after cycles, for tests/smoke).
+
+        from_db=True takes signals from the scanner's signals.db instead of
+        scanning the market directly (two-stage pipeline).
+        """
         # Startup reconcile: adopt/close vs the real exchange state.
         try:
             rec = self.state.reconcile(self.exchange.get_positions())
@@ -825,7 +896,8 @@ class Executor:
         while True:
             log.info("--- scan cycle %d ---", n + 1)
             try:
-                summary = self.scan_once()
+                summary = (self.scan_from_db(db_path) if from_db
+                           else self.scan_once())
                 log.info("cycle summary: %s", summary)
             except Exception:  # noqa: BLE001 - the loop must survive
                 log.exception("scan cycle failed")
