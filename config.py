@@ -164,3 +164,138 @@ KLINES_TTL_SEC = {"5m": 300, "15m": 480, "30m": 720, "1h": 1200, "4h": 2400, "1d
 DERIVATIVES_CACHE_SEC = 120
 DERIVATIVES_PERIOD = "4h"       # GAS: CFG.DERIVATIVES_DEFAULT_PERIOD (L51)
 HTTP_TIMEOUT_SEC = 15
+
+# ------------------------------------------------- dashboard studio overrides
+# Trading-studio settings (dashboard.py writes dashboard_settings.json; the
+# executor applies them at the start of every scan cycle via
+# apply_dashboard_overrides(), so changes take effect WITHOUT a restart).
+#
+# Numeric engine knobs: setting name -> (config attribute, min, max).
+# STRICT defaults are the code defaults; the dashboard may move them within
+# the ranges below. Nothing here can disable a hard gate except the explicit
+# veto toggles (which the user opts into deliberately).
+DASH_NUMERIC_OVERRIDES = {
+    # signal quality gate
+    "min_quality_score": ("MIN_QUALITY_SCORE", 50, 95),
+    "min_24h_volume_usd": ("MIN_24H_VOLUME_USD", 500_000, 10_000_000),
+    "freshness_max_drift_pct": ("FRESHNESS_MAX_DRIFT_PCT", 0.1, 2.0),
+    # TP / SL geometry (RR multiples of the ATR stop distance)
+    "tp1_rr": ("TP1_RR", 0.5, 5.0),
+    "tp2_rr": ("TP2_RR", 1.0, 8.0),
+    "tp3_rr": ("TP3_RR", 1.5, 12.0),
+    "stop_atr_min": ("STOP_ATR_MIN", 0.5, 3.0),
+    "stop_atr_max": ("STOP_ATR_MAX", 1.0, 5.0),
+}
+# Boolean engine knobs: setting name -> config attribute.
+DASH_BOOL_OVERRIDES = {
+    "bullish_only": "BULLISH_ONLY",
+    "breakeven_after_tp1": "EXEC_BREAKEVEN_AFTER_TP1",
+}
+# MTF 30m leg mode: STRICT (default) or LEAN (GAS default behavior).
+DASH_MTF_MODES = ("STRICT", "LEAN")
+# Deterministic veto codes the dashboard can toggle (default: all enabled).
+# Disabling a veto is an explicit operator choice and is logged as such.
+DASH_VETO_CODES = ("leverage_risk", "funding", "squeeze", "whale",
+                   "liq_wall", "btc_breaker")
+# Vetoes currently disabled by the dashboard (populated by
+# apply_dashboard_overrides; read by vetoes.run_vetoes).
+DISABLED_VETOES = frozenset()
+
+# Canonical dashboard defaults — single source of truth for dashboard.py,
+# executor.py and validation. Risk knobs (auto_trade, risk_pct, leverage,
+# interval) live here too.
+DASHBOARD_DEFAULTS = {
+    # operation
+    "auto_trade": True,
+    "risk_pct_per_trade": 1.0,
+    "max_leverage": 3,
+    "poll_interval_min": 5,
+    # signal
+    "min_quality_score": 70,
+    "min_24h_volume_usd": 2_000_000.0,
+    "freshness_max_drift_pct": 0.4,
+    "bullish_only": True,
+    "mtf_30m_mode": "STRICT",
+    # TP / SL
+    "tp1_rr": 1.5,
+    "tp2_rr": 2.25,
+    "tp3_rr": 3.0,
+    "stop_atr_min": 1.25,
+    "stop_atr_max": 2.0,
+    "tp_split_1": 0.4,
+    "tp_split_2": 0.3,
+    "tp_split_3": 0.3,
+    "breakeven_after_tp1": True,
+    # vetoes (True = enabled)
+    "veto_leverage_risk": True,
+    "veto_funding": True,
+    "veto_squeeze": True,
+    "veto_whale": True,
+    "veto_liq_wall": True,
+    "veto_btc_breaker": True,
+}
+
+_ORIGINALS: dict = {}
+
+
+def _snapshot_originals() -> None:
+    if _ORIGINALS:
+        return
+    for _name, (attr, _lo, _hi) in DASH_NUMERIC_OVERRIDES.items():
+        _ORIGINALS[attr] = globals()[attr]
+    for attr in DASH_BOOL_OVERRIDES.values():
+        _ORIGINALS[attr] = globals()[attr]
+    _ORIGINALS["TP_SPLIT"] = TP_SPLIT
+    _ORIGINALS["MTF_30M_MODE"] = MTF_30M_MODE
+    _ORIGINALS["DISABLED_VETOES"] = frozenset()
+
+
+def apply_dashboard_overrides(settings: dict) -> None:
+    """Patch engine config from dashboard settings (clamped, idempotent).
+
+    Called by the executor at the start of every scan cycle. Missing keys
+    keep current values; out-of-range values are clamped. Never raises —
+    the scan loop must survive a corrupt settings file.
+    """
+    try:
+        _snapshot_originals()
+        for name, (attr, lo, hi) in DASH_NUMERIC_OVERRIDES.items():
+            if name not in settings:
+                continue
+            try:
+                v = float(settings[name])
+            except (TypeError, ValueError):
+                continue
+            v = max(lo, min(hi, v))
+            if attr == "MIN_QUALITY_SCORE":
+                v = int(round(v))
+            globals()[attr] = v
+        for name, attr in DASH_BOOL_OVERRIDES.items():
+            if name in settings and isinstance(settings[name], bool):
+                globals()[attr] = settings[name]
+        if settings.get("mtf_30m_mode") in DASH_MTF_MODES:
+            globals()["MTF_30M_MODE"] = settings["mtf_30m_mode"]
+        # TP split: three fractions, normalized to sum 1.
+        try:
+            parts = [float(settings[f"tp_split_{i}"]) for i in (1, 2, 3)]
+            if all(p > 0 for p in parts):
+                tot = sum(parts)
+                globals()["TP_SPLIT"] = tuple(p / tot for p in parts)
+        except (KeyError, TypeError, ValueError):
+            pass
+        # stop ATR sanity: min must not exceed max.
+        if globals()["STOP_ATR_MIN"] > globals()["STOP_ATR_MAX"]:
+            globals()["STOP_ATR_MIN"] = globals()["STOP_ATR_MAX"]
+        disabled = frozenset(
+            code for code in DASH_VETO_CODES
+            if settings.get(f"veto_{code}", True) is False)
+        globals()["DISABLED_VETOES"] = disabled
+    except Exception:  # noqa: BLE001 - never break the scan loop
+        pass
+
+
+def reset_dashboard_overrides() -> None:
+    """Restore the STRICT code defaults (used by tests)."""
+    _snapshot_originals()
+    for attr, v in _ORIGINALS.items():
+        globals()[attr] = v
