@@ -448,6 +448,35 @@ class MarketData:
             out.append(f"{base}USDT")
         return sorted(set(out))
 
+    def get_swap_tickers(self) -> list[dict]:
+        """Bulk 24h stats for every USDT-margined OKX perpetual (one HTTP call).
+
+        Returns Binance-style dicts: symbol, last, vol_usd_24h, chg_pct_24h.
+        chg is derived from open24h because /market/tickers has no % field.
+        Leveraged tokens and non-USDT-SWAP instruments are excluded.
+        """
+        rows = self._okx_get("/api/v5/market/tickers", {"instType": "SWAP"})
+        out = []
+        for r in rows:
+            inst = str(r.get("instId", ""))
+            m = re.fullmatch(r"([A-Z0-9]+)-USDT-SWAP", inst)
+            if not m:
+                continue
+            base = m.group(1)
+            if base.endswith(("UP", "DOWN", "BULL", "BEAR", "3L", "3S")):
+                continue
+            last = self._num(r.get("last"))
+            open24 = self._num(r.get("open24h"))
+            base_vol = self._num(r.get("volCcy24h"))  # SWAP: base currency
+            if not last:
+                continue
+            vol_usd = (base_vol or 0.0) * last
+            chg_pct = ((last - open24) / open24 * 100.0
+                       if open24 else 0.0)
+            out.append({"symbol": f"{base}USDT", "base": base, "last": last,
+                        "vol_usd_24h": vol_usd, "chg_pct_24h": chg_pct})
+        return out
+
     def _okx_ct_val(self, inst_id: str) -> float:
         """Contract value (base currency) for an OKX SWAP instrument.
 

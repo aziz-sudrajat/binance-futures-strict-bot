@@ -47,7 +47,8 @@ CREATE INDEX IF NOT EXISTS idx_signals_symbol
   ON signals(symbol, status);
 """
 
-_COLUMNS = ("id", "symbol", "signal_id", "direction", "quality", "entry",
+_COLUMNS = ("id", "symbol", "signal_id", "direction", "quality", "strength",
+            "entry",
             "entry_low", "entry_high", "stop_loss", "tp1", "tp2", "tp3",
             "reasons", "regime", "source", "created_at", "expires_at",
             "status", "consumed_at")
@@ -59,7 +60,15 @@ class SignalDB:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Lightweight migrations for existing DBs (additive only)."""
+        cols = {r["name"] for r in
+                self._conn.execute("PRAGMA table_info(signals)")}
+        if "strength" not in cols:
+            self._conn.execute("ALTER TABLE signals ADD COLUMN strength REAL")
 
     def close(self):
         try:
@@ -81,9 +90,9 @@ class SignalDB:
         now_ms = int(time.time() * 1000)
         expires_at = now_ms + int(expiry_min) * 60_000
         cur = self._conn.execute(
-            "SELECT id, quality, expires_at FROM signals "
+            "SELECT id, quality, strength, expires_at FROM signals "
             "WHERE symbol = ? AND status = 'new' "
-            "ORDER BY quality DESC LIMIT 1",
+            "ORDER BY quality DESC, strength DESC LIMIT 1",
             (signal["symbol"],))
         row = cur.fetchone()
         if row and row["expires_at"] > now_ms \
@@ -94,12 +103,13 @@ class SignalDB:
                                "WHERE id = ?", (row["id"],))
         cur = self._conn.execute(
             """INSERT INTO signals
-               (symbol, signal_id, direction, quality, entry, entry_low,
-                entry_high, stop_loss, tp1, tp2, tp3, reasons, regime,
-                source, created_at, expires_at, status)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               (symbol, signal_id, direction, quality, strength, entry,
+                entry_low, entry_high, stop_loss, tp1, tp2, tp3, reasons,
+                regime, source, created_at, expires_at, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (signal["symbol"], signal_id, signal.get("direction", "LONG"),
              float(signal.get("quality") or 0),
+             signal.get("strength"),
              signal.get("entry"), signal.get("entry_low"),
              signal.get("entry_high"), signal.get("stop_loss"),
              signal.get("tp1"), signal.get("tp2"), signal.get("tp3"),
@@ -130,7 +140,7 @@ class SignalDB:
         cur = self._conn.execute(
             f"SELECT {', '.join(_COLUMNS)} FROM signals "
             "WHERE status = 'new' AND expires_at > ? "
-            "ORDER BY quality DESC LIMIT ?",
+            "ORDER BY quality DESC, strength DESC, id ASC LIMIT ?",
             (now_ms, limit))
         return [self._row_to_dict(r) for r in cur.fetchall()]
 

@@ -155,18 +155,85 @@ def split_tp_qty(qty: float, step: float, min_qty: float,
     return merged, f"tp splits {merged}"
 
 
+def select_top_movers(tickers: list[dict], n: int,
+                      min_vol_usd: float) -> list[str]:
+    """GAS parity: getTopMovers_ — top-N by |24h %| * log10(24h USD vol).
+
+    Stablecoins are never candidates (GAS CFG STABLECOINS); quiet coins
+    below min_vol_usd are cut. Returns Binance-style symbols, best first.
+    """
+    import math
+    stables = set(config.STABLECOINS)
+    scored = []
+    for t in tickers or []:
+        base = str(t.get("base") or "")
+        if base in stables:
+            continue
+        vol = float(t.get("vol_usd_24h") or 0)
+        if vol < min_vol_usd:
+            continue
+        chg = abs(float(t.get("chg_pct_24h") or 0))
+        scored.append((chg * math.log10(vol + 1), t.get("symbol")))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [s for _, s in scored[:max(1, n)]]
+
+
 def resolve_universe(exchange, settings: dict,
-                     curated: list[str] | None = None) -> list[str]:
+                     curated: list[str] | None = None,
+                     market=None) -> list[str]:
     """Universe for this scan cycle.
 
     - "curated" (default): the built-in liquid list (config.UNIVERSE).
     - "top_volume": top-N symbols by 24h quote volume from the exchange.
+    - "top_movers": GAS parity — top-N by |24h %| * log10(volume) from OKX
+      perpetual tickers (stables excluded). Needs `market` (MarketData).
+    - "all": every USDT-margined OKX perpetual (~hundreds of symbols).
+      Needs `market`. One bad symbol never kills a scan.
       Any fetch failure falls back to the curated list (fail-safe: keep
       trading the known coins instead of scanning nothing).
     """
     curated = list(curated if curated is not None else config.UNIVERSE)
-    if settings.get("universe_mode") != "top_volume":
+    mode = settings.get("universe_mode", "curated")
+    if mode not in config.UNIVERSE_MODES:
+        mode = "curated"
+    if mode == "curated":
         return curated
+    if mode == "all":
+        # Full sweep: every USDT-margined OKX perpetual.
+        try:
+            syms = market.list_okx_swap_symbols() if market is not None \
+                else []
+            syms = [s for s in syms
+                    if s[:-4] not in config.STABLECOINS] if syms else []
+        except Exception as e:  # noqa: BLE001 - fallback, never break a scan
+            log.warning("all-coin universe failed (%s), using curated list", e)
+            return curated
+        if not syms:
+            return curated
+        log.info("universe: all mode, %d symbols", len(syms))
+        return syms
+    if mode == "top_movers":
+        # GAS parity: fish where the volatility is.
+        try:
+            n = int(settings.get("universe_top_n",
+                                 config.UNIVERSE_TOP_MOVERS_DEFAULT))
+        except (TypeError, ValueError):
+            n = config.UNIVERSE_TOP_MOVERS_DEFAULT
+        n = max(10, min(n, config.UNIVERSE_TOP_N_MAX))
+        try:
+            min_vol = float(settings.get("min_24h_volume_usd") or 0)
+        except (TypeError, ValueError):
+            min_vol = 0
+        try:
+            tickers = market.get_swap_tickers() if market is not None else []
+            syms = select_top_movers(tickers, n, min_vol)
+        except Exception as e:  # noqa: BLE001 - fallback, never break a scan
+            log.warning("top-movers universe failed (%s), using curated", e)
+            return curated
+        if not syms:
+            return curated
+        log.info("universe: top_movers mode, %d symbols", len(syms))
+        return syms
     try:
         n = int(settings.get("universe_top_n",
                              config.UNIVERSE_TOP_N_DEFAULT))
@@ -316,7 +383,7 @@ class Executor:
                         sorted(config.DISABLED_VETOES))
         self._manage_positions(balance, summary)
         universe = resolve_universe(self.exchange, self._dash_settings(),
-                                    self.universe)
+                                    self.universe, market=self.market)
         for symbol in universe:
             try:
                 self._scan_symbol(symbol, balance, summary)

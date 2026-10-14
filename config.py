@@ -177,6 +177,18 @@ UNIVERSE = [
 ]
 UNIVERSE_TOP_N_DEFAULT = 30
 UNIVERSE_TOP_N_MAX = 100
+# GAS CFG L114: stablecoins never become signal candidates.
+STABLECOINS = ["USDT", "USDC", "DAI", "USDG", "FDUSD", "TUSD", "USDP",
+               "PYUSD", "USDE", "USTC", "LUSD", "FRAX", "GUSD", "BUSD",
+               "EURI", "XAUT"]
+# Universe modes (executor.resolve_universe):
+#   curated    — the built-in liquid list above (config.UNIVERSE)
+#   top_volume — top-N by 24h quote volume
+#   top_movers — GAS parity (selectActiveSymbols_/getTopMovers_): top-N by
+#                |24h % change| * log10(24h USD volume), stables excluded
+#   all        — every USDT-margined OKX perpetual (~hundreds of symbols)
+UNIVERSE_MODES = ("curated", "top_volume", "top_movers", "all")
+UNIVERSE_TOP_MOVERS_DEFAULT = 60  # GAS: getTopMovers_(n), n default 60
 
 # ------------------------------------------------------- signal cache (DB)
 # Two-stage pipeline: scanner.py scans ALL OKX coins -> signals.db;
@@ -320,8 +332,8 @@ DASHBOARD_DEFAULTS = {
     "veto_liq_wall": True,
     "veto_btc_breaker": True,
     # universe
-    "universe_mode": "curated",  # curated | top_volume
-    "universe_top_n": 30,        # 10-100, used when top_volume
+    "universe_mode": "top_movers",  # curated | top_volume | top_movers | all (GAS parity: top_movers)
+    "universe_top_n": 30,        # 10-100, used when top_volume/top_movers
     # order execution (full operator control; defaults are the safe ones)
     "margin_mode": "ISOLATED",   # ISOLATED | CROSS
     "leverage_mode": "auto",     # auto (risk default) | fixed
