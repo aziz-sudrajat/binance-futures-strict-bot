@@ -466,3 +466,45 @@ def test_delta_mirrors_for_shorts():
     assert d == -config.BTC_DUMP_PENALTY
     d, _ = btc_breadth_warn_delta(-2.5, "BEARISH")
     assert d == 0  # BTC dumping is fine for shorts
+
+
+def test_mtf_cascade_relaxed_1d_leg():
+    """MTF_REQUIRE_1D=False (biasa): 1d neutral no longer hard-rejects; the
+    1d trend is threaded through for soft scoring."""
+    import config
+    old = config.MTF_REQUIRE_1D
+    config.MTF_REQUIRE_1D = False
+    try:
+        k4h_bear = [{"close": c} for c in [100.0 * 0.998 ** i for i in range(100)]]
+        k1d_neutral = [{"close": 100.0 + (i % 2)} for i in range(100)]
+        a30_bear = {"signal": "BEARISH WATCH", "trade_plan": {"entry": 1}}
+        r = mtf_cascade_check(k4h_bear, k1d_neutral, a30_bear, "BEARISH")
+        assert r["pass"] is True
+        assert r["t1d"] in ("BULLISH", "BEARISH", "NEUTRAL")  # threaded for soft delta
+        # 4h leg is still a hard gate
+        k4h_bull = [{"close": c} for c in uptrend(100)]
+        r = mtf_cascade_check(k4h_bull, k1d_neutral, a30_bear, "BEARISH")
+        assert r["pass"] is False and r["stage"] == "4h"
+    finally:
+        config.MTF_REQUIRE_1D = old
+
+
+def test_mtf_1d_delta_soft_scoring():
+    from quality_deltas import mtf_1d_delta
+    d, _ = mtf_1d_delta("BEARISH", "BEARISH")
+    assert d == config.MTF_CONFIRM_1D_BOOST
+    d, _ = mtf_1d_delta("BULLISH", "BEARISH")
+    assert d == -config.MTF_CONFIRM_1D_PENALTY
+    d, note = mtf_1d_delta("NEUTRAL", "BEARISH")
+    assert d == 0
+    d, _ = mtf_1d_delta(None, "BULLISH")
+    assert d == 0
+    # BULLISH direction mirrors
+    d, _ = mtf_1d_delta("BULLISH", "BULLISH")
+    assert d == config.MTF_CONFIRM_1D_BOOST
+
+
+def test_biasa_preset_relaxes_1d_leg():
+    assert config.SIGNAL_MODE_PRESETS["ketat"]["mtf_require_1d"] is True
+    assert config.SIGNAL_MODE_PRESETS["sedang"]["mtf_require_1d"] is True
+    assert config.SIGNAL_MODE_PRESETS["biasa"]["mtf_require_1d"] is False

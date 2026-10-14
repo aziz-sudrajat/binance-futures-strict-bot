@@ -384,3 +384,24 @@ def test_explicit_flag_beats_bot_mode(monkeypatch):
     with pytest.raises(SystemExit) as ei:
         main(["--live", "--balance"])
     assert "BINANCE_LIVE_KEY" in str(ei.value)
+
+
+def test_validate_preserves_mtf_require_1d(dash_env):
+    # Regression: a new bool knob must survive validate_settings, otherwise
+    # the biasa preset's 1d relaxation would be silently dropped on save.
+    out = validate_settings({"mtf_require_1d": False})
+    assert out["mtf_require_1d"] is False
+    out = validate_settings({"mtf_require_1d": True})
+    assert out["mtf_require_1d"] is True
+    assert validate_settings({})["mtf_require_1d"] is True  # default
+    with __import__("pytest").raises(ValueError):
+        validate_settings({"mtf_require_1d": "nope"})
+
+
+def test_apply_mtf_require_1d_override(dash_env):
+    save_settings({"mtf_require_1d": False}, dash_env)
+    import executor as exmod
+    e = object.__new__(exmod.Executor)
+    e.settings_mode = "live"
+    config.apply_dashboard_overrides(e._dash_settings())
+    assert config.MTF_REQUIRE_1D is False

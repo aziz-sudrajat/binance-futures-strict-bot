@@ -47,6 +47,7 @@ auto-trade jalan. TUI curses lama (`tui.py`) tetap ada sebagai alternatif.
 |---|---|---|---|
 | Min quality | 70 | 60 | 50 |
 | MTF 30m | STRICT | LEAN | LEAN |
+| MTF 1d leg | hard gate | hard gate | soft delta (bonus/penalti skor) |
 | Bullish only | ya | ya | tidak (LONG+SHORT) |
 | Min volume 24h | $2jt | $1jt | $500rb |
 | Freshness drift | 0.4% | 0.6% | 1.0% |

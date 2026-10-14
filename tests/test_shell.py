@@ -152,6 +152,7 @@ def test_apply_signal_mode_preset():
     assert s["signal_mode"] == "biasa"
     assert s["min_quality_score"] == 50
     assert s["bullish_only"] is False  # biasa = bidirectional (LONG+SHORT)
+    assert s["mtf_require_1d"] is False  # 1d leg relaxed to a soft delta
     assert s["veto_funding"] is True  # core veto stays on
     with __import__("pytest").raises(ValueError):
         dashboard.apply_signal_mode_preset({}, "ngawur")

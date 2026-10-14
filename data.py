@@ -429,6 +429,25 @@ class MarketData:
         self._deriv_cache[key] = (time.time(), adv)
         return adv
 
+    def list_okx_swap_symbols(self) -> list[str]:
+        """All USDT-margined OKX perpetuals as Binance-style symbols.
+
+        Used by the all-coin scanner. Leveraged tokens are excluded.
+        """
+        rows = self._okx_get("/api/v5/market/tickers",
+                             {"instType": "SWAP"})
+        out = []
+        for r in rows:
+            inst = str(r.get("instId", ""))
+            m = re.fullmatch(r"([A-Z0-9]+)-USDT-SWAP", inst)
+            if not m:
+                continue
+            base = m.group(1)
+            if base.endswith(("UP", "DOWN", "BULL", "BEAR", "3L", "3S")):
+                continue
+            out.append(f"{base}USDT")
+        return sorted(set(out))
+
     def _okx_ct_val(self, inst_id: str) -> float:
         """Contract value (base currency) for an OKX SWAP instrument.
 
