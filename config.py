@@ -219,8 +219,12 @@ DASH_VETO_CODES = ("leverage_risk", "funding", "squeeze", "whale",
 # Signal strictness presets: ketat | sedang | biasa.
 # Choosing a mode applies its bundle to the individual dashboard settings
 # (quality gate, MTF 30m leg, bullish-only, volume gate, freshness drift,
-# veto toggles). The user can still fine-tune knobs afterwards — the mode
-# is a preset, not a lock.
+# veto toggles). ketat/sedang are LONG-only (GAS parity). biasa is
+# bidirectional: the engine runs a fully mirrored SHORT pipeline
+# (BEARISH WATCH -> SHORT with bearish cascade, bearish vetoes/deltas,
+# mirrored freshness, short-capable executor).
+# The user can still fine-tune knobs afterwards — the mode is a preset,
+# not a lock.
 SIGNAL_MODES = ("ketat", "sedang", "biasa")
 SIGNAL_MODE_PRESETS = {
     "ketat": {  # today's behavior — GAS STRICT parity
@@ -249,7 +253,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_liq_wall": False,
         "veto_btc_breaker": True,
     },
-    "biasa": {  # permissive: quality floor, shorts allowed, core vetoes only
+    "biasa": {  # permissive: quality floor, bidirectional, core vetoes only
         "min_quality_score": 50,
         "mtf_30m_mode": "LEAN",
         "bullish_only": False,
