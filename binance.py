@@ -220,6 +220,58 @@ class BinanceShell:
             title="Web Dashboard", border_style="cyan"))
 
     # -------------------------------------------------- setting
+    def cmd_signal_mode(self, args: list[str]) -> None:
+        """Show or change the signal strictness preset."""
+        modes = config.SIGNAL_MODES
+        if not args:
+            cur = dashboard.load_settings(mode=self.mode).get(
+                "signal_mode", "ketat")
+            t = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+            t.add_column(style="bold cyan", no_wrap=True)
+            t.add_column()
+            descs = {
+                "ketat": "GAS STRICT — quality ≥70, MTF STRICT, long-only, "
+                         "semua veto ON",
+                "sedang": "quality ≥60, MTF LEAN, long-only, veto liq-wall OFF",
+                "biasa": "quality ≥50, MTF LEAN, SHORT diizinkan, veto inti "
+                         "saja",
+            }
+            for m in modes:
+                mark = "●" if m == cur else "○"
+                t.add_row(f"{mark} {m}", descs[m])
+            self.console.print(Panel(t, title="Mode Sinyal",
+                                     border_style="cyan"))
+            self.console.print("[dim]pakai: signal-mode <ketat|sedang|biasa>"
+                               "[/dim]")
+            return
+        want = args[0].lower()
+        if want not in modes:
+            self.console.print(
+                f"[red]mode tidak dikenal:[/red] {want} — pilih "
+                f"{' | '.join(modes)}")
+            return
+        sett = dashboard.load_settings(mode=self.mode)
+        if sett.get("signal_mode") == want:
+            self.console.print(f"[dim]sudah di mode {want}[/dim]")
+            return
+        if self.mode == "live":
+            self.console.print("[yellow]mode live: preset tetap boleh "
+                               "diganti (bukan knob risiko)[/yellow]")
+        dashboard.apply_signal_mode_preset(sett, want)
+        dashboard.save_settings(sett, mode=self.mode)
+        bundle = config.SIGNAL_MODE_PRESETS[want]
+        t = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+        t.add_column(style="cyan", no_wrap=True)
+        t.add_column(justify="right", style="bold")
+        for k, v in bundle.items():
+            t.add_row(k, "[green]on[/green]" if v is True
+                      else "[red]off[/red]" if v is False else str(v))
+        self.console.print(Panel(
+            t, title=f"✓ mode sinyal → {want.upper()}",
+            border_style="green",
+            subtitle="[dim]berlaku tanpa restart; knob bisa di-fine-tune "
+                     "manual setelahnya[/dim]"))
+
     def cmd_setting(self, _args: list[str]) -> None:
         fields = dashboard.SETTING_FIELDS
         while True:
@@ -240,6 +292,10 @@ class BinanceShell:
             val = Prompt.ask(f"{label} [{cur}]", default="").strip()
             if not val:
                 continue
+            if key == "signal_mode":
+                # preset, not a raw value: apply the whole bundle
+                self.cmd_signal_mode([val])
+                continue
             try:
                 sett[key] = coerce_setting(kind, val)
             except ValueError as e:
@@ -254,6 +310,9 @@ class BinanceShell:
             self.console.print("[red]pakai: set <key> <value>[/red]")
             return
         key, val = args[0], " ".join(args[1:])
+        if key == "signal_mode":
+            self.cmd_signal_mode([val])
+            return
         fields = {k: (label, kind)
                   for k, label, kind in dashboard.SETTING_FIELDS}
         if key not in fields:
@@ -462,6 +521,7 @@ class BinanceShell:
             "dashboard": self.cmd_dashboard, "setting": self.cmd_setting,
             "set": self.cmd_set, "scanner": self.cmd_scanner,
             "auto-trade": self.cmd_autotrade,
+            "signal-mode": self.cmd_signal_mode,
         }.get(cmd.name)
         if cmd.name == "clear":
             self.console.clear()
