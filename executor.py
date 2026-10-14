@@ -506,8 +506,9 @@ class Executor:
 
     # ------------------------------------------------------------ open flow
     def manual_entry(self, symbol: str, balance: float | None = None,
-                     atr_mult: float = 1.5) -> tuple[bool, str]:
-        """Manual market LONG entry (TEST ONLY).
+                     atr_mult: float = 1.5,
+                     direction: str = "LONG") -> tuple[bool, str]:
+        """Manual market entry (terminal `entry` command).
 
         BYPASSES every STRICT signal gate — no score, no MTF cascade, no
         vetoes, no volume check. Only the mechanical safety layer still
@@ -515,51 +516,23 @@ class Executor:
         setup, fixed-margin sizing, risk gates (kill switch, caps), and
         the standard SL/TP bracket machinery.
 
-        Levels: entry = live market price; SL = entry - atr_mult x ATR(15m);
+        Levels: entry = live market price; SL = entry ∓ atr_mult x ATR(15m);
         TP1/2/3 at the config RR ladder (1.5 / 2.25 / 3.0). Idempotent per
-        15m candle via the signal id.
+        15m candle via the signal id. The caller (terminal) must confirm
+        with the user before invoking — this function does not prompt.
         """
-        from data import normalize_symbol
-        from indicators import atr_wilder
-
-        symbol = normalize_symbol(symbol)
-        if not symbol:
-            return False, "unknown symbol"
-        # 1. Live price (fail-closed).
-        try:
-            live = self.market.get_live_price(symbol)
-        except Exception:  # noqa: BLE001
-            live = None
-        if live is None or live <= 0:
-            return False, "live price unavailable - holding (fail-closed)"
-        # 2. ATR from 15m candles (fail-closed on thin data).
-        try:
-            candles = self.market.get_klines(symbol, "15m", limit=60)
-        except Exception:  # noqa: BLE001
-            candles = []
-        if len(candles) < config.ATR_PERIOD + 2:
-            return False, (f"only {len(candles)} 15m candles - "
-                           f"need {config.ATR_PERIOD + 2} for ATR")
-        atr = atr_wilder(candles, config.ATR_PERIOD)
-        if not atr or atr <= 0:
-            return False, "ATR unavailable - holding (fail-closed)"
-        # 3. Bracket levels around the live price.
-        entry = float(live)
-        stop = entry - atr_mult * atr
-        risk_dist = entry - stop
-        signal = {
-            "symbol": symbol, "direction": "LONG", "interval": "15m",
-            "entry": entry, "entry_low": entry, "entry_high": entry,
-            "stop_loss": stop,
-            "tp1": entry + risk_dist * config.TP1_RR,
-            "tp2": entry + risk_dist * config.TP2_RR,
-            "tp3": entry + risk_dist * config.TP3_RR,
-            "quality": 0, "manual": True,
-            "note": "manual market entry - bypasses STRICT gates",
-        }
-        # 4. Idempotency per 15m candle; then the standard open flow.
+        plan, err = self.preview_manual_entry(symbol, direction=direction,
+                                              atr_mult=atr_mult)
+        if err:
+            return False, err
+        signal = plan["signal"]
+        symbol = plan["symbol"]
+        direction = plan["direction"]
+        entry = plan["entry"]
+        stop = plan["stop_loss"]
+        # Idempotency per 15m candle; then the standard open flow.
         close_ms = signal_candle_close_ms(self.market, symbol)
-        sid = f"{symbol}:manual:{close_ms}"
+        sid = f"{symbol}:manual:{direction}:{close_ms}"
         if self.state.seen_signal(sid):
             return False, f"manual entry already attempted this candle ({sid})"
         if balance is None:
@@ -571,13 +544,71 @@ class Executor:
         margin = self.fixed_margin_usdt
         ok, note = self._try_open(symbol, signal, sid, balance)
         if ok:
-            return True, (f"MANUAL LONG {symbol} @ {entry:.6g} "
+            return True, (f"MANUAL {direction} {symbol} @ {entry:.6g} "
                           f"({lev}x isolated"
                           f"{f', ${margin:.0f} margin' if margin else ''}) | "
                           f"SL {stop:.6g} | "
                           f"TP1 {signal['tp1']:.6g} TP2 {signal['tp2']:.6g} "
                           f"TP3 {signal['tp3']:.6g} | {note}")
         return False, f"manual entry rejected: {note}"
+
+    def preview_manual_entry(self, symbol: str, direction: str = "LONG",
+                             atr_mult: float = 1.5) -> tuple[dict | None, str]:
+        """Build the manual-entry bracket plan WITHOUT placing any order.
+
+        Returns (plan, "") on success or (None, reason). The terminal shows
+        the plan and asks for confirmation before calling manual_entry().
+        Fail-closed on missing price/ATR data.
+        """
+        from data import normalize_symbol
+        from indicators import atr_wilder
+
+        direction = str(direction or "LONG").upper()
+        if direction not in ("LONG", "SHORT"):
+            return None, f"direction harus LONG atau SHORT, bukan {direction}"
+        is_short = direction == "SHORT"
+        symbol = normalize_symbol(symbol)
+        if not symbol:
+            return None, "unknown symbol"
+        try:
+            live = self.market.get_live_price(symbol)
+        except Exception:  # noqa: BLE001
+            live = None
+        if live is None or live <= 0:
+            return None, "live price unavailable - holding (fail-closed)"
+        try:
+            candles = self.market.get_klines(symbol, "15m", limit=60)
+        except Exception:  # noqa: BLE001
+            candles = []
+        if len(candles) < config.ATR_PERIOD + 2:
+            return None, (f"only {len(candles)} 15m candles - "
+                           f"need {config.ATR_PERIOD + 2} for ATR")
+        atr = atr_wilder(candles, config.ATR_PERIOD)
+        if not atr or atr <= 0:
+            return None, "ATR unavailable - holding (fail-closed)"
+        entry = float(live)
+        stop = entry + atr_mult * atr if is_short else entry - atr_mult * atr
+        risk_dist = abs(entry - stop)
+        tp = (lambda rr: entry - risk_dist * rr) if is_short else \
+             (lambda rr: entry + risk_dist * rr)
+        signal = {
+            "symbol": symbol, "direction": direction, "interval": "15m",
+            "entry": entry, "entry_low": entry, "entry_high": entry,
+            "stop_loss": stop,
+            "tp1": tp(config.TP1_RR),
+            "tp2": tp(config.TP2_RR),
+            "tp3": tp(config.TP3_RR),
+            "quality": 0, "manual": True,
+            "note": "manual market entry - bypasses STRICT gates",
+        }
+        return {
+            "symbol": symbol, "direction": direction, "entry": entry,
+            "stop_loss": stop, "tp1": signal["tp1"], "tp2": signal["tp2"],
+            "tp3": signal["tp3"], "atr": float(atr),
+            "risk_pct": risk_dist / entry * 100 if entry else 0.0,
+            "leverage": self._resolve_leverage(symbol),
+            "signal": signal,
+        }, ""
 
     def _try_open(self, symbol: str, signal: dict, sid: str,
                   balance: float | None) -> tuple[bool, str]:

@@ -38,6 +38,14 @@ COMMANDS: list[Command] = [
     Command("scan", "Scan sinyal dengan engine STRICT (Signal Radar)",
             usage="scan [all] [--top N]",
             examples=("scan", "scan all", "scan --top 10")),
+    Command("cari", "Cari coin: analisis 15m/30m/4h/1d + alasan lolos/gagal",
+            usage="cari <nama coin>",
+            aliases=("search", "cek"),
+            examples=("cari btc", "cari WAL")),
+    Command("entry", "Entry manual coin (konfirmasi dulu): long / short",
+            usage="entry <nama coin> <long|short>",
+            aliases=("masuk",),
+            examples=("entry btc long", "entry eth short")),
     Command("auto-trade", "Jalankan auto-trade loop (Ctrl+C berhenti)",
             usage="auto-trade [--demo|--live|--paper] [--from-db] [--setting]",
             aliases=("autotrade", "trade"),
@@ -239,6 +247,49 @@ def radar_table(rows: list[dict], limit: int = 20) -> Table:
     if shown == 0:
         t.add_row("", "[dim]tidak ada signal approved[/dim]",
                   "", "", "", "", "")
+    return t
+
+
+def _rejection_category(reason: str) -> str:
+    r = (reason or "").lower()
+    if "bullish-only" in r:
+        return "15m bearish/netral (mode long-only)"
+    if "no directional setup" in r or "tanpa setup" in r:
+        return "15m netral (tanpa setup)"
+    if "cascade" in r or "4h trend" in r or "1d trend" in r or "30m" in r:
+        return "cascade MTF tak selaras"
+    if "volume" in r:
+        return "volume 24h di bawah minimum"
+    if r.startswith("veto"):
+        return "kena veto"
+    if "derivat" in r:
+        return "data derivatif tak lengkap"
+    if "freshness" in r or "drift" in r:
+        return "harga tak fresh"
+    if "quality" in r or "skor" in r:
+        return "skor quality di bawah minimum"
+    return "lainnya / data error"
+
+
+def rejection_breakdown(rows: list[dict]) -> Table:
+    """Kenapa coin-coin ditolak — biar '0 sinyal' ada penjelasannya."""
+    counts: dict[str, int] = {}
+    examples: dict[str, str] = {}
+    for r in rows:
+        if r.get("state") == "approved":
+            continue
+        cat = _rejection_category(str(r.get("reason") or ""))
+        counts[cat] = counts.get(cat, 0) + 1
+        if cat not in examples:
+            examples[cat] = f"{r.get('symbol')}: {str(r.get('reason') or '')[:70]}"
+    t = Table(title="Kenapa ditolak", show_header=True)
+    t.add_column("Alasan", justify="left")
+    t.add_column("Coin", justify="right")
+    t.add_column("Contoh", justify="left")
+    for cat, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        t.add_row(cat, str(n), f"[dim]{examples[cat]}[/dim]")
+    if not counts:
+        t.add_row("[dim]tidak ada penolakan[/dim]", "", "")
     return t
 
 
