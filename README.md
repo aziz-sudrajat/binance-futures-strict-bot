@@ -47,10 +47,14 @@ auto-trade jalan. TUI curses lama (`tui.py`) tetap ada sebagai alternatif.
 |---|---|---|---|
 | Min quality | 70 | 60 | 50 |
 | MTF 30m | STRICT | LEAN | LEAN |
-| Bullish only | ya | ya | tidak (SHORT ok) |
+| Bullish only | ya | ya | ya (LONG-only) |
 | Min volume 24h | $2jt | $1jt | $500rb |
 | Freshness drift | 0.4% | 0.6% | 1.0% |
 | Veto aktif | semua (6) | semua kecuali liq-wall | leverage + funding saja |
+
+Catatan: ketiga mode LONG-only — engine & executor memang dirancang
+bullish-only (paritas GAS), belum ada jalur SHORT. "Biasa" melonggarkan
+filter LONG, bukan mengaktifkan short.
 
 Mode adalah preset, bukan kunci — knob individual tetap bisa di-fine-tune
 manual setelahnya (`set` / editor `setting`). Berlaku tanpa restart.
