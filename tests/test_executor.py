@@ -1,0 +1,379 @@
+"""Tests for the Phase 2 executor (mocked exchange — NO real orders)."""
+
+import itertools
+import json
+import os
+
+import pytest
+
+import config
+import executor as ex
+from executor import Executor, compute_qty, split_tp_qty, make_signal_id
+from lifecycle import LifecycleLogger
+from risk import PaperBroker, RiskManager, floor_to_step, utc_today
+from run_executor import require_testnet_keys
+from state import StateStore
+import risk as risk_mod
+
+
+# ------------------------------------------------------------------ fakes
+
+class FakeMarket:
+    def __init__(self, live=100.0, close_ms=1_728_900_000_000 - 1):
+        self.live = live
+        self.close_ms = close_ms
+
+    def get_live_price(self, symbol):
+        return self.live
+
+    def get_klines(self, symbol, interval, limit=220):
+        return [{"close_time": self.close_ms, "close": self.live}]
+
+
+class FakeExchange:
+    """Controllable stand-in for ExchangeClient."""
+
+    def __init__(self, balance=10_000.0):
+        self._balance = balance
+        self.market_price = {}
+        self.orders = {}
+        self._pos = {}
+        self._ids = itertools.count(1000)
+        self.filters = {"status": "TRADING", "tickSize": 0.1, "stepSize": 0.001,
+                        "minQty": 0.001, "maxQty": 100000.0, "minNotional": 5.0}
+        self.margin_calls = []
+
+    def get_balance(self, asset="USDT"):
+        return self._balance
+
+    def get_positions(self):
+        return list(self.exchange_positions)
+
+    def set_leverage(self, symbol, leverage):
+        return True
+
+    def set_margin_type(self, symbol, margin_type="ISOLATED"):
+        self.margin_calls.append((symbol, margin_type))
+        return True
+
+    def get_symbol_filters(self, symbol):
+        return dict(self.filters)
+
+    def place_order(self, symbol, side, type, quantity=None, price=None,
+                    stop_price=None, time_in_force="GTC", reduce_only=False,
+                    working_type="MARK_PRICE", client_order_id=None):
+        oid = next(self._ids)
+        o = {"orderId": oid, "symbol": symbol, "side": side, "type": type,
+             "origQty": quantity or 0.0, "price": price or 0.0,
+             "stopPrice": stop_price or 0.0, "reduceOnly": reduce_only,
+             "clientOrderId": client_order_id or f"fake_{oid}",
+             "status": "NEW", "executedQty": 0.0, "avgPrice": 0.0}
+        if type == "MARKET":
+            px = self.market_price.get(symbol, price or 0.0)
+            o.update(status="FILLED", executedQty=quantity, avgPrice=px)
+            self._apply_fill(symbol, quantity, reduce_only)
+        self.orders[oid] = o
+        return {"orderId": oid, "clientOrderId": o["clientOrderId"],
+                "status": o["status"]}
+
+    def _apply_fill(self, symbol, qty, reduce_only):
+        if reduce_only:
+            self._pos[symbol] = self._pos.get(symbol, 0.0) - (qty or 0.0)
+        else:
+            self._pos[symbol] = self._pos.get(symbol, 0.0) + (qty or 0.0)
+
+    def get_positions(self):
+        return [{"symbol": s, "side": "LONG", "qty": q, "entry_price": 0.0,
+                 "unrealized_pnl": 0.0, "leverage": 3}
+                for s, q in self._pos.items() if q > 0]
+
+    def get_order(self, symbol, order_id=None, orig_client_order_id=None):
+        for o in self.orders.values():
+            if order_id is not None and o["orderId"] == order_id:
+                return dict(o)
+            if orig_client_order_id and o["clientOrderId"] == orig_client_order_id:
+                return dict(o)
+        return None
+
+    def cancel_order(self, symbol, order_id=None, orig_client_order_id=None):
+        for o in self.orders.values():
+            if ((order_id is not None and o["orderId"] == order_id) or
+                    (orig_client_order_id and
+                     o["clientOrderId"] == orig_client_order_id)):
+                if o["status"] == "NEW":
+                    o["status"] = "CANCELED"
+                return True
+        return True
+
+    def get_open_orders(self, symbol=None):
+        return [dict(o) for o in self.orders.values()
+                if o["status"] == "NEW"
+                and (symbol is None or o["symbol"] == symbol)]
+
+    # test helper: force an order to FILLED
+    def fill(self, order_id, px, qty=None):
+        o = self.orders[order_id]
+        o["status"] = "FILLED"
+        o["executedQty"] = qty if qty is not None else o["origQty"]
+        o["avgPrice"] = px
+        self._apply_fill(o["symbol"], o["executedQty"], o["reduceOnly"])
+        return o
+
+
+def _signal(symbol="BTCUSDT", entry=100.0):
+    return {"symbol": symbol, "direction": "LONG", "interval": "15m",
+            "entry": entry, "entry_low": 99.5, "entry_high": 100.5,
+            "stop_loss": 98.0, "tp1": 103.0, "tp2": 104.5, "tp3": 106.0,
+            "quality": 80}
+
+
+@pytest.fixture
+def workdir(tmp_path):
+    return str(tmp_path)
+
+
+@pytest.fixture
+def rig(workdir):
+    market = FakeMarket(live=100.0)
+    exchange = FakeExchange(balance=10_000.0)
+    exchange.market_price = {"BTCUSDT": 100.0}
+    state = StateStore(os.path.join(workdir, "state.json"))
+    lifecycle = LifecycleLogger(os.path.join(workdir, "lifecycle.jsonl"))
+    risk = RiskManager(state, exchange.get_balance)
+    ev = lambda symbol, m: (_signal(symbol), "stub")  # noqa: E731
+    executor = Executor(market, exchange, risk, state, lifecycle,
+                        universe=["BTCUSDT"], evaluate_fn=ev)
+    return executor, market, exchange, state, lifecycle, risk
+
+
+# ------------------------------------------------------------------- sizing
+
+def test_sizing_math():
+    # $10k balance, 1% risk = $100; stop distance $2 -> raw qty 50.
+    # Per-symbol exposure cap (20% of $10k = $2000 notional) binds:
+    # 50 * $100 = $5000 -> capped to $2000 / $100 = 20.
+    filters = {"stepSize": 0.001, "minQty": 0.001, "minNotional": 5.0}
+    qty, note = compute_qty(10_000.0, 100.0, 98.0, filters)
+    assert qty == 20.0, note
+    assert qty * 100.0 <= 2000.0 + 1e-9
+    # Without the cap binding: wide stop -> small qty, cap not hit.
+    qty2, _ = compute_qty(10_000.0, 100.0, 90.0, filters)  # $10 dist
+    assert qty2 == 10.0  # $100 / $10, notional $1000 < $2000 cap
+
+
+def test_sizing_floors_down():
+    filters = {"stepSize": 0.5, "minQty": 0.5, "minNotional": 5.0}
+    qty, _ = compute_qty(10_000.0, 100.0, 98.0, filters)
+    # raw 50 -> cap 2000/100=20 -> floor(20/0.5)*0.5 = 20.0
+    assert qty == 20.0
+    assert floor_to_step(7.89, 0.5) == 7.5  # never rounds up
+
+
+def test_sizing_rounds_to_zero_skips():
+    filters = {"stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0}
+    qty, reason = compute_qty(100.0, 100.0, 99.99, filters)
+    assert qty == 0.0 and "minQty" in reason
+
+
+def test_tp_split_ratios():
+    splits, note = split_tp_qty(20.0, 0.001, 0.001)
+    assert splits == [8.0, 6.0, 6.0], note
+    assert abs(sum(splits) - 20.0) < 1e-9
+
+
+def test_tp_split_step_aligned():
+    splits, _ = split_tp_qty(7.0, 0.5, 0.5)
+    assert splits == [2.5, 2.0, 2.5]
+    for s in splits:
+        assert abs(s / 0.5 - round(s / 0.5)) < 1e-9
+
+
+def test_tp_split_unexitable_aborts():
+    # qty so small that even TP3 < minQty after merging -> abort.
+    splits, reason = split_tp_qty(0.0015, 0.001, 0.001)
+    assert splits is None and "abort" in reason
+
+
+# ------------------------------------------------------------- idempotency
+
+def test_idempotent_rescan(rig):
+    executor, market, exchange, state, lifecycle, risk = rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    assert summary["opened"] == 1
+    sid = make_signal_id("BTCUSDT", market.close_ms, "LONG")
+    assert state.seen_signal(sid)
+    summary2 = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+                "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary2)
+    assert summary2["opened"] == 0 and summary2["rejected"] == 1
+    events = lifecycle.read_all()
+    states = [e["state"] for e in events if e["signal_id"] == sid]
+    assert "approved" in states and "rejected" in states
+
+
+def test_signal_id_changes_with_candle(rig):
+    executor, market, exchange, state, lifecycle, risk = rig
+    sid1 = make_signal_id("BTCUSDT", market.close_ms, "LONG")
+    market.close_ms += 900_000  # next 15m candle
+    sid2 = make_signal_id("BTCUSDT", market.close_ms, "LONG")
+    assert sid1 != sid2
+
+
+# --------------------------------------------------------------- open flow
+
+def test_open_flow_places_brackets(rig):
+    executor, market, exchange, state, lifecycle, risk = rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    assert summary["opened"] == 1
+    positions = executor._open_positions()
+    assert len(positions) == 1
+    pos_id, pos = next(iter(positions.items()))
+    assert pos["brackets_placed"] is True
+    assert pos["sl_order_id"] is not None
+    assert all(pos["tp"][leg]["order_id"] for leg in ("tp1", "tp2", "tp3"))
+    # margin was set to ISOLATED
+    assert ("BTCUSDT", "ISOLATED") in exchange.margin_calls
+    # lifecycle trail
+    states = [e["state"] for e in lifecycle.read_all()]
+    assert "position_opened" in states
+
+
+def test_breakeven_after_tp1(rig):
+    executor, market, exchange, state, lifecycle, risk = rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    pos_id, pos = next(iter(executor._open_positions().items()))
+    old_sl = pos["sl_order_id"]
+    # Simulate TP1 filling on the exchange.
+    exchange.fill(pos["tp"]["tp1"]["order_id"], 103.0)
+    executor._manage_one(pos_id, pos, 10_000.0, summary)
+    pos = executor._open_positions()[pos_id]
+    assert pos["breakeven_moved"] is True
+    assert pos["sl_order_id"] != old_sl
+    new_sl = exchange.get_order("BTCUSDT", order_id=pos["sl_order_id"])
+    assert new_sl["stopPrice"] == pos["entry_price"]  # == 100.0 (breakeven)
+    assert exchange.get_order("BTCUSDT", order_id=old_sl)["status"] == "CANCELED"
+    states = [e["state"] for e in lifecycle.read_all()]
+    assert "tp1_hit" in states
+
+
+# ------------------------------------------------------------- risk manager
+
+def test_kill_switch_triggers_and_resets(workdir, monkeypatch):
+    state = StateStore(os.path.join(workdir, "state.json"))
+    balance = {"v": 10_000.0}
+    rm = RiskManager(state, lambda: balance["v"])
+    rm.ensure_day()
+    # -4% day -> breach of the 3% cap.
+    balance["v"] = 9_600.0
+    ok, reason = rm.check_daily_loss()
+    assert ok is False and rm.kill_switch_active()
+    ok2, _ = rm.check_can_open("BTCUSDT", 100.0, 0)
+    assert ok2 is False
+    # Next UTC day -> reset.
+    monkeypatch.setattr(risk_mod, "utc_today", lambda: "2099-01-02")
+    rm.ensure_day()
+    assert rm.kill_switch_active() is False
+    ok3, _ = rm.check_daily_loss()
+    assert ok3 is True
+
+
+def test_max_positions_cap(workdir):
+    state = StateStore(os.path.join(workdir, "state.json"))
+    rm = RiskManager(state, lambda: 10_000.0, max_positions=1)
+    rm.ensure_day()
+    ok, _ = rm.check_can_open("BTCUSDT", 100.0, 1)
+    assert ok is False
+    ok, _ = rm.check_can_open("BTCUSDT", 100.0, 0)
+    assert ok is True
+
+
+def test_balance_unavailable_fail_closed(workdir):
+    state = StateStore(os.path.join(workdir, "state.json"))
+    rm = RiskManager(state, lambda: None)
+    rm.ensure_day()
+    ok, reason = rm.check_can_open("BTCUSDT", 100.0, 0)
+    assert ok is False and "fail-closed" in reason
+
+
+# ---------------------------------------------------------------- reconcile
+
+def test_restart_reconcile_adopts_and_closes(workdir):
+    state = StateStore(os.path.join(workdir, "state.json"))
+    state.get("positions", {})["p1"] = {"symbol": "BTCUSDT", "qty": 1.0}
+    state.save()
+    rec = state.reconcile([
+        {"symbol": "ETHUSDT", "side": "LONG", "qty": 2.0,
+         "entry_price": 50.0, "unrealized_pnl": 0.0, "leverage": 3},
+    ])
+    assert len(rec["adopted"]) == 1 and len(rec["closed"]) == 1
+    adopted = state.get("positions")[rec["adopted"][0]]
+    assert adopted["unmanaged"] is True and adopted["symbol"] == "ETHUSDT"
+    assert state.get("positions")["p1"]["closed"] is True
+    # state file round-trips
+    state2 = StateStore(os.path.join(workdir, "state.json"))
+    assert state2.get("positions")["p1"]["closed"] is True
+
+
+# --------------------------------------------------------------- paper sim
+
+def test_paper_fill_simulation():
+    prices = {"BTCUSDT": 100.0}
+    broker = PaperBroker(10_000.0, price_fn=lambda s: prices[s])
+    o = broker.place_order("BTCUSDT", "BUY", "LIMIT", quantity=1.0, price=99.0)
+    assert o["status"] == "NEW"  # rests: live 100 > 99
+    prices["BTCUSDT"] = 98.5
+    fills = broker.poll(["BTCUSDT"])
+    assert len(fills) == 1 and fills[0]["order"]["status"] == "FILLED"
+    assert broker.positions["BTCUSDT"]["qty"] == 1.0
+    # Take-profit rests until touched.
+    tp = broker.place_order("BTCUSDT", "SELL", "LIMIT", quantity=0.5,
+                            price=103.0, reduce_only=True)
+    assert tp["status"] == "NEW"
+    prices["BTCUSDT"] = 104.0
+    fills = broker.poll(["BTCUSDT"])
+    assert len(fills) == 1
+    assert broker.realized_pnl > 0
+    # Stop-loss triggers below the stop price.
+    sl = broker.place_order("BTCUSDT", "SELL", "STOP_MARKET", quantity=0.5,
+                            stop_price=97.0, reduce_only=True)
+    prices["BTCUSDT"] = 96.0
+    fills = broker.poll(["BTCUSDT"])
+    assert len(fills) == 1
+    assert broker.positions["BTCUSDT"]["qty"] == 0.0
+
+
+def test_paper_market_fills_immediately():
+    broker = PaperBroker(10_000.0, price_fn=lambda s: 100.0)
+    o = broker.place_order("BTCUSDT", "BUY", "MARKET", quantity=2.0)
+    assert o["status"] == "FILLED"
+    assert broker.positions["BTCUSDT"]["qty"] == 2.0
+
+
+# ------------------------------------------------------------------- CLI
+
+def test_testnet_without_keys_refuses():
+    with pytest.raises(SystemExit) as ei:
+        require_testnet_keys({})
+    assert "BINANCE_TESTNET_KEY" in str(ei.value)
+    with pytest.raises(SystemExit):
+        require_testnet_keys({"BINANCE_TESTNET_KEY": "x"})
+    key, secret = require_testnet_keys(
+        {"BINANCE_TESTNET_KEY": "k", "BINANCE_TESTNET_SECRET": "s"})
+    assert (key, secret) == ("k", "s")
+
+
+def test_lifecycle_jsonl_appends(workdir):
+    path = os.path.join(workdir, "lifecycle.jsonl")
+    lc = LifecycleLogger(path)
+    lc.log("sid1", "BTCUSDT", "approved", quality=80)
+    lc.log("sid1", "BTCUSDT", "rejected", reason="dup")
+    events = lc.read_all()
+    assert len(events) == 2 and events[0]["state"] == "approved"
+    with open(path) as f:
+        assert len(f.readlines()) == 2  # one JSON object per line

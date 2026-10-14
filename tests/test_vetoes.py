@@ -1,0 +1,302 @@
+"""Tests for vetoes.py — ROADMAP ITEM 2 (deterministic hard vetoes).
+
+Verifies the GAS deep-check veto ports:
+  leverage_risk_index  <- derivGateAdvanced_    (GAS L1016-1022), veto L3338
+  squeeze_risk_index   <- derivGateAdvanced_    (GAS L1024-1034), veto L3360
+  funding extreme      <- deepCheckDerivatives_ (GAS L3346-3354), CFG L72
+  whale divergence     <- deepCheckDerivatives_ (GAS L3366-3379), CFG L90
+  liquidity wall       <- deepCheckLiquidity_  (GAS L3395-3425), CFG L75-76
+  BTC circuit breaker  <- deepCheckBtcBreadth_ (GAS L3634-3662), CFG L106
+
+T3: BTC -3%/1h vetoes ALL symbols. T4: each veto fires on synthetic data.
+Regression: a signal that passed before vetoes still passes when none fire.
+"""
+
+import pytest
+
+import config
+import vetoes
+from signal_engine import evaluate_symbol
+from tests.test_engine import FakeMarket
+from tests.test_indicators import candles_from_closes
+from vetoes import (
+    btc_1h_change_pct,
+    leverage_risk_index,
+    run_vetoes,
+    squeeze_risk_index,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_veto_caches():
+    vetoes.reset_caches()
+    yield
+    vetoes.reset_caches()
+
+
+BENIGN_SNAP = {"aggregate_funding": 0.0001}
+
+
+def blocks_by_code(blocks):
+    return {code: (kind, reason) for code, kind, reason in blocks}
+
+
+# ------------------------------------------------- pure index formulas
+def test_leverage_risk_index_formula():
+    # Hand-computed per GAS L1016-1022:
+    # crowding=|52-50|*2=4; fundingCrowd=min(100, 0.0001*100000)=10;
+    # oiVolRisk=min(100, 50/200*100)=25; spikeRisk=min(100, max(0,1-1)*25)=0
+    # -> round(4*.28 + 10*.22 + 25*.25 + 0) = round(9.57) = 10
+    assert leverage_risk_index(52.0, 0.0001, 50_000_000, 200_000_000, 1.0) == 10
+    # Extreme crowding -> 95 >= veto 90:
+    # crowding=90; fundingCrowd=90; oiVolRisk=100; spikeRisk=100
+    # -> round(90*.28 + 90*.22 + 100*.25 + 100*.25) = round(95.0) = 95
+    assert leverage_risk_index(95.0, 0.0009, 400_000_000, 200_000_000, 5.0) == 95
+    # Zero volume -> oiVolRisk 0, no ZeroDivisionError (GAS: oiVolumeRatio=0)
+    assert leverage_risk_index(60.0, 0.0002, 10_000_000, 0.0, 1.0) == \
+        round(20 * 0.28 + 20 * 0.22 + 0 + 0)
+
+
+def test_squeeze_risk_index_formula():
+    # BULLISH, GAS L1024-1029:
+    # max(0,70-50)*1.25=25 + max(0,0.0005)*90000=45 + max(0,10)*1.2=12
+    # + (long>short ? min(25, 3*6)=18) = 100 -> clamp 100
+    assert squeeze_risk_index(70.0, 0.0005, 10.0, 2_000_000, 1_000_000,
+                              3.0, "BULLISH") == 100
+    # Benign: 2.5 + 9 + 2.4 + 0 (liq equal) = 13.9 -> 14
+    assert squeeze_risk_index(52.0, 0.0001, 2.0, 100_000, 100_000,
+                              1.0, "BULLISH") == 14
+    # BEARISH mirror (GAS L1030-1034): short squeeze on crowded shorts
+    assert squeeze_risk_index(30.0, -0.0005, 10.0, 1_000_000, 2_000_000,
+                              3.0, "BEARISH") == 100
+    # Liq term only when the signal-side liquidations dominate
+    assert squeeze_risk_index(70.0, 0.0005, 10.0, 1_000_000, 2_000_000,
+                              3.0, "BULLISH") == 82  # 25+45+12, no liq term
+
+
+def test_btc_1h_change_pct():
+    m = FakeMarket()
+    m.btc_1h = candles_from_closes([100.0, 96.9])
+    assert btc_1h_change_pct(m) == pytest.approx(-3.1)
+    vetoes.reset_caches()
+    m.btc_1h = candles_from_closes([100.0, 102.0])
+    assert btc_1h_change_pct(m) == pytest.approx(2.0)
+
+
+# ------------------------------------------------- T4: each veto fires
+def test_no_veto_on_benign_market():
+    assert run_vetoes("BTCUSDT", "BULLISH", FakeMarket(), BENIGN_SNAP) == []
+
+
+def test_leverage_veto_fires():
+    m = FakeMarket()
+    m.adv.update({"retail_long": 95.0, "funding": 0.0009,
+                  "oi_usd": 400_000_000.0, "volume_24h": 200_000_000.0,
+                  "spike": 5.0, "long_liq_usd": 50_000.0,
+                  "short_liq_usd": 500_000.0})
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    kind, reason = by["leverage_risk"]
+    assert kind == "veto"
+    assert "95/100" in reason and str(config.DERIV_LEVERAGE_RISK_VETO) in reason
+
+
+def test_funding_extreme_veto_fires():
+    m = FakeMarket()
+    snap = {"aggregate_funding": 0.0012}  # +0.12%: crowded long, against LONG
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, snap))
+    assert by["funding"][0] == "veto"
+    assert "against BULLISH" in by["funding"][1]
+
+
+def test_funding_extreme_supporting_direction_no_veto():
+    m = FakeMarket()
+    snap = {"aggregate_funding": -0.0012}  # negative funding supports longs
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, snap))
+    assert "funding" not in by
+
+
+def test_funding_below_threshold_no_veto():
+    m = FakeMarket()
+    snap = {"aggregate_funding": 0.0009}
+    assert "funding" not in blocks_by_code(
+        run_vetoes("BTCUSDT", "BULLISH", m, snap))
+
+
+def test_squeeze_veto_fires():
+    m = FakeMarket()
+    m.adv.update({"retail_long": 80.0, "funding": 0.0008, "oi_change": 20.0,
+                  "long_liq_usd": 2_000_000.0, "short_liq_usd": 1_000_000.0,
+                  "spike": 4.0})
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    kind, reason = by["squeeze"]
+    assert kind == "veto"
+    assert "long squeeze risk 100/100" in reason
+    # leverage must NOT fire here (59 < 90): vetoes are independent
+    assert "leverage_risk" not in by
+
+
+def test_whale_divergence_veto_fires():
+    m = FakeMarket()
+    m.adv.update({"top_long": 20.0, "divergence": -32.0, "retail_long": 52.0})
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    kind, reason = by["whale"]
+    assert kind == "veto"
+    assert "20.0%" in reason
+
+
+def test_whale_penalty_tier_not_a_veto():
+    # GAS DERIV_TOP_TRADER_VETO_LONG=35 is a *penalty* tier (-12 delta), not a
+    # hard veto — we deliberately do not port it as a veto (roadmap item 3).
+    m = FakeMarket()
+    m.adv.update({"top_long": 30.0, "divergence": -12.0, "retail_long": 52.0})
+    assert "whale" not in blocks_by_code(
+        run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+
+
+def test_liq_wall_veto_fires():
+    m = FakeMarket()
+    m.book = {"bids": [(99.5, 100.0)], "asks": [(100.3, 3000.0)],
+              "mid": 100.0, "provider": "fake"}  # $300.9k ask at +0.3%
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    kind, reason = by["liq_wall"]
+    assert kind == "veto"
+    assert "ask" in reason and "$300,900" in reason
+
+
+def test_liq_wall_outside_distance_no_veto():
+    m = FakeMarket()
+    m.book = {"bids": [(99.5, 100.0)], "asks": [(100.8, 3000.0)],
+              "mid": 100.0, "provider": "fake"}  # +0.8%: beyond 0.5%
+    assert "liq_wall" not in blocks_by_code(
+        run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+
+
+def test_liq_wall_below_notional_no_veto():
+    m = FakeMarket()
+    m.book = {"bids": [(99.5, 100.0)], "asks": [(100.3, 500.0)],
+              "mid": 100.0, "provider": "fake"}  # $50k < $250k
+    assert "liq_wall" not in blocks_by_code(
+        run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+
+
+def test_liq_wall_blocks_bearish_via_bids():
+    m = FakeMarket()
+    m.book = {"bids": [(99.7, 3000.0)], "asks": [(100.5, 100.0)],
+              "mid": 100.0, "provider": "fake"}  # $299k bid at -0.3%
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BEARISH", m, BENIGN_SNAP))
+    assert by["liq_wall"][0] == "veto"
+    assert "bid" in by["liq_wall"][1]
+
+
+# ------------------------------------------------- T3: BTC circuit breaker
+def test_btc_dump_vetoes_all_symbols():
+    # -3.1%/1h: every symbol's new LONG signal is vetoed (market-wide).
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        m = FakeMarket()
+        m.btc_1h = candles_from_closes([100.0, 96.9])
+        vetoes.reset_caches()
+        by = blocks_by_code(run_vetoes(symbol, "BULLISH", m, BENIGN_SNAP))
+        kind, reason = by["btc_breaker"]
+        assert kind == "veto", symbol
+        assert "circuit breaker" in reason, symbol
+
+
+def test_btc_dump_at_threshold_vetoes():
+    m = FakeMarket()
+    m.btc_1h = candles_from_closes([100.0, 97.0])  # exactly -3.0%
+    by = blocks_by_code(run_vetoes("ETHUSDT", "BULLISH", m, BENIGN_SNAP))
+    assert by["btc_breaker"][0] == "veto"
+
+
+def test_btc_mild_drop_no_veto():
+    # -2%: GAS applies a -15 score penalty (not ported — roadmap item 3),
+    # but never a veto. We record no block.
+    m = FakeMarket()
+    m.btc_1h = candles_from_closes([100.0, 98.0])
+    assert "btc_breaker" not in blocks_by_code(
+        run_vetoes("ETHUSDT", "BULLISH", m, BENIGN_SNAP))
+
+
+def test_btc_breaker_long_only():
+    # GAS comment L3655: the breaker guards LONG exposure; a BEARISH setup
+    # is not penalized for BTC selling off.
+    m = FakeMarket()
+    m.btc_1h = candles_from_closes([100.0, 96.9])
+    assert "btc_breaker" not in blocks_by_code(
+        run_vetoes("BTCUSDT", "BEARISH", m, BENIGN_SNAP))
+
+
+def test_btc_data_failure_holds():
+    m = FakeMarket()
+
+    def boom(symbol, interval, limit=220):
+        raise RuntimeError("provider timeout")
+
+    m.get_klines = boom
+    by = blocks_by_code(run_vetoes("ETHUSDT", "BULLISH", m, BENIGN_SNAP))
+    kind, reason = by["btc_breaker"]
+    assert kind == "hold"
+    assert "fail-closed" in reason
+
+
+# ------------------------------------------------- fail-closed holds
+def test_adv_derivatives_failure_holds():
+    m = FakeMarket()
+    m.raise_adv = True
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    assert by["adv_deriv"][0] == "hold"
+
+
+def test_order_book_failure_holds():
+    m = FakeMarket()
+    m.raise_book = True
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    kind, reason = by["liq_wall"]
+    assert kind == "hold"
+    assert "fail-closed" in reason
+
+
+def test_leverage_inputs_incomplete_holds():
+    m = FakeMarket()
+    m.adv["oi_usd"] = None
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    assert by["leverage_risk"][0] == "hold"
+
+
+# ------------------------------------------------- end-to-end + regression
+def test_veto_rejects_signal_end_to_end():
+    m = FakeMarket(bullish=True)
+    m.adv.update({"retail_long": 95.0, "funding": 0.0009,
+                  "oi_usd": 400_000_000.0, "volume_24h": 200_000_000.0,
+                  "spike": 5.0, "long_liq_usd": 50_000.0,
+                  "short_liq_usd": 500_000.0})
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert reason.startswith("veto:")
+    assert "leverage risk index" in reason
+
+
+def test_veto_hold_rejects_signal_end_to_end():
+    m = FakeMarket(bullish=True)
+    m.raise_adv = True
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert "holding (fail-closed)" in reason
+
+
+def test_btc_dump_rejects_signal_end_to_end():
+    m = FakeMarket(bullish=True)
+    m.btc_1h = candles_from_closes([100.0, 96.5])  # -3.5%/1h
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert "circuit breaker" in reason
+
+
+def test_strict_pass_regression_with_vetoes():
+    # A signal that passed before ROADMAP ITEM 2 still passes when no veto
+    # fires: vetoes add rejections, never approvals.
+    signal, note = evaluate_symbol("BTCUSDT", FakeMarket(bullish=True))
+    assert signal is not None, note
+    assert signal["direction"] == "LONG"
+    assert signal["quality"] >= config.MIN_QUALITY_SCORE
+    assert "STRICT PASS" in note
