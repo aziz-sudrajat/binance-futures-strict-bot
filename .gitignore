@@ -21,3 +21,7 @@ lifecycle-live.jsonl
 
 # Dashboard runtime settings — local to each host, never commit
 dashboard_settings.json
+
+# Mode key files (filled by the user, never commit)
+.env.live
+.env.demo
