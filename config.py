@@ -56,6 +56,17 @@ MTF_CONFIRM_4H_BOOST = 6        # GAS CFG L112: mtfConfirm4hPass_ (L2074) 4h bul
 MTF_CONFIRM_4H_PENALTY = 10     # GAS CFG L113: 4h bearish
 DERIV_LIQ_SPIKE_THRESHOLD = 3   # GAS default (L1067): liq spike >= 3x -> LIQUIDATION EVENT
 
+# --------------------------------------- test-mode leverage tiers
+# User-authorized 2026-10-14 (TESTNET only): leverage per coin tier when
+# fixed-margin test mode is active. Trending majors get 20x, everything
+# else 10x. A single --leverage CLI value overrides all tiers.
+TEST_LEVERAGE_TIERS = {
+    "BTCUSDT": 20,
+    "ETHUSDT": 20,
+    "BNBUSDT": 20,
+}
+TEST_LEVERAGE_DEFAULT = 10
+
 # --------------------------------------- derivatives coverage (fail-closed)
 # Audit D4/H6: a snapshot with zero positioning visibility must HOLD the
 # signal, never auto-neutralize. Required components block the signal when
@@ -115,13 +126,15 @@ BACKTEST_DEFAULT_DAYS = 60         # default lookback for the CLI smoke run
 BACKTEST_DEFAULT_STEP_H = 6        # signal evaluation step (hours)
 
 # ------------------------------------------------------------- executor
-# Phase 2 executor. Testnet ONLY by default; keys come from env vars
-# BINANCE_TESTNET_KEY / BINANCE_TESTNET_SECRET — never hardcoded, never
-# logged. No mainnet code path is enabled: BASE_URL defaults to the Binance
-# Futures testnet and can only be pointed elsewhere via an explicit env
-# override (needed because Binance mainnet is geo-blocked from some hosts —
-# see README "Live deployment" note).
+# Phase 2 executor. Modes: paper (default), testnet (--testnet), live (--live).
+# Keys come from env vars and are never hardcoded, never logged:
+#   testnet: BINANCE_TESTNET_KEY / BINANCE_TESTNET_SECRET
+#   live:    BINANCE_LIVE_KEY / BINANCE_LIVE_SECRET  (mainnet, real money)
+# BASE_URL defaults per mode (testnet vs mainnet) and can be overridden via
+# BINANCE_FUTURES_BASE_URL (needed because Binance mainnet is geo-blocked
+# from some hosts — see README "Live deployment" note).
 BINANCE_FUTURES_BASE_URL = "https://testnet.binancefuture.com"
+BINANCE_FUTURES_MAINNET_URL = "https://fapi.binance.com"
 EXEC_POLL_INTERVAL_MIN = 5
 EXEC_MAX_EXPOSURE_PCT_PER_SYMBOL = 20.0  # max position notional as % of balance
 EXEC_BREAKEVEN_AFTER_TP1 = True           # move SL to entry once TP1 fills
@@ -129,12 +142,16 @@ EXEC_SIGNAL_ID_TTL_HOURS = 72             # processed signal IDs are kept this l
 EXEC_RECV_WINDOW_MS = 10000
 EXEC_STATE_FILE = "state.json"
 EXEC_LIFECYCLE_FILE = "lifecycle.jsonl"
+# Live mode uses SEPARATE state files so testnet/paper records can never
+# contaminate (or be mistaken for) real-money position history.
+EXEC_LIVE_STATE_FILE = "state-live.json"
+EXEC_LIVE_LIFECYCLE_FILE = "lifecycle-live.jsonl"
 EXEC_PAPER_START_BALANCE = 10_000.0       # hypothetical USDT for paper mode
 
 # ------------------------------------------------------------------ universe
 # GAS: CFG.DEFAULT_FAVORITES (L130). Symbols are normalized to XXXUSDT.
 UNIVERSE = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT",
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "SUIUSDT",
     "AVAXUSDT", "WLDUSDT", "DOGEUSDT", "PEPEUSDT",
 ]
 
