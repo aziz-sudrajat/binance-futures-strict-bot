@@ -151,7 +151,7 @@ def test_apply_signal_mode_preset():
     dashboard.apply_signal_mode_preset(s, "biasa")
     assert s["signal_mode"] == "biasa"
     assert s["min_quality_score"] == 50
-    assert s["bullish_only"] is False
+    assert s["bullish_only"] is True  # engine is long-only; biasa loosens LONG
     assert s["veto_funding"] is True  # core veto stays on
     with __import__("pytest").raises(ValueError):
         dashboard.apply_signal_mode_preset({}, "ngawur")
@@ -182,7 +182,7 @@ def test_shell_signal_mode_command(tmp_path, monkeypatch):
     assert shell.dispatch("set signal_mode biasa") is True
     st = dashboard.load_settings(mode="paper")
     assert st["signal_mode"] == "biasa"
-    assert st["bullish_only"] is False
+    assert st["bullish_only"] is True  # long-only engine; biasa = looser LONG
     # unknown mode rejected, settings untouched
     assert shell.dispatch("signal-mode ngawur") is True
     assert dashboard.load_settings(mode="paper")["signal_mode"] == "biasa"
