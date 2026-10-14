@@ -186,3 +186,11 @@ def test_shell_signal_mode_command(tmp_path, monkeypatch):
     # unknown mode rejected, settings untouched
     assert shell.dispatch("signal-mode ngawur") is True
     assert dashboard.load_settings(mode="paper")["signal_mode"] == "biasa"
+
+
+def test_parse_line_tolerates_leading_colon():
+    from shell_ui import parse_line
+    assert parse_line(": scan --top 5") == ("scan", ["--top", "5"])
+    assert parse_line(":signal-mode sedang") == ("signal-mode", ["sedang"])
+    assert parse_line(":") == ("", [])
+    assert parse_line("scan") == ("scan", [])
