@@ -263,7 +263,7 @@ class App:
             self.add(y, 0, line)
             y += 1
         self.draw_footer(
-            "1/2/3 mode · r radar · s setting · a auto-trade · q keluar")
+            "1/2/3 mode · r radar · d signal DB · s setting · a auto-trade · q keluar")
 
     def draw_settings(self) -> None:
         h, _w = self.std.getmaxyx()
@@ -290,6 +290,63 @@ class App:
                      curses.A_REVERSE if i == self.sel else 0)
         self.draw_footer("↑↓/jk pilih · spasi toggle · enter edit angka · "
                          "s kembali")
+
+    def load_dbsignals(self) -> None:
+        """Load fresh DB signals (fast, local SQLite — no thread needed)."""
+        try:
+            self.dbsig = dashboard.scanner_status()
+            self.dbsig_err = ""
+        except Exception as e:  # noqa: BLE001
+            self.dbsig = None
+            self.dbsig_err = str(e)[:120]
+
+    def draw_dbsignals(self) -> None:
+        h, _w = self.std.getmaxyx()
+        self.add(0, 0, " SIGNAL DB — scanner OKX → signals.db (tahap 1)",
+                 self.C["cyan"], curses.A_BOLD)
+        if self.dbsig_err:
+            self.add(2, 0, f"! {self.dbsig_err}", self.C["red"])
+        elif self.dbsig is not None:
+            st = self.dbsig.get("state") or {}
+            db = self.dbsig.get("db") or {}
+            lines = []
+            if st:
+                lines.append(f"pass terakhir: {st.get('symbols')} coin, "
+                             f"approved {st.get('approved')}, "
+                             f"error {st.get('errors')}, "
+                             f"{st.get('duration_s')}s")
+            lines.append(f"fresh di DB: {db.get('fresh', 0)}  "
+                         f"(consumed {db.get('consumed', 0)}, "
+                         f"expired {db.get('expired', 0)})")
+            lines.append("")
+            for s in self.dbsig.get("signals") or []:
+                lines.append(f"{s['symbol']:12} {s['direction']:5} "
+                             f"Q={s['quality']:<6} entry={s['entry']}  "
+                             f"{s['age_min']}m lalu")
+            if not lines:
+                lines.append("belum ada signal")
+            if self.sel < self.scroll:
+                self.scroll = self.sel
+            if self.sel >= self.scroll + h - 3:
+                self.scroll = self.sel - (h - 4)
+            for i in range(self.scroll, min(len(lines),
+                                            self.scroll + h - 3)):
+                self.add(i - self.scroll + 2, 0, lines[i])
+        else:
+            self.add(2, 0, "tekan d untuk muat", self.C["yel"])
+        self.draw_footer("d muat ulang · ↑↓ scroll · s kembali")
+
+    def on_key_dbsignals(self, ch: int) -> bool:
+        if ch in (ord("s"), ord("q"), 27):
+            self.screen = "main"
+        elif ch == ord("d"):
+            self.sel = self.scroll = 0
+            self.load_dbsignals()
+        elif ch in (curses.KEY_UP, ord("k")):
+            self.sel = max(0, self.sel - 1)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            self.sel += 1
+        return True
 
     def draw_radar(self) -> None:
         h, _w = self.std.getmaxyx()
@@ -329,6 +386,10 @@ class App:
             self.screen = "radar"
             self.sel = self.scroll = 0
             self.start_radar()
+        elif ch == ord("d"):
+            self.screen = "dbsignals"
+            self.sel = self.scroll = 0
+            self.load_dbsignals()
         elif ch == ord("s"):
             self.screen = "settings"
             self.sel = self.scroll = 0
@@ -410,6 +471,8 @@ class App:
                 self.draw_main()
             elif self.screen == "settings":
                 self.draw_settings()
+            elif self.screen == "dbsignals":
+                self.draw_dbsignals()
             else:
                 self.draw_radar()
             self.std.refresh()
@@ -422,6 +485,8 @@ class App:
                 alive = self.on_key_main(ch)
             elif self.screen == "settings":
                 alive = self.on_key_settings(ch)
+            elif self.screen == "dbsignals":
+                alive = self.on_key_dbsignals(ch)
             else:
                 alive = self.on_key_radar(ch)
 
