@@ -36,14 +36,10 @@ log = logging.getLogger("executor")
 _FEE_PCT = 0.05  # fee estimate per fill for PnL accounting (matches backtest)
 _ENTRY_TIMEOUT_HOURS = 6  # cancel an unfilled entry order after this long
 
-# Dashboard settings defaults (dashboard.py writes dashboard_settings.json;
-# the executor honors it live, without a restart).
-_DASH_DEFAULTS = {
-    "auto_trade": True,
-    "risk_pct_per_trade": 1.0,
-    "max_leverage": 3,
-    "poll_interval_min": 5,
-}
+# Dashboard settings defaults — canonical source is config.DASHBOARD_DEFAULTS
+# (dashboard.py writes dashboard_settings.json; the executor honors it live,
+# without a restart).
+_DASH_DEFAULTS = config.DASHBOARD_DEFAULTS
 
 
 def signal_candle_close_ms(market, symbol: str) -> int:
@@ -267,6 +263,11 @@ class Executor:
                          "managed": 0, "errors": []}
         balance = self.exchange.get_balance()
         self.risk.ensure_day()
+        # Studio settings: applied every cycle, no restart needed.
+        config.apply_dashboard_overrides(self._dash_settings())
+        if config.DISABLED_VETOES:
+            log.warning("scan with vetoes DISABLED by operator: %s",
+                        sorted(config.DISABLED_VETOES))
         self._manage_positions(balance, summary)
         for symbol in self.universe:
             try:
