@@ -152,11 +152,25 @@ EXEC_LIVE_LIFECYCLE_FILE = "lifecycle-live.jsonl"
 EXEC_PAPER_START_BALANCE = 10_000.0       # hypothetical USDT for paper mode
 
 # ------------------------------------------------------------------ universe
-# GAS: CFG.DEFAULT_FAVORITES (L130). Symbols are normalized to XXXUSDT.
+# Curated universe of liquid USDT-M perpetuals. The dashboard can switch to
+# "top_volume" mode, which picks the top-N symbols by 24h quote volume from
+# the exchange instead (see executor.resolve_universe). One bad symbol never
+# kills a scan — untradable/delist symbols are skipped gracefully.
 UNIVERSE = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "SUIUSDT",
-    "AVAXUSDT", "WLDUSDT", "DOGEUSDT", "PEPEUSDT",
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TONUSDT",
+    "TRXUSDT", "DOTUSDT", "POLUSDT", "LTCUSDT", "BCHUSDT",
+    "NEARUSDT", "UNIUSDT", "ATOMUSDT", "ETCUSDT", "FILUSDT",
+    "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT", "SUIUSDT",
+    "SEIUSDT", "TIAUSDT", "JUPUSDT", "WLDUSDT", "TAOUSDT",
+    "PEPEUSDT", "SHIBUSDT", "BONKUSDT", "WIFUSDT", "FLOKIUSDT",
+    "FETUSDT", "RENDERUSDT", "GALAUSDT", "SANDUSDT", "MANAUSDT",
+    "AAVEUSDT", "MKRUSDT", "LDOUSDT", "ARUSDT", "STXUSDT",
+    "IMXUSDT", "HBARUSDT", "VETUSDT", "GRTUSDT", "ONDOUSDT",
+    "JASMYUSDT", "NOTUSDT", "AXSUSDT", "SNXUSDT", "CRVUSDT",
 ]
+UNIVERSE_TOP_N_DEFAULT = 30
+UNIVERSE_TOP_N_MAX = 100
 
 # ------------------------------------------------------------ data / caching
 # GAS: klinesTtlSec_ per interval (L418-428), DERIVATIVES_CACHE_SECONDS=120 (L50)
@@ -233,6 +247,9 @@ DASHBOARD_DEFAULTS = {
     "veto_whale": True,
     "veto_liq_wall": True,
     "veto_btc_breaker": True,
+    # universe
+    "universe_mode": "curated",  # curated | top_volume
+    "universe_top_n": 30,        # 10-100, used when top_volume
     # order execution (full operator control; defaults are the safe ones)
     "margin_mode": "ISOLATED",   # ISOLATED | CROSS
     "leverage_mode": "auto",     # auto (risk default) | fixed
