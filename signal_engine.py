@@ -486,7 +486,8 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
     except Exception:  # noqa: BLE001 - run_vetoes retries and holds on failure
         book = None
     blocks = run_vetoes(symbol, "BULLISH", market, snap, book=book,
-                        skip_deriv_vetoes=degraded)
+                        skip_deriv_vetoes=degraded,
+                        disabled=getattr(config, "DISABLED_VETOES", ()))
     if blocks:
         why = "; ".join(f"[{code}/{kind}] {reason}"
                         for code, kind, reason in blocks)
