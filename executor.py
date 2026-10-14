@@ -29,7 +29,7 @@ from lifecycle import (
     GENERATED, APPROVED, REJECTED, ENTRY_TRIGGERED, POSITION_OPENED,
     TP1_HIT, TP2_HIT, TP3_HIT, SL_HIT, EXPIRED, CANCELLED,
 )
-from risk import floor_to_step
+from risk import floor_to_step, quantize_price
 
 log = logging.getLogger("executor")
 
@@ -665,7 +665,7 @@ class Executor:
         in_zone = signal["entry_low"] <= live <= signal["entry_high"]
         entry_type = "MARKET" if in_zone else "LIMIT"
         tick = filters.get("tickSize", 0) or 0
-        entry_px = round(entry / tick) * tick if tick else entry
+        entry_px = quantize_price(entry, tick)
         order = self.exchange.place_order(
             symbol, entry_side, entry_type,
             quantity=qty,
@@ -849,7 +849,7 @@ class Executor:
             pass
 
         def _px(p: float) -> float:
-            return round(p / tick) * tick if tick else p
+            return quantize_price(p, tick)
 
         sl = self.exchange.place_algo_order(
             symbol, exit_side, "STOP_MARKET", quantity=pos["qty"],
@@ -908,7 +908,7 @@ class Executor:
             tick = (self.exchange.get_symbol_filters(symbol) or {}).get("tickSize")
         except Exception:  # noqa: BLE001
             pass
-        be = round(pos["entry_price"] / tick) * tick if tick else pos["entry_price"]
+        be = quantize_price(pos["entry_price"], tick)
         exit_side = "BUY" if pos.get("direction") == "SHORT" else "SELL"
         sl = self.exchange.place_order(
             symbol, exit_side, "STOP_MARKET", quantity=pos["qty"],

@@ -27,11 +27,34 @@ def utc_today() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
+def _step_decimals(step: float) -> int:
+    """Decimal places implied by a step/tick size (0.001 -> 3, 1 -> 0)."""
+    s = f"{step:.12f}".rstrip("0").rstrip(".")
+    return len(s.partition(".")[2]) if "." in s else 0
+
+
 def floor_to_step(qty: float, step: float) -> float:
-    """Round quantity DOWN to the exchange step size (never up)."""
+    """Round quantity DOWN to the exchange step size (never up).
+
+    Also strips IEEE-754 artifacts (e.g. 70*0.1 -> 7.000000000000001):
+    the result is quantized to the step's own decimal places, so the
+    value sent to the exchange never exceeds its precision (-1111).
+    """
     if step <= 0:
         return qty
-    return math.floor(qty / step + 1e-12) * step
+    floored = math.floor(qty / step + 1e-12) * step
+    return round(floored, _step_decimals(step))
+
+
+def quantize_price(px: float, tick: float) -> float:
+    """Round a price to the exchange tick size, stripping float artifacts.
+
+    Replaces the naive round(px/tick)*tick pattern, which can emit values
+    like 0.055990000000000005 that Binance rejects with -1111.
+    """
+    if not tick or tick <= 0 or px is None:
+        return px
+    return round(round(px / tick) * tick, _step_decimals(tick))
 
 
 class RiskManager:

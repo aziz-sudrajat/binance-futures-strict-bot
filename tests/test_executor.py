@@ -787,3 +787,82 @@ def test_short_full_stack_with_paper_broker(workdir):
     pos = ex._open_positions()[pos_id]
     assert pos["tp"]["tp1"]["filled"] is True
     assert pos["realized"] > 0
+
+
+def test_floor_to_step_strips_float_artifacts():
+    # Regression: 70*0.1 == 7.000000000000001 in IEEE-754; Binance rejects
+    # such values with -1111 (precision over maximum). The hardened
+    # floor_to_step must emit exactly representable, step-aligned values.
+    from risk import floor_to_step, quantize_price, _step_decimals
+    assert _step_decimals(0.001) == 3
+    assert _step_decimals(1) == 0
+    assert _step_decimals(0.00000001) == 8
+    assert floor_to_step(7.0, 0.1) == 7.0
+    assert repr(floor_to_step(7.0, 0.1)) == "7.0"
+    # still floors down, never up
+    assert floor_to_step(7.09, 0.1) == 7.0
+    assert floor_to_step(0.0, 0.001) == 0.0
+    assert floor_to_step(5.5, 0) == 5.5  # no step -> passthrough
+    # quantize_price: the 0.05599/0.00001 case that failed live (-1111)
+    assert quantize_price(0.05599, 0.00001) == 0.05599
+    assert repr(quantize_price(0.05599, 0.00001)) == "0.05599"
+    assert quantize_price(123.456, 0.1) == 123.5  # rounds to tick
+    assert quantize_price(100.0, 0) == 100.0
+    # fuzz: never emit more decimals than the step allows
+    import random
+    rng = random.Random(42)
+    for step in (0.1, 0.01, 0.001, 0.00001, 1, 0.5):
+        dec = _step_decimals(step)
+        for _ in range(200):
+            v = rng.uniform(0.0001, 99999)
+            q = floor_to_step(v, step)
+            assert abs(q - v) < step + 1e-9  # within one step below
+            assert round(q, dec) == q, (v, step, repr(q))
+            p = quantize_price(v, step)
+            assert round(p, dec) == p, (v, step, repr(p))
+
+
+def test_last_event_ts_tail_read(tmp_path):
+    """last_event_ts reads only the tail: newest ts, empty, missing file."""
+    from lifecycle import LifecycleLogger
+    p = tmp_path / "lc.jsonl"
+    lc = LifecycleLogger(str(p))
+    assert lc.last_event_ts() is None  # missing file
+    p.write_text("")
+    assert lc.last_event_ts() is None  # empty file
+    lc.log("s1", "AAAUSDT", "generated")
+    t1 = lc.last_event_ts()
+    assert isinstance(t1, int) and t1 > 0
+    lc.log("s1", "AAAUSDT", "position_opened", qty=1.0, entry=2.0)
+    t2 = lc.last_event_ts()
+    assert t2 >= t1
+    # garbage lines are skipped
+    with open(p, "a") as f:
+        f.write("not json\n{\"no_ts\": 1}\n")
+    assert lc.last_event_ts() == t2
+
+
+def test_write_last_run(tmp_path):
+    """_write_last_run emits a worker-friendly JSON with notable events."""
+    import json
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from lifecycle import LifecycleLogger
+    from run_executor import _write_last_run, _NOTABLE_STATES
+    lc = LifecycleLogger(str(tmp_path / "lifecycle.jsonl"))
+    start = lc.last_event_ts() or 0
+    lc.log("s1", "WALUSDT", "generated")
+    lc.log("s1", "WALUSDT", "position_opened", qty=10.0, entry=0.06)
+    lc.log("s2", "AAAUSDT", "rejected", reason="x")  # not notable
+    _write_last_run("TESTNET", lc, start, {"approved": 1, "rejected": 1,
+                                           "opened": 1, "managed": 0,
+                                           "errors": []})
+    d = json.loads((tmp_path / "last_run.json").read_text())
+    assert d["mode"] == "TESTNET"
+    assert d["summary"]["opened"] == 1
+    assert d["last_event_ts"] == lc.last_event_ts()
+    assert len(d["notable"]) == 1
+    n = d["notable"][0]
+    assert n["symbol"] == "WALUSDT" and n["state"] == "position_opened"
+    assert n["qty"] == 10.0 and n["entry"] == 0.06
+    assert "rejected" not in _NOTABLE_STATES
