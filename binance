@@ -1,0 +1,4 @@
+#!/bin/sh
+# Binance Futures Studio — terminal interaktif.
+# Pakai: ./binance   (atau: .venv/bin/python binance.py [perintah])
+exec "$(dirname "$0")/.venv/bin/python" "$(dirname "$0")/binance.py" "$@"
