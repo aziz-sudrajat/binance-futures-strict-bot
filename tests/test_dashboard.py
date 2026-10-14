@@ -166,6 +166,7 @@ def test_apply_numeric_overrides(dash_env):
     from executor import Executor as _E  # noqa
     import executor as exmod
     e = object.__new__(exmod.Executor)
+    e.settings_mode = "live"
     config.apply_dashboard_overrides(e._dash_settings())
     assert config.MIN_QUALITY_SCORE == 80
     assert config.TP1_RR == 2.0
@@ -177,6 +178,7 @@ def test_apply_clamps_out_of_range(dash_env):
         json.dump({"min_quality_score": 200, "tp1_rr": 99.0}, f)
     import executor as exmod
     e = object.__new__(exmod.Executor)
+    e.settings_mode = "live"
     config.apply_dashboard_overrides(e._dash_settings())
     assert config.MIN_QUALITY_SCORE == 95
     assert config.TP1_RR == 5.0
@@ -187,6 +189,7 @@ def test_apply_tp_split_normalized(dash_env):
                   dash_env)
     import executor as exmod
     e = object.__new__(exmod.Executor)
+    e.settings_mode = "live"
     config.apply_dashboard_overrides(e._dash_settings())
     assert config.TP_SPLIT == pytest.approx((0.25, 0.25, 0.5))
     assert abs(sum(config.TP_SPLIT) - 1.0) < 1e-9
@@ -196,6 +199,7 @@ def test_apply_veto_toggles(dash_env):
     save_settings({"veto_funding": False, "veto_whale": False}, dash_env)
     import executor as exmod
     e = object.__new__(exmod.Executor)
+    e.settings_mode = "live"
     config.apply_dashboard_overrides(e._dash_settings())
     assert config.DISABLED_VETOES == frozenset({"funding", "whale"})
 
@@ -205,6 +209,7 @@ def test_apply_mtf_and_bools(dash_env):
                    "breakeven_after_tp1": False}, dash_env)
     import executor as exmod
     e = object.__new__(exmod.Executor)
+    e.settings_mode = "live"
     config.apply_dashboard_overrides(e._dash_settings())
     assert config.MTF_30M_MODE == "LEAN"
     assert config.BULLISH_ONLY is False
@@ -216,6 +221,7 @@ def test_apply_ignores_invalid_mtf(dash_env):
         json.dump({"mtf_30m_mode": "YOLO"}, f)
     import executor as exmod
     e = object.__new__(exmod.Executor)
+    e.settings_mode = "live"
     config.apply_dashboard_overrides(e._dash_settings())
     assert config.MTF_30M_MODE == "STRICT"
 
@@ -265,3 +271,116 @@ def test_studio_validation_accepts_full_settings(dash_env):
 def test_studio_validation_rejects(dash_env, bad):
     with pytest.raises(ValueError):
         save_settings(bad, dash_env)
+
+
+# ------------------------------------------------- order config + modes
+def test_order_fields_validate(dash_env):
+    out = save_settings({"margin_mode": "CROSS", "leverage_mode": "fixed",
+                         "leverage": 20, "entry_mode": "fixed_usdt",
+                         "fixed_usdt": 50}, dash_env)
+    assert out["margin_mode"] == "CROSS"
+    assert out["leverage"] == 20
+    assert out["fixed_usdt"] == 50.0
+
+
+@pytest.mark.parametrize("bad", [
+    {"margin_mode": "MARGIN"},
+    {"leverage_mode": "yolo"},
+    {"leverage": 0}, {"leverage": 126},
+    {"entry_mode": "random"},
+    {"fixed_usdt": 0}, {"fixed_usdt": 200_000},
+])
+def test_order_fields_reject(dash_env, bad):
+    with pytest.raises(ValueError):
+        save_settings(bad, dash_env)
+
+
+def test_per_mode_sections(dash_env):
+    save_settings({"leverage_mode": "fixed", "leverage": 20}, dash_env,
+                  mode="testnet")
+    save_settings({"leverage_mode": "auto"}, dash_env, mode="live")
+    assert load_settings(dash_env, mode="testnet")["leverage"] == 20
+    assert load_settings(dash_env, mode="live")["leverage_mode"] == "auto"
+    # untouched mode falls back to defaults
+    assert load_settings(dash_env, mode="paper")["auto_trade"] is True
+
+
+def test_legacy_flat_file_is_live_section(dash_env):
+    # legacy flat file: one profile shared by all modes
+    with open(dash_env, "w", encoding="utf-8") as f:
+        json.dump({"auto_trade": False}, f)
+    assert load_settings(dash_env, mode="live")["auto_trade"] is False
+    assert load_settings(dash_env, mode="testnet")["auto_trade"] is False
+
+
+def test_executor_fixed_leverage(erig):
+    executor, _ = erig
+    save_settings({"leverage_mode": "fixed", "leverage": 20},
+                  config.DASHBOARD_SETTINGS_FILE, mode="live")
+    assert executor._resolve_leverage("BTCUSDT") == 20
+
+
+def test_executor_margin_mode_cross(erig):
+    executor, exchange = erig
+    save_settings({"margin_mode": "CROSS"},
+                  config.DASHBOARD_SETTINGS_FILE, mode="live")
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    assert summary["opened"] == 1
+    assert ("BTCUSDT", "CROSS") in exchange.margin_calls
+
+
+def test_executor_fixed_usdt_entry(erig):
+    executor, exchange = erig
+    save_settings({"entry_mode": "fixed_usdt", "fixed_usdt": 50,
+                   "leverage_mode": "fixed", "leverage": 10},
+                  config.DASHBOARD_SETTINGS_FILE, mode="live")
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    assert summary["opened"] == 1
+    # 50 USDT * 10x / $100 entry = 5.0 qty (floored to step)
+    pos = next(iter(executor._open_positions().values()))
+    assert pos["qty"] == pytest.approx(5.0)
+
+
+def test_settings_mode_picks_section(tmp_path, dash_env):
+    market = FakeMarket(live=100.0)
+    exchange = FakeExchange(balance=10_000.0)
+    state = StateStore(os.path.join(str(tmp_path), "s2.json"))
+    lifecycle = LifecycleLogger(os.path.join(str(tmp_path), "l2.jsonl"))
+    risk = RiskManager(state, exchange.get_balance)
+    ex = Executor(market, exchange, risk, state, lifecycle,
+                  universe=["BTCUSDT"], settings_mode="testnet")
+    save_settings({"auto_trade": False}, config.DASHBOARD_SETTINGS_FILE,
+                  mode="testnet")
+    save_settings({"auto_trade": True}, config.DASHBOARD_SETTINGS_FILE,
+                  mode="live")
+    assert ex._dash_settings()["auto_trade"] is False
+
+
+def test_bot_mode_env_selects_testnet(monkeypatch):
+    import run_executor
+    from run_executor import main
+    monkeypatch.setenv("BOT_MODE", "demo")
+    # demo -> testnet -> needs testnet keys -> refuses without them
+    with pytest.raises(SystemExit):
+        main(["--balance"])
+
+
+def test_bot_mode_env_selects_live(monkeypatch):
+    from run_executor import main
+    monkeypatch.setenv("BOT_MODE", "live")
+    with pytest.raises(SystemExit):
+        main(["--balance"])
+
+
+def test_explicit_flag_beats_bot_mode(monkeypatch):
+    import run_executor
+    from run_executor import main
+    monkeypatch.setenv("BOT_MODE", "demo")
+    # explicit --live ignores BOT_MODE=demo -> needs live keys
+    with pytest.raises(SystemExit) as ei:
+        main(["--live", "--balance"])
+    assert "BINANCE_LIVE_KEY" in str(ei.value)
