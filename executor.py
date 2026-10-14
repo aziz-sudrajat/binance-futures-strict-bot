@@ -98,12 +98,11 @@ def compute_qty(balance: float, entry: float, stop: float,
 
 def compute_test_qty(fixed_margin_usdt: float, leverage: int, entry: float,
                      filters: dict) -> tuple[float, str]:
-    """Fixed-margin test sizing. Returns (qty, note); qty == 0 means skip.
+    """Fixed-margin sizing. Returns (qty, note); qty == 0 means skip.
 
     notional = fixed_margin_usdt * leverage; qty = notional / entry, floored
     to stepSize, honoring minQty / minNotional. The per-symbol exposure cap
     and the other risk gates still apply downstream in risk.check_can_open.
-    TEST ONLY - never used for live trading.
     """
     if fixed_margin_usdt is None or fixed_margin_usdt <= 0:
         return 0.0, "fixed margin must be > 0"
@@ -165,7 +164,8 @@ class Executor:
                  fixed_margin_usdt: float | None = None,
                  leverage_override: int | None = None,
                  leverage_tiers: dict | None = None,
-                 leverage_default: int | None = None):
+                 leverage_default: int | None = None,
+                 settings_mode: str | None = None):
         self.market = market
         self.exchange = exchange
         self.risk = risk
@@ -173,6 +173,8 @@ class Executor:
         self.lifecycle = lifecycle or LifecycleLogger()
         self.universe = universe or list(config.UNIVERSE)
         self.poll_interval_min = poll_interval_min
+        # Which dashboard settings section applies ("live"/"testnet"/"paper").
+        self.settings_mode = settings_mode or "live"
         # TEST MODE overrides (never for live): fixed margin per position and
         # explicit leverage, bypassing the RISK_PCT_PER_TRADE/MAX_LEVERAGE
         # defaults. Risk gates (kill switch, caps) still apply downstream.
@@ -197,12 +199,19 @@ class Executor:
         Read fresh on every call (cheap: tiny JSON file) so the dashboard
         takes effect without restarting the loop. Missing/corrupt file ->
         defaults (current behavior, auto-trade ON).
+
+        The file holds per-mode sections {"live": {...}, "testnet": {...}};
+        the executor's settings_mode picks its section. A legacy flat file
+        (no mode keys) is treated as the live section.
         """
         s = dict(_DASH_DEFAULTS)
         try:
             with open(config.DASHBOARD_SETTINGS_FILE, "r",
                       encoding="utf-8") as f:
                 loaded = json.load(f) or {}
+            if isinstance(loaded, dict) and any(
+                    k in loaded for k in ("live", "testnet", "paper")):
+                loaded = loaded.get(self.settings_mode) or {}
             for k in s:
                 if k in loaded:
                     s[k] = loaded[k]
@@ -233,7 +242,8 @@ class Executor:
         2. per-symbol tier (test mode only),
         3. normal risk default MAX_LEVERAGE.
         The dashboard cap tightens (never loosens) path 3 only; explicit
-        test-mode overrides are left untouched.
+        test-mode overrides are left untouched. A dashboard "fixed" leverage
+        (operator choice, 1-125) applies when no CLI override is set.
         """
         if self.leverage_override:
             return self.leverage_override
@@ -245,6 +255,13 @@ class Executor:
             default = (self.leverage_default if self.leverage_default is not None
                        else config.TEST_LEVERAGE_DEFAULT)
             return tiers.get(symbol, default)
+        ds = self._dash_settings()
+        if ds.get("leverage_mode") == "fixed":
+            try:
+                v = int(ds.get("leverage", 3))
+            except (TypeError, ValueError):
+                v = 3
+            return max(1, min(v, 125))
         return max(1, min(config.MAX_LEVERAGE, self._effective_max_leverage(),
                           125))
 
@@ -420,14 +437,30 @@ class Executor:
         filters = self.exchange.get_symbol_filters(symbol)
         if not filters:
             return self._reject(symbol, sid, "symbol not tradable on exchange")
+        ds = self._dash_settings()
         lev = self._resolve_leverage(symbol)
+        margin_mode = ds.get("margin_mode", "ISOLATED")
+        if margin_mode not in ("ISOLATED", "CROSS"):
+            margin_mode = "ISOLATED"
         self.exchange.set_leverage(symbol, lev)
-        self.exchange.set_margin_type(symbol, "ISOLATED")
+        self.exchange.set_margin_type(symbol, margin_mode)
+        if (margin_mode != "ISOLATED"
+                or ds.get("leverage_mode") == "fixed"
+                or ds.get("entry_mode") == "fixed_usdt"):
+            log.warning("%s operator order config: margin=%s leverage=%sx "
+                        "entry=%s", symbol, margin_mode, lev,
+                        ds.get("entry_mode", "risk"))
 
         # 3. Sizing.
         if self.fixed_margin_usdt is not None:
             qty, note = compute_test_qty(self.fixed_margin_usdt, lev, entry,
                                          filters)
+        elif ds.get("entry_mode") == "fixed_usdt":
+            try:
+                fu = float(ds.get("fixed_usdt", 10.0))
+            except (TypeError, ValueError):
+                fu = 10.0
+            qty, note = compute_test_qty(max(1.0, fu), lev, entry, filters)
         else:
             qty, note = compute_qty(balance, entry, float(signal["stop_loss"]),
                                     filters,
