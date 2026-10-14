@@ -10,7 +10,7 @@ Framework-style interactive shell: ketik perintah, bukan hafal tombol.
     binance(paper)> position
     binance(paper)> setting
 
-Perintah: scan, auto-trade [--demo|--live|--paper] [--from-db] [--setting],
+Perintah: scan, cari <coin>, entry <coin> <long|short>, auto-trade [--demo|--live|--paper] [--from-db] [--setting],
 setting, set <key> <value>, position, balance, signals, scanner <start|stop|
 status|once>, mode [live|demo|paper], events, kill, dashboard, clear,
 help, exit.
@@ -48,8 +48,9 @@ import scanner as scanner_mod
 import shell_ui
 from shell_ui import (COMMANDS, banner, coerce_setting, command_help,
                       events_table, help_table, lookup_command, parse_line,
-                      positions_table, radar_table, settings_table,
-                      signals_table, status_panel, suggest_command)
+                      positions_table, radar_table, rejection_breakdown,
+                      settings_table, signals_table, status_panel,
+                      suggest_command)
 
 MODES = ("live", "testnet", "paper")
 MODE_ALIASES = {"demo": "testnet", "testnet": "testnet",
@@ -152,7 +153,131 @@ class BinanceShell:
         if "error" in result:
             self.console.print(f"[red]scan gagal:[/red] {result['error']}")
             return
-        self.console.print(radar_table(result.get("rows") or [], limit=top))
+        rows = result.get("rows") or []
+        self.console.print(radar_table(rows, limit=top))
+        approved = sum(1 for r in rows if r.get("state") == "approved")
+        if approved == 0:
+            self.console.print(rejection_breakdown(rows))
+            self.console.print(
+                "[dim]0 sinyal = hasil valid bila pasar tak selaras dengan "
+                "mode aktif. Cek `cari <coin>` untuk diagnostik per-coin, "
+                "atau `signal-mode biasa` untuk ikut sinyal SHORT.[/dim]")
+
+    def cmd_cari(self, args: list[str]) -> None:
+        """cari <nama coin> — diagnostik per-coin: tren 15m/30m/4h/1d,
+        quality bila lolos, atau alasan penolakan engine."""
+        if not args:
+            self.console.print("[red]pakai: cari <nama coin>[/red] "
+                               "[dim](cth: cari btc)[/dim]")
+            return
+        from data import MarketData, normalize_symbol
+        from signal_engine import analyze_candles, evaluate_symbol, \
+            mtf_trend_direction
+        symbol = normalize_symbol("".join(args))
+        if not symbol:
+            self.console.print("[red]nama coin tidak dikenal[/red]")
+            return
+        settings = dashboard.load_settings(mode=self.mode)
+        config.apply_dashboard_overrides(settings)
+        market = MarketData()
+        with self.console.status(f"[green]menganalisis {symbol}…[/green]",
+                                 spinner="dots"):
+            try:
+                signal, note = evaluate_symbol(symbol, market)
+            except Exception as e:  # noqa: BLE001
+                self.console.print(f"[red]{symbol}: data error — {e}[/red]")
+                return
+            try:
+                a15 = analyze_candles(symbol, "15m",
+                                      market.get_klines(symbol, "15m"))
+                a30 = analyze_candles(symbol, "30m",
+                                      market.get_klines(symbol, "30m"))
+                t4 = mtf_trend_direction(
+                    [float(c["close"]) for c in market.get_klines(symbol, "4h")])
+                t1 = mtf_trend_direction(
+                    [float(c["close"]) for c in market.get_klines(symbol, "1d")])
+                live = market.get_live_price(symbol)
+            except Exception as e:  # noqa: BLE001
+                self.console.print(f"[red]{symbol}: analisis gagal — {e}[/red]")
+                return
+        dir_color = ("green" if signal and signal.get("direction") == "LONG"
+                     else "red" if signal else "dim")
+        body = (
+            f"[bold]{symbol}[/bold]  "
+            f"[dim]harga[/dim] {live:.6g}\n"
+            f"[dim]15m[/dim] {a15['signal']} "
+            f"(strength {a15['strength']}/5, RSI {a15['rsi']:.0f})  "
+            f"[dim]30m[/dim] {a30['signal']}  "
+            f"[dim]4h[/dim] {t4}  [dim]1d[/dim] {t1}\n"
+        )
+        if signal:
+            body += (
+                f"[{dir_color}]✅ LOLOS {signal['direction']}[/{dir_color}]  "
+                f"[dim]quality[/dim] [bold]{signal['quality']:.0f}[/bold]  "
+                f"[dim]entry[/dim] {signal['entry']:.6g}  "
+                f"[red]SL {signal['stop_loss']:.6g}[/red]\n"
+                f"[dim]TP1 {signal['tp1']:.6g} / TP2 {signal['tp2']:.6g} / "
+                f"TP3 {signal['tp3']:.6g}[/dim]"
+            )
+        else:
+            body += f"[yellow]⛔ ditolak engine:[/yellow] {note}"
+        self.console.print(Panel(body, title=f"Cari coin [{self.mode}]",
+                                 border_style="cyan"))
+
+    def cmd_entry(self, args: list[str]) -> None:
+        """entry <nama coin> <long|short> — entry manual dengan konfirmasi.
+        Melewati gate sinyal STRICT (pilihan sadar user); safety mekanis
+        (freshness, filter exchange, risk gate, bracket SL/TP) tetap jalan."""
+        if len(args) < 2:
+            self.console.print("[red]pakai: entry <nama coin> "
+                               "<long|short>[/red] [dim](cth: entry btc "
+                               "long)[/dim]")
+            return
+        direction = args[-1].upper()
+        if direction not in ("LONG", "SHORT"):
+            self.console.print("[red]arah harus long atau short[/red]")
+            return
+        name = "".join(args[:-1])
+        from data import normalize_symbol
+        symbol = normalize_symbol(name)
+        if not symbol:
+            self.console.print("[red]nama coin tidak dikenal[/red]")
+            return
+        try:
+            executor = self.get_executor()
+        except SystemExit as e:
+            self.console.print(f"[red]{e}[/red]")
+            return
+        plan, err = executor.preview_manual_entry(symbol, direction=direction)
+        if err:
+            self.console.print(f"[red]{symbol}: {err}[/red]")
+            return
+        dcolor = "green" if direction == "LONG" else "red"
+        self.console.print(Panel(
+            f"[bold]{symbol}[/bold] [{dcolor}]{direction}[/{dcolor}] "
+            f"[dim]di mode[/dim] [bold]{self.mode}[/bold]\n"
+            f"[dim]entry (market)[/dim] {plan['entry']:.6g}  "
+            f"[dim]leverage[/dim] {plan['leverage']}x isolated\n"
+            f"[red]SL {plan['stop_loss']:.6g}[/red] "
+            f"[dim](risiko {plan['risk_pct']:.2f}%)[/dim]\n"
+            f"[dim]TP1 {plan['tp1']:.6g} / TP2 {plan['tp2']:.6g} / "
+            f"TP3 {plan['tp3']:.6g}[/dim]\n"
+            f"[yellow]melewati gate sinyal STRICT — keputusan manual "
+            f"anda[/yellow]",
+            title="Rencana entry manual", border_style="yellow"))
+        if self.mode == "live":
+            self.console.print(Panel(
+                "[bold red]LIVE MODE — order beneran, uang beneran.[/bold red]",
+                border_style="red"))
+        if not Prompt.ask(f"Eksekusi {direction} {symbol}?",
+                          choices=["y", "n"], default="n") == "y":
+            self.console.print("[dim]dibatalkan[/dim]")
+            return
+        ok, note = executor.manual_entry(symbol, direction=direction)
+        if ok:
+            self.console.print(f"[bold green]✅ {note}[/bold green]")
+        else:
+            self.console.print(f"[red]❌ {note}[/red]")
 
     def cmd_mode(self, args: list[str]) -> None:
         if not args:
@@ -523,6 +648,7 @@ class BinanceShell:
             return True
         handler = {
             "help": self.cmd_help, "scan": self.cmd_scan,
+            "cari": self.cmd_cari, "entry": self.cmd_entry,
             "mode": self.cmd_mode, "balance": self.cmd_balance,
             "position": self.cmd_position, "signals": self.cmd_signals,
             "events": self.cmd_events, "kill": self.cmd_kill,

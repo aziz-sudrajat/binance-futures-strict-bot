@@ -18,7 +18,9 @@ Framework-style shell — ketik perintah, bukan hafal tombol:
 
 | Perintah | Fungsi |
 |---|---|
-| `scan [--top N]` | Scan sinyal engine STRICT (Signal Radar) |
+| `scan [--top N]` | Scan sinyal engine STRICT (Signal Radar); bila 0, tampil breakdown alasan penolakan |
+| `cari <coin>` | Diagnostik per-coin: tren 15m/30m/4h/1d + alasan lolos/gagal engine |
+| `entry <coin> <long\|short>` | Entry manual (konfirmasi dulu): lewati gate STRICT, safety mekanis tetap jalan |
 | `auto-trade` | Auto-trade loop mode aktif (Ctrl+C berhenti, live panel) |
 | `auto-trade --demo` / `--live` / `--paper` | Ganti mode lalu jalan |
 | `auto-trade --from-db` | Eksekusi dari signals.db (tahap 2 pipeline) |

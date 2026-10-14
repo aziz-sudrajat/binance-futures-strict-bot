@@ -41,9 +41,9 @@ def test_commands_have_handlers():
     names = {c.name for c in COMMANDS}
     # every non-trivial command must dispatch without "belum diimplementasi"
     for name in names - {"clear", "exit", "help"}:
-        assert name in ("scan", "auto-trade", "setting", "set", "position",
-                        "balance", "signals", "scanner", "mode", "events",
-                        "kill", "dashboard", "signal-mode"), name
+        assert name in ("scan", "cari", "entry", "auto-trade", "setting", "set",
+                        "position", "balance", "signals", "scanner", "mode",
+                        "events", "kill", "dashboard", "signal-mode"), name
 
 
 # ------------------------------------------------------- dispatch
@@ -195,3 +195,47 @@ def test_parse_line_tolerates_leading_colon():
     assert parse_line(":signal-mode sedang") == ("signal-mode", ["sedang"])
     assert parse_line(":") == ("", [])
     assert parse_line("scan") == ("scan", [])
+
+
+# ------------------------------------------------------- rejection breakdown
+def test_rejection_category():
+    from shell_ui import _rejection_category as cat
+    assert cat("bullish-only: 15m signal BEARISH WATCH") == \
+        "15m bearish/netral (mode long-only)"
+    assert cat("15m: no directional setup (NEUTRAL)") == \
+        "15m netral (tanpa setup)"
+    assert cat("STRICT cascade: 4h trend bearish (need bullish)") == \
+        "cascade MTF tak selaras"
+    assert cat("24h volume $895,370 below $2,000,000") == \
+        "volume 24h di bawah minimum"
+    assert cat("veto: [liq_wall/veto] wall") == "kena veto"
+    assert cat("weird new reason") == "lainnya / data error"
+
+
+def test_rejection_breakdown_groups():
+    from shell_ui import rejection_breakdown
+    from rich.console import Console
+    rows = [
+        {"symbol": "BTCUSDT", "state": "rejected",
+         "reason": "bullish-only: 15m signal BEARISH WATCH"},
+        {"symbol": "ETHUSDT", "state": "rejected",
+         "reason": "bullish-only: 15m signal BEARISH WATCH"},
+        {"symbol": "SOLUSDT", "state": "rejected",
+         "reason": "STRICT cascade: 4h trend bearish (need bullish)"},
+        {"symbol": "WALUSDT", "state": "approved", "quality": 75},
+    ]
+    t = rejection_breakdown(rows)
+    console = Console(record=True, width=100)
+    console.print(t)
+    out = console.export_text()
+    assert "15m bearish/netral (mode long-only)" in out
+    assert "2" in out  # count for the long-only bucket
+    assert "WALUSDT" not in out  # approved rows excluded
+
+
+def test_cari_entry_commands_registered():
+    import binance as bsh
+    shell = bsh.BinanceShell()
+    assert shell.dispatch("cari") is True  # missing arg -> usage, no crash
+    assert shell.dispatch("entry") is True
+    assert shell.dispatch("entry btc") is True  # missing direction -> usage

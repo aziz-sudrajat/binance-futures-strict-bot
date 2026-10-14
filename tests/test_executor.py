@@ -682,6 +682,47 @@ def test_manual_entry_unknown_symbol(workdir):
     assert not ok
 
 
+def test_manual_entry_short_mirrors_brackets(workdir):
+    executor, exchange = _manual_rig(workdir)
+    ok, note = executor.manual_entry("GRASSUSDT", direction="SHORT")
+    assert ok, note
+    assert "MANUAL SHORT GRASSUSDT" in note
+    positions = executor._open_positions()
+    assert len(positions) == 1
+    pos = next(iter(positions.values()))
+    assert pos["direction"] == "SHORT"
+    # mirrored: SL above entry, TPs below
+    assert pos["tp"]["tp1"]["price"] < pos["entry_price"] < pos["stop_loss"]
+    assert pos["brackets_placed"] is True
+
+
+def test_manual_entry_bad_direction(workdir):
+    executor, _ = _manual_rig(workdir)
+    ok, note = executor.manual_entry("GRASSUSDT", direction="SIDEWAYS")
+    assert not ok and "LONG atau SHORT" in note
+    assert len(executor._open_positions()) == 0
+
+
+def test_preview_manual_entry_places_no_orders(workdir):
+    executor, exchange = _manual_rig(workdir)
+    plan, err = executor.preview_manual_entry("GRASSUSDT", direction="SHORT")
+    assert err == "", err
+    assert plan["direction"] == "SHORT"
+    assert plan["symbol"] == "GRASSUSDT"
+    assert plan["stop_loss"] > plan["entry"] > plan["tp1"] > plan["tp2"] > plan["tp3"]
+    assert plan["risk_pct"] > 0
+    # no orders placed, no positions opened
+    assert exchange.orders == {}
+    assert len(executor._open_positions()) == 0
+
+
+def test_preview_manual_entry_fail_closed(workdir):
+    executor, _ = _manual_rig(workdir)
+    executor.market.live = 0
+    plan, err = executor.preview_manual_entry("GRASSUSDT")
+    assert plan is None and "live price" in err.lower()
+
+
 def _short_signal(symbol="BTCUSDT", entry=100.0):
     return {"symbol": symbol, "direction": "SHORT", "interval": "15m",
             "entry": entry, "entry_low": 99.5, "entry_high": 100.5,
