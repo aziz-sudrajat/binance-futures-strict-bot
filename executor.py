@@ -155,6 +155,35 @@ def split_tp_qty(qty: float, step: float, min_qty: float,
     return merged, f"tp splits {merged}"
 
 
+def resolve_universe(exchange, settings: dict,
+                     curated: list[str] | None = None) -> list[str]:
+    """Universe for this scan cycle.
+
+    - "curated" (default): the built-in liquid list (config.UNIVERSE).
+    - "top_volume": top-N symbols by 24h quote volume from the exchange.
+      Any fetch failure falls back to the curated list (fail-safe: keep
+      trading the known coins instead of scanning nothing).
+    """
+    curated = list(curated if curated is not None else config.UNIVERSE)
+    if settings.get("universe_mode") != "top_volume":
+        return curated
+    try:
+        n = int(settings.get("universe_top_n",
+                             config.UNIVERSE_TOP_N_DEFAULT))
+    except (TypeError, ValueError):
+        n = config.UNIVERSE_TOP_N_DEFAULT
+    n = max(10, min(n, config.UNIVERSE_TOP_N_MAX))
+    try:
+        syms = exchange.get_top_volume_symbols(n)
+    except Exception as e:  # noqa: BLE001 - fallback, never break a scan
+        log.warning("top-volume universe failed (%s), using curated list", e)
+        return curated
+    if not syms:
+        return curated
+    log.info("universe: top_volume mode, %d symbols", len(syms))
+    return syms
+
+
 class Executor:
     def __init__(self, market, exchange, risk, state,
                  lifecycle: LifecycleLogger | None = None,
@@ -286,7 +315,9 @@ class Executor:
             log.warning("scan with vetoes DISABLED by operator: %s",
                         sorted(config.DISABLED_VETOES))
         self._manage_positions(balance, summary)
-        for symbol in self.universe:
+        universe = resolve_universe(self.exchange, self._dash_settings(),
+                                    self.universe)
+        for symbol in universe:
             try:
                 self._scan_symbol(symbol, balance, summary)
             except Exception as e:  # noqa: BLE001 - one symbol never kills a scan
@@ -296,7 +327,7 @@ class Executor:
         poll = getattr(self.exchange, "poll", None)
         if callable(poll):
             try:
-                poll(self.universe)
+                poll(universe)
             except Exception:  # noqa: BLE001
                 log.exception("paper poll failed")
         self.state.save()
