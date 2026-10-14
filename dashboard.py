@@ -30,12 +30,9 @@ import config
 # ------------------------------------------------------------------ settings
 SETTINGS_PATH = config.DASHBOARD_SETTINGS_FILE
 
-DEFAULTS = {
-    "auto_trade": True,
-    "risk_pct_per_trade": 1.0,
-    "max_leverage": 3,
-    "poll_interval_min": 5,
-}
+# Canonical defaults live in config.DASHBOARD_DEFAULTS (single source of
+# truth shared with the executor).
+DEFAULTS = config.DASHBOARD_DEFAULTS
 
 
 def load_settings(path: str = SETTINGS_PATH) -> dict:
@@ -55,18 +52,38 @@ def load_settings(path: str = SETTINGS_PATH) -> dict:
 def validate_settings(data: dict) -> dict:
     """Clean + clamp user settings. Raises ValueError on bad input.
 
-    The dashboard may only TIGHTEN risk, never exceed the code defaults.
+    Risk knobs may only TIGHTEN (never exceed the code defaults).
+    Engine knobs (signal/TP/SL) move within their documented ranges.
     """
     if not isinstance(data, dict):
         raise ValueError("settings must be a JSON object")
     out = dict(DEFAULTS)
 
-    if "auto_trade" in data:
-        v = data["auto_trade"]
-        if not isinstance(v, bool):
-            raise ValueError("auto_trade must be true/false")
-        out["auto_trade"] = v
+    def _bool(key: str) -> None:
+        if key in data:
+            v = data[key]
+            if not isinstance(v, bool):
+                raise ValueError(f"{key} must be true/false")
+            out[key] = v
 
+    _bool("auto_trade")
+    _bool("bullish_only")
+    _bool("breakeven_after_tp1")
+    for code in config.DASH_VETO_CODES:
+        _bool(f"veto_{code}")
+
+    # numeric engine knobs: (attr, lo, hi) ranges from config
+    for name, (_attr, lo, hi) in config.DASH_NUMERIC_OVERRIDES.items():
+        if name in data:
+            try:
+                v = float(data[name])
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} must be a number")
+            if not lo <= v <= hi:
+                raise ValueError(f"{name} must be {lo:g}-{hi:g}")
+            out[name] = v
+
+    # risk-per-trade: tighten-only (cap at the code default)
     if "risk_pct_per_trade" in data:
         try:
             v = float(data["risk_pct_per_trade"])
@@ -77,14 +94,14 @@ def validate_settings(data: dict) -> dict:
                 f"risk_pct_per_trade must be 0.1-{config.RISK_PCT_PER_TRADE}")
         out["risk_pct_per_trade"] = v
 
+    # max leverage: tighten-only (cap at the code default)
     if "max_leverage" in data:
         try:
             v = int(data["max_leverage"])
         except (TypeError, ValueError):
             raise ValueError("max_leverage must be an integer")
         if not 1 <= v <= config.MAX_LEVERAGE:
-            raise ValueError(
-                f"max_leverage must be 1-{config.MAX_LEVERAGE}")
+            raise ValueError(f"max_leverage must be 1-{config.MAX_LEVERAGE}")
         out["max_leverage"] = v
 
     if "poll_interval_min" in data:
@@ -95,6 +112,25 @@ def validate_settings(data: dict) -> dict:
         if not 1 <= v <= 60:
             raise ValueError("poll_interval_min must be 1-60")
         out["poll_interval_min"] = v
+
+    if "mtf_30m_mode" in data:
+        v = data["mtf_30m_mode"]
+        if v not in config.DASH_MTF_MODES:
+            raise ValueError(
+                f"mtf_30m_mode must be one of {list(config.DASH_MTF_MODES)}")
+        out["mtf_30m_mode"] = v
+
+    for i in (1, 2, 3):
+        k = f"tp_split_{i}"
+        if k in data:
+            try:
+                v = float(data[k])
+            except (TypeError, ValueError):
+                raise ValueError(f"{k} must be a number")
+            # wide range: apply_dashboard_overrides normalizes to sum 1.0
+            if not 0.01 <= v <= 10:
+                raise ValueError(f"{k} must be 0.01-10")
+            out[k] = v
 
     return out
 
@@ -153,6 +189,46 @@ def _fmt_ts(ts_ms: int) -> str:
         return dt.strftime("%d %H:%M:%S")
     except (TypeError, ValueError, OSError):
         return "-"
+
+
+def run_radar() -> list[dict]:
+    """Signal Radar: evaluate the whole universe with the CURRENT studio
+    settings and rank by quality (approved first). Uses the real engine —
+    the same pipeline the executor runs. Takes ~30-60s for 9 symbols."""
+    from data import MarketData
+    from signal_engine import evaluate_symbol
+    config.apply_dashboard_overrides(load_settings())
+    market = MarketData()
+    out = []
+    for symbol in config.UNIVERSE:
+        try:
+            signal, note = evaluate_symbol(symbol, market)
+        except Exception as e:  # noqa: BLE001 - one symbol never kills radar
+            out.append({"symbol": symbol, "state": "error", "quality": None,
+                        "reason": str(e)[:160]})
+            continue
+        if signal is None:
+            out.append({"symbol": symbol, "state": "rejected", "quality": None,
+                        "reason": note})
+        else:
+            out.append({
+                "symbol": symbol, "state": "approved",
+                "quality": signal.get("quality"),
+                "direction": signal.get("direction"),
+                "entry": signal.get("entry"),
+                "entry_low": signal.get("entry_low"),
+                "entry_high": signal.get("entry_high"),
+                "stop_loss": signal.get("stop_loss"),
+                "tp1": signal.get("tp1"), "tp2": signal.get("tp2"),
+                "tp3": signal.get("tp3"),
+                "rr1": round(signal.get("rr1") or 0, 2),
+                "rsi": signal.get("rsi"),
+                "regime": signal.get("regime"),
+                "volume_ratio": signal.get("volume_ratio"),
+            })
+    out.sort(key=lambda r: (r["state"] != "approved",
+                            -((r.get("quality") or -1))))
+    return out
 
 
 def read_events(mode: str, limit: int = 60) -> list[dict]:
@@ -258,6 +334,10 @@ h1{font-size:20px;margin:8px 0 12px}
 .setrow label{font-size:14px}
 .setrow input[type=number]{width:90px;padding:8px;background:#0d1117;
    border:1px solid #30363d;border-radius:8px;color:#e6edf3;font-size:15px}
+.setrow select{padding:8px;background:#0d1117;border:1px solid #30363d;
+   border-radius:8px;color:#e6edf3;font-size:15px}
+.veto{display:flex;justify-content:space-between;align-items:center;
+      padding:7px 0;border-bottom:1px solid #21262d;font-size:13px}
 .save{width:100%;padding:12px;margin-top:10px;background:#1f6feb;color:#fff;
       border:none;border-radius:8px;font-size:16px;font-weight:700}
 .save:active{background:#388bfd}
@@ -283,6 +363,13 @@ th{color:#8b949e;font-weight:600}
   <div class="row"><span>PnL hari ini</span><b id="m-pnl">—</b></div>
   <div class="row"><span>Kill switch</span><b id="m-ks">—</b></div>
 </div>
+<div class="card"><h2>📡 Signal Radar</h2>
+  <div class="dim" style="font-size:13px;margin-bottom:8px">Scan seluruh
+  universe dengan setting saat ini, diurutkan dari signal terkuat.
+  Butuh ~30–60 detik.</div>
+  <button class="save" id="scan" style="margin-top:0">Scan Signal Sekarang</button>
+  <div id="radar"><span class="dim">belum di-scan</span></div>
+</div>
 <div class="card"><h2>Auto Trade</h2>
   <div class="setrow"><label><b>Auto-trade aktif</b><br>
     <span class="dim" style="font-size:12px">OFF = scan tetap jalan tapi
@@ -297,7 +384,52 @@ th{color:#8b949e;font-weight:600}
     <input type="number" id="s-lev" step="1" min="1" max="3"></div>
   <div class="setrow"><label>Interval scan (menit)</label>
     <input type="number" id="s-int" step="1" min="1" max="60"></div>
-  <button class="save" id="save">Simpan Setting</button>
+</div>
+<div class="card"><h2>🎯 Signal — Quality &amp; Filter</h2>
+  <div class="setrow"><label>Min quality score<br>
+    <span class="dim" style="font-size:12px">STRICT default 70</span></label>
+    <input type="number" id="s-minq" step="1" min="50" max="95"></div>
+  <div class="setrow"><label>MTF 30m mode<br>
+    <span class="dim" style="font-size:12px">STRICT = full bullish watch</span></label>
+    <select id="s-mtf">
+      <option value="STRICT">STRICT</option>
+      <option value="LEAN">LEAN</option>
+    </select></div>
+  <div class="setrow"><label><b>Bullish only</b><br>
+    <span class="dim" style="font-size:12px">OFF = izinkan juga signal SHORT</span></label>
+    <label class="switch"><input type="checkbox" id="s-bull">
+    <span class="sl"></span></label></div>
+  <div class="setrow"><label>Min volume 24h (USD)</label>
+    <input type="number" id="s-vol" step="100000" min="500000" max="10000000"></div>
+  <div class="setrow"><label>Max freshness drift (%)<br>
+    <span class="dim" style="font-size:12px">batal entry kalau harga lari</span></label>
+    <input type="number" id="s-fresh" step="0.1" min="0.1" max="2.0"></div>
+</div>
+<div class="card"><h2>🛡️ TP &amp; SL</h2>
+  <div class="setrow"><label>TP1 (x risk)</label>
+    <input type="number" id="s-tp1" step="0.25" min="0.5" max="5"></div>
+  <div class="setrow"><label>TP2 (x risk)</label>
+    <input type="number" id="s-tp2" step="0.25" min="1" max="8"></div>
+  <div class="setrow"><label>TP3 (x risk)</label>
+    <input type="number" id="s-tp3" step="0.25" min="1.5" max="12"></div>
+  <div class="setrow"><label>Stop ATR min</label>
+    <input type="number" id="s-satrmin" step="0.25" min="0.5" max="3"></div>
+  <div class="setrow"><label>Stop ATR max</label>
+    <input type="number" id="s-satrmax" step="0.25" min="1" max="5"></div>
+  <div class="setrow"><label>Split TP1/TP2/TP3<br>
+    <span class="dim" style="font-size:12px">fraksi, dinormalisasi ke 1.0</span></label>
+    <span><input type="number" id="s-sp1" step="0.1" min="0.01" max="10" style="width:64px">
+    <input type="number" id="s-sp2" step="0.1" min="0.01" max="10" style="width:64px">
+    <input type="number" id="s-sp3" step="0.1" min="0.01" max="10" style="width:64px"></span></div>
+  <div class="setrow"><label><b>Breakeven setelah TP1</b><br>
+    <span class="dim" style="font-size:12px">geser SL ke entry</span></label>
+    <label class="switch"><input type="checkbox" id="s-be">
+    <span class="sl"></span></label></div>
+</div>
+<div class="card"><h2>⛔ Vetoes <span class="dim" style="font-size:12px;text-transform:none">
+  (matikan = risiko sendiri)</span></h2>
+  <div id="vetoes"></div>
+  <button class="save" id="save">💾 Simpan Semua Setting</button>
   <div id="msg"></div>
 </div>
 <div class="card"><h2>Posisi Terbuka</h2><div id="positions">
@@ -337,6 +469,19 @@ async function refresh(){
     $('s-risk').value = st.risk_pct_per_trade;
     $('s-lev').value = st.max_leverage;
     $('s-int').value = st.poll_interval_min;
+    $('s-minq').value = st.min_quality_score;
+    $('s-mtf').value = st.mtf_30m_mode;
+    $('s-bull').checked = !!st.bullish_only;
+    $('s-vol').value = st.min_24h_volume_usd;
+    $('s-fresh').value = st.freshness_max_drift_pct;
+    $('s-tp1').value = st.tp1_rr; $('s-tp2').value = st.tp2_rr;
+    $('s-tp3').value = st.tp3_rr;
+    $('s-satrmin').value = st.stop_atr_min;
+    $('s-satrmax').value = st.stop_atr_max;
+    $('s-sp1').value = st.tp_split_1; $('s-sp2').value = st.tp_split_2;
+    $('s-sp3').value = st.tp_split_3;
+    $('s-be').checked = !!st.breakeven_after_tp1;
+    renderVetoes(st);
     const pos = $('positions');
     if(!s.positions.length){ pos.innerHTML='<span class="dim">tidak ada posisi</span>'; }
     else{
@@ -362,28 +507,84 @@ async function refresh(){
   const d=new Date();
   $('clock').textContent='update '+d.toLocaleTimeString('id-ID');
 }
-$('s-auto').onchange = async ()=>{
-  const r = await fetch('/api/settings',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({auto_trade:$('s-auto').checked})});
-  const j = await r.json();
-  $('msg').textContent = j.ok ? '✓ auto-trade '+(j.settings.auto_trade?'ON':'OFF')
-                              : '✗ '+j.error;
-  $('msg').className = j.ok ? 'green' : 'red';
-  setTimeout(()=>$('msg').textContent='',2500);
-};
-$('save').onclick = async ()=>{
-  const body={auto_trade:$('s-auto').checked,
-    risk_pct_per_trade:parseFloat($('s-risk').value),
-    max_leverage:parseInt($('s-lev').value),
-    poll_interval_min:parseInt($('s-int').value)};
+const VETOES=[
+ ['veto_leverage_risk','Leverage Risk','crowded trade / flush risk'],
+ ['veto_funding','Funding Extreme','funding ekstrem berlawanan arah'],
+ ['veto_squeeze','Squeeze Risk','risiko stop-hunt'],
+ ['veto_whale','Whale Divergence','top trader berlawanan arah'],
+ ['veto_liq_wall','Liquidity Wall','tembok order block arah'],
+ ['veto_btc_breaker','BTC Breaker','BTC dump -3%/1h'],
+];
+function renderVetoes(st){
+  $('vetoes').innerHTML=VETOES.map(v=>
+    '<div class="veto"><span><b>'+v[1]+'</b><br><span class="dim" style="font-size:11px">'+
+    v[2]+'</span></span><label class="switch"><input type="checkbox" data-veto="'+
+    v[0]+'"'+(st[v[0]]?' checked':'')+'><span class="sl"></span></label></div>'
+  ).join('');
+  document.querySelectorAll('[data-veto]').forEach(el=>{
+    el.onchange=()=>postSettings({[el.dataset.veto]:el.checked}, true);
+  });
+}
+async function postSettings(body, quiet){
   const r = await fetch('/api/settings',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j = await r.json();
-  $('msg').textContent = j.ok ? '✓ setting tersimpan' : '✗ '+j.error;
-  $('msg').className = j.ok ? 'green' : 'red';
-  setTimeout(()=>$('msg').textContent='',2500);
-  refresh();
+  const ok=j.ok;
+  $('msg').textContent = ok ? '✓ tersimpan' : '✗ '+(j.error||'gagal');
+  $('msg').className = ok ? 'green' : 'red';
+  if(!quiet||!ok) setTimeout(()=>$('msg').textContent='',2500);
+  if(ok) refresh();
+  return ok;
+}
+$('s-auto').onchange = ()=>postSettings({auto_trade:$('s-auto').checked}, true);
+$('s-bull').onchange = ()=>postSettings({bullish_only:$('s-bull').checked}, true);
+$('s-be').onchange = ()=>postSettings({breakeven_after_tp1:$('s-be').checked}, true);
+$('save').onclick = ()=>{
+  postSettings({
+    auto_trade:$('s-auto').checked,
+    risk_pct_per_trade:parseFloat($('s-risk').value),
+    max_leverage:parseInt($('s-lev').value),
+    poll_interval_min:parseInt($('s-int').value),
+    min_quality_score:parseInt($('s-minq').value),
+    mtf_30m_mode:$('s-mtf').value,
+    bullish_only:$('s-bull').checked,
+    min_24h_volume_usd:parseFloat($('s-vol').value),
+    freshness_max_drift_pct:parseFloat($('s-fresh').value),
+    tp1_rr:parseFloat($('s-tp1').value),
+    tp2_rr:parseFloat($('s-tp2').value),
+    tp3_rr:parseFloat($('s-tp3').value),
+    stop_atr_min:parseFloat($('s-satrmin').value),
+    stop_atr_max:parseFloat($('s-satrmax').value),
+    tp_split_1:parseFloat($('s-sp1').value),
+    tp_split_2:parseFloat($('s-sp2').value),
+    tp_split_3:parseFloat($('s-sp3').value),
+    breakeven_after_tp1:$('s-be').checked,
+  });
+};
+$('scan').onclick = async ()=>{
+  $('scan').disabled=true; $('scan').textContent='Scanning…';
+  $('radar').innerHTML='<span class="dim">menghubungi exchange…</span>';
+  try{
+    const r = await (await fetch('/api/radar?mode='+mode)).json();
+    if(r.error){ $('radar').innerHTML='<span class="red">✗ '+r.error+'</span>'; }
+    else if(!r.length){ $('radar').innerHTML='<span class="dim">kosong</span>'; }
+    else{
+      $('radar').innerHTML='<table><tr><th>#</th><th>Symbol</th><th>Q</th><th>Entry</th><th>SL</th><th>TP1–3</th></tr>'+
+      r.map((x,i)=>{
+        if(x.state!=='approved')
+          return '<tr><td>'+(i+1)+'</td><td><b>'+x.symbol+'</b></td>'+
+            '<td colspan="4"><span class="dim" style="font-size:11px">'+
+            (x.reason||x.state).slice(0,90)+'</span></td></tr>';
+        return '<tr><td>'+(i+1)+'</td><td><b>'+x.symbol+'</b><br>'+
+          '<span class="dim" style="font-size:11px">'+x.regime+'</span></td>'+
+          '<td><b class="green">'+x.quality+'</b></td>'+
+          '<td>'+(+x.entry).toFixed(4)+'</td><td class="red">'+(+x.stop_loss).toFixed(4)+'</td>'+
+          '<td class="yel" style="font-size:11px">'+(+x.tp1).toFixed(4)+'<br>'+
+          (+x.tp2).toFixed(4)+'<br>'+(+x.tp3).toFixed(4)+'</td></tr>';
+      }).join('')+'</table>';
+    }
+  }catch(e){ $('radar').innerHTML='<span class="red">✗ gagal: '+e+'</span>'; }
+  $('scan').disabled=false; $('scan').textContent='Scan Signal Sekarang';
 };
 refresh(); setInterval(refresh, 5000);
 </script></body></html>
@@ -426,6 +627,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, read_events(self._mode(), limit))
         elif path == "/api/settings":
             self._json(200, load_settings())
+        elif path == "/api/radar":
+            try:
+                self._json(200, run_radar())
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"error": str(e)})
         else:
             self._json(404, {"error": "not found"})
 
