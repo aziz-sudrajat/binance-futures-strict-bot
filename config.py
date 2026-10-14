@@ -1,0 +1,146 @@
+"""STRICT-mode configuration for the Binance Futures signal engine.
+
+Constants mirror the GAS bot (workspace/user/files/AZZATSSINS-20261013-imageperf-v4_5_02o2.gs,
+CFG block lines 13-160) so the Python port makes identical decisions.
+Risk defaults below are user-correctable and feed Phase 2 (executor).
+"""
+
+# ---------------------------------------------------------------- STRICT gate
+MIN_QUALITY_SCORE = 70          # GAS: getMinQuality_() -> 70 when SIGNAL_FILTER_MODE='STRICT' (L3137-3141)
+MTF_TIMEFRAMES = ("15m", "30m", "4h", "1d")
+# STRICT cascade (GAS L3156-3170): 4h bullish AND 1d bullish AND 30m BULLISH WATCH.
+MTF_CONFIRM_INTERVAL = "30m"
+MTF_30M_MODE = "STRICT"        # 30m leg mode (see note below).
+# NOTE (audit D5): STRICT requires a full 30m BULLISH WATCH (GAS mtfConfirmPass_
+# STRICT branch, L2097-2101). This is DELIBERATELY stricter than the GAS default:
+# GAS CFG sets MTF_CONFIRM_MODE='LEAN' (L86), so the GAS cascade's 30m leg passes
+# neutral-with-bullish-lean setups. We keep STRICT for the trading mandate;
+# set MTF_30M_MODE='LEAN' to reproduce the GAS default behavior instead.
+MTF_CASCADE_BOOST = 8           # GAS: mtfCascadeCheck_ returns boost: 8 (L3156)
+MTF_CONFIRM_BOOST = 8           # GAS: mtfConfirmPass_ STRICT returns boost: 8 (L2097)
+MTF_LEAN_BOOST = 3             # GAS: mtfConfirmPass_ LEAN returns boost: 3 on lean (L2107)
+
+# ------------------------------------------------- indicator / setup constants
+KLINES_LIMIT = 220              # GAS: CFG.KLINES_LIMIT (L97)
+MIN_CANDLES = 80                # GAS: analyzeCandles_ requires >= 80 (L1905)
+SIGNAL_MIN_SCORE = 5            # GAS: CFG.SIGNAL_MIN_SCORE (L98)
+MIN_STRENGTH = 3                # GAS: AUTO_MIN_STRENGTH, minS = max(3, ...) (L98, L7535)
+BULLISH_ONLY = True             # GAS: CFG.BULLISH_ONLY (L84) -> STRICT is effectively LONG-only
+ATR_PERIOD = 14                 # GAS: CFG.ATR_PERIOD (L120)
+SWING_LOOKBACK = 12             # GAS: CFG.SWING_LOOKBACK (L121)
+ENTRY_MAX_PULLBACK_ATR = 0.50   # GAS: CFG.ENTRY_MAX_PULLBACK_ATR (L122)
+ENTRY_ZONE_ATR = 0.10           # GAS: CFG.ENTRY_ZONE_ATR (L123)
+STOP_ATR_MIN = 1.25             # GAS: CFG.STOP_ATR_MIN (L124)
+STOP_ATR_MAX = 2.00             # GAS: CFG.STOP_ATR_MAX (L125)
+TP1_RR = 1.50                   # GAS: CFG.TP1_RR (L126)
+TP2_RR = 2.25                   # GAS: CFG.TP2_RR (L127)
+TP3_RR = 3.00                   # GAS: CFG.TP3_RR (L128)
+FRESHNESS_MAX_DRIFT_PCT = 0.4   # GAS: CFG.FRESHNESS_MAX_DRIFT_PCT (L103)
+MIN_24H_VOLUME_USD = 2_000_000  # GAS: CFG.MIN_24H_VOLUME_USD (L100)
+
+# Quality-score blend (ROADMAP ITEM 3): every scoreDelta contributor is an
+# explicit, named component in quality_deltas.py, ported from the GAS deep
+# check (prePublishDeepCheck_, L3172-3262). No synthetic blends.
+SCORE_DELTA_CLAMP = 40          # GAS clamps deep-check scoreDelta to [-40, +40] (L3250)
+QUALITY_MIN = 5                 # GAS: deepCheckQualityScore_ clamps to [5, 98] (L3532-3535)
+QUALITY_MAX = 98
+
+# ------------------------------------------------- warn-tier delta constants
+# Each mirrors a GAS deep-check delta (veto tiers stay in vetoes.py).
+H1_TREND_BONUS = 8              # GAS CFG L101: deepCheckH1Trend_ (L3605) bullish-aligned 1h
+H1_TREND_PENALTY = 10           # GAS CFG L102: bearish-opposed 1h
+BTC_DUMP_WARN_PCT = 2.0         # GAS CFG L105: BTC <= -2%/1h -> quality penalty (LONG)
+BTC_DUMP_PENALTY = 15           # GAS CFG L107
+LIQ_WALL_WARN_DISTANCE_PCT = 1.0  # GAS CFG L91: wall penalty zone (veto only < 0.5%)
+MTF_CONFIRM_4H_BOOST = 6        # GAS CFG L112: mtfConfirm4hPass_ (L2074) 4h bullish
+MTF_CONFIRM_4H_PENALTY = 10     # GAS CFG L113: 4h bearish
+DERIV_LIQ_SPIKE_THRESHOLD = 3   # GAS default (L1067): liq spike >= 3x -> LIQUIDATION EVENT
+
+# --------------------------------------- derivatives coverage (fail-closed)
+# Audit D4/H6: a snapshot with zero positioning visibility must HOLD the
+# signal, never auto-neutralize. Required components block the signal when
+# missing; optional ones are recorded on the signal dict but do not block.
+DERIV_COMPONENT_KEYS = {       # logical name -> get_derivatives_snapshot() key
+    "funding": "aggregate_funding",
+    "open_interest": "aggregate_oi_change",
+    "long_short": "aggregate_long",
+    "taker_volume": "taker_buy_sell_ratio",
+}
+DERIV_REQUIRED_COMPONENTS = ("funding", "open_interest")
+DERIV_OPTIONAL_COMPONENTS = ("long_short", "taker_volume")
+
+# -------------------------------- deterministic vetoes (ROADMAP ITEM 2)
+# Ports of the GAS deep-check hard vetoes (deepCheckDerivatives_ L3336-3393,
+# deepCheckLiquidity_ L3395-3425, deepCheckBtcBreadth_ L3634-3662).
+# Any fired veto — or any veto whose required inputs are unavailable —
+# REJECTS the signal; vetoes are never compensated by the quality score.
+DERIV_LEVERAGE_RISK_VETO = 90       # GAS CFG L71: leverageRisk >= 90 -> veto
+DERIV_FUNDING_EXTREME = 0.001       # GAS CFG L72: |funding| >= 0.1% against direction -> veto
+DERIV_SQUEEZE_RISK_VETO = 85        # GAS CFG L73: squeeze risk >= 85 -> veto
+DERIV_TOP_TRADER_VETO_LONG = 35     # GAS CFG L74: whale-divergence *penalty* tier (not ported as veto;
+                                    # penalties belong to roadmap item 3, quality recalibration)
+DERIV_TOP_TRADER_EXTREME_LONG = 25  # GAS CFG L90: top-trader hard-veto tier
+LIQ_WALL_VETO_DISTANCE_PCT = 0.5    # GAS CFG L75: wall within 0.5% of mid blocks direction
+LIQ_WALL_MIN_NOTIONAL_USD = 250_000 # GAS CFG L76: wall notional threshold
+BTC_DUMP_VETO_PCT = 3.0             # GAS CFG L106: BTC -3%/1h -> veto ALL new signals (LONG-only system)
+BTC_BREAKER_TTL_SEC = 300           # own cache for the market-wide breaker check
+ADV_DERIV_CACHE_SEC = 120           # Gate contract-stats cache (GAS DERIVATIVES_CACHE_SECONDS L50)
+ADV_DERIV_STATS_LIMIT = 48          # 48 x 15m buckets ~ 12h: 16-bucket window + history (GAS L1002)
+ORDER_BOOK_DEPTH_LIMIT = 100        # depth levels fetched for the wall veto
+
+# ------------------------------------------------------------- risk defaults
+# User-correctable. Consumed by the Phase 2 executor; Phase 1 is paper-only.
+RISK_PCT_PER_TRADE = 1.0       # % of futures balance risked per trade
+MAX_LEVERAGE = 3               # max leverage multiplier
+TP_SPLIT = (0.4, 0.3, 0.3)     # scale-out fractions at TP1 / TP2 / TP3
+MAX_CONCURRENT_POSITIONS = 3
+DAILY_LOSS_CAP_PCT = 3.0       # kill switch: stop trading if daily loss exceeds this
+
+# ------------------------------------------------------- backtest defaults
+# ROADMAP ITEM 4 (honest backtester). Costs are applied per side; every
+# assumption is documented in backtest.py and the README — nothing is hidden.
+BACKTEST_TAKER_FEE_PCT = 0.05      # taker fee per side (conservative: entries
+                                   # are limits but we charge taker)
+BACKTEST_SLIPPAGE_PCT = 0.02       # slippage estimate per side
+BACKTEST_FUNDING_PER_8H_PCT = 0.01 # funding estimate per 8h while in position
+                                   # (assumed PAID by the long — conservative;
+                                   # historical funding is NOT used: degraded)
+BACKTEST_MAX_HOLD_HOURS = 48       # positions older than this close at market
+BACKTEST_SIGNAL_EXPIRY_HOURS = 24  # GAS: CRYPTO_SIGNAL_EXPIRY_HOURS — a signal
+                                   # never entered within this window = NO_TRADE
+BACKTEST_START_EQUITY = 10_000.0   # hypothetical USD equity for sizing
+BACKTEST_MIN_TRADES = 30           # below this the report says SAMPLE TOO SMALL
+BACKTEST_BREAKEVEN_AFTER_TP1 = True  # move SL to entry once TP1 fills
+BACKTEST_DEFAULT_DAYS = 60         # default lookback for the CLI smoke run
+BACKTEST_DEFAULT_STEP_H = 6        # signal evaluation step (hours)
+
+# ------------------------------------------------------------- executor
+# Phase 2 executor. Testnet ONLY by default; keys come from env vars
+# BINANCE_TESTNET_KEY / BINANCE_TESTNET_SECRET — never hardcoded, never
+# logged. No mainnet code path is enabled: BASE_URL defaults to the Binance
+# Futures testnet and can only be pointed elsewhere via an explicit env
+# override (needed because Binance mainnet is geo-blocked from some hosts —
+# see README "Live deployment" note).
+BINANCE_FUTURES_BASE_URL = "https://testnet.binancefuture.com"
+EXEC_POLL_INTERVAL_MIN = 5
+EXEC_MAX_EXPOSURE_PCT_PER_SYMBOL = 20.0  # max position notional as % of balance
+EXEC_BREAKEVEN_AFTER_TP1 = True           # move SL to entry once TP1 fills
+EXEC_SIGNAL_ID_TTL_HOURS = 72             # processed signal IDs are kept this long
+EXEC_RECV_WINDOW_MS = 10000
+EXEC_STATE_FILE = "state.json"
+EXEC_LIFECYCLE_FILE = "lifecycle.jsonl"
+EXEC_PAPER_START_BALANCE = 10_000.0       # hypothetical USDT for paper mode
+
+# ------------------------------------------------------------------ universe
+# GAS: CFG.DEFAULT_FAVORITES (L130). Symbols are normalized to XXXUSDT.
+UNIVERSE = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT",
+    "AVAXUSDT", "WLDUSDT", "DOGEUSDT", "PEPEUSDT",
+]
+
+# ------------------------------------------------------------ data / caching
+# GAS: klinesTtlSec_ per interval (L418-428), DERIVATIVES_CACHE_SECONDS=120 (L50)
+KLINES_TTL_SEC = {"5m": 300, "15m": 480, "30m": 720, "1h": 1200, "4h": 2400, "1d": 7200}
+DERIVATIVES_CACHE_SEC = 120
+DERIVATIVES_PERIOD = "4h"       # GAS: CFG.DERIVATIVES_DEFAULT_PERIOD (L51)
+HTTP_TIMEOUT_SEC = 15
