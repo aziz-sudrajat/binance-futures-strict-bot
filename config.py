@@ -233,6 +233,12 @@ DASHBOARD_DEFAULTS = {
     "veto_whale": True,
     "veto_liq_wall": True,
     "veto_btc_breaker": True,
+    # order execution (full operator control; defaults are the safe ones)
+    "margin_mode": "ISOLATED",   # ISOLATED | CROSS
+    "leverage_mode": "auto",     # auto (risk default) | fixed
+    "leverage": 3,               # 1-125, used when leverage_mode=fixed
+    "entry_mode": "risk",        # risk (RISK_PCT_PER_TRADE sizing) | fixed_usdt
+    "fixed_usdt": 10.0,          # USDT margin per position when fixed_usdt
 }
 
 _ORIGINALS: dict = {}
