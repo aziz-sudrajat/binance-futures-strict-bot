@@ -135,6 +135,31 @@ class ExchangeClient:
             return out
         return None
 
+    def get_top_volume_symbols(self, n: int = 30) -> list[str]:
+        """Top-N USDT-margined perpetual symbols by 24h quote volume.
+
+        Public endpoint (no auth). Leveraged tokens (UP/DOWN/BULL/BEAR) are
+        excluded. Used for the dashboard "top_volume" universe mode.
+        """
+        data = self._request("GET", "/fapi/v1/ticker/24hr", signed=False)
+        rows: list[tuple[float, str]] = []
+        for t in data:
+            sym = str(t.get("symbol", ""))
+            if not sym.endswith("USDT"):
+                continue
+            base = sym[:-4]
+            if base.endswith(("UP", "DOWN", "BULL", "BEAR")):
+                continue
+            try:
+                qv = float(t.get("quoteVolume", 0))
+            except (TypeError, ValueError):
+                continue
+            if qv > 0:
+                rows.append((qv, sym))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        n = max(1, min(int(n), config.UNIVERSE_TOP_N_MAX))
+        return [s for _, s in rows[:n]]
+
     # ------------------------------------------------------------- account
     def get_balance(self, asset: str = "USDT") -> float | None:
         """Available futures wallet balance for the asset, or None on failure."""
@@ -269,4 +294,68 @@ class ExchangeClient:
             return out if isinstance(out, list) else []
         except ExchangeError as e:
             log.warning("get_open_orders -> %s", e)
+            return []
+
+    # ------------------------------------------------- algo (conditional) orders
+    # Binance migrated STOP_MARKET / TAKE_PROFIT_MARKET / STOP / TAKE_PROFIT /
+    # TRAILING_STOP_MARKET to the Algo Order API (effective 2025-12-09):
+    # /fapi/v1/order now rejects them with -4120. SL/TP brackets MUST go here.
+    def place_algo_order(self, symbol: str, side: str, type: str,
+                         quantity: float | None = None,
+                         trigger_price: float | None = None,
+                         price: float | None = None,
+                         reduce_only: bool = False,
+                         working_type: str = "MARK_PRICE",
+                         time_in_force: str = "GTE_GTC",
+                         client_algo_id: str | None = None) -> dict | None:
+        """Place a conditional algo order. Returns the algo order dict
+        (with algoId), or None on failure."""
+        params: dict = {"algoType": "CONDITIONAL", "symbol": symbol,
+                        "side": side, "type": type}
+        if quantity is not None:
+            params["quantity"] = quantity
+        if trigger_price is not None:
+            params["triggerPrice"] = trigger_price
+        if price is not None:
+            params["price"] = price
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        params["workingType"] = working_type
+        params["timeInForce"] = time_in_force
+        if client_algo_id:
+            params["newClientAlgoId"] = client_algo_id
+        try:
+            return self._request("POST", "/fapi/v1/algoOrder", params)
+        except ExchangeError as e:
+            log.warning("place_algo_order %s %s %s -> %s",
+                        symbol, side, type, e)
+            return None
+
+    def get_algo_order(self, symbol: str, algo_id: int) -> dict | None:
+        try:
+            return self._request("GET", "/fapi/v1/algoOrder",
+                                 {"symbol": symbol, "algoId": algo_id})
+        except ExchangeError as e:
+            log.warning("get_algo_order %s -> %s", symbol, e)
+            return None
+
+    def cancel_algo_order(self, symbol: str, algo_id: int) -> bool:
+        try:
+            self._request("DELETE", "/fapi/v1/algoOrder",
+                          {"symbol": symbol, "algoId": algo_id})
+            return True
+        except ExchangeError as e:
+            # -2011 (unknown order) means it is already gone — fine.
+            if "-2011" in str(e):
+                return True
+            log.warning("cancel_algo_order %s -> %s", symbol, e)
+            return False
+
+    def get_open_algo_orders(self, symbol: str | None = None) -> list[dict]:
+        params = {"symbol": symbol} if symbol else {}
+        try:
+            out = self._request("GET", "/fapi/v1/openAlgoOrders", params)
+            return out if isinstance(out, list) else []
+        except ExchangeError as e:
+            log.warning("get_open_algo_orders -> %s", e)
             return []
