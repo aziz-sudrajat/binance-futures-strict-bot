@@ -214,14 +214,34 @@ python3 -m venv .venv
 1. Buka https://www.binance.com → API Management → buat API key
 2. Centang **Enable Futures**, pastikan **Enable Withdrawals MATI**
 3. Batasi IP jika bisa
-4. `export BINANCE_LIVE_KEY=<key> BINANCE_LIVE_SECRET=<secret>`
+4. `cp .env.live.example .env.live` lalu isi key-nya
 
-> Key hanya hidup di environment variable. Jangan pernah paste ke chat,
-> jangan commit (sudah di-`.gitignore`).
+> Key hanya hidup di file `.env.live` / `.env.demo` (gitignored).
+> Jangan pernah paste ke chat, jangan commit.
 
-Agar key permanen antar sesi Termux, tambahkan baris `export` ke `~/.bashrc`.
+### 5. Ganti mode: live ⇄ demo
 
-### 5. Mode jalan
+```bash
+cp .env.live.example .env.live   # sekali saja, lalu isi key
+cp .env.demo.example .env.demo   # sekali saja, lalu isi key
+
+source switch.sh live   # -> mainnet, UANG ASLI
+source switch.sh demo    # -> testnet, uang palsu
+```
+
+`switch.sh` meng-export key yang benar + `BOT_MODE`. Setelah itu jalanin
+bot/dashboard **tanpa flag mode** — mode ikut `BOT_MODE`:
+
+```bash
+.venv/bin/python run_executor.py --once   # ikut BOT_MODE
+.venv/bin/python run_executor.py --loop
+.venv/bin/python dashboard.py             # tab default ikut BOT_MODE
+```
+
+Flag eksplisit (`--live`, `--testnet`, `--mode live`) selalu menang atas
+`BOT_MODE`.
+
+### 6. Mode jalan (eksplisit)
 
 ```bash
 # --- PAPER (simulasi, tanpa key, tanpa order) ---
@@ -260,14 +280,28 @@ Isi dashboard (auto-refresh 5 detik):
 | Auto Trade | toggle on/off, risiko/trade, max leverage, interval scan |
 | 🎯 Signal | min quality score, MTF 30m mode, bullish-only, min volume, freshness |
 | 🛡️ TP & SL | TP1/2/3 (x risk), stop ATR min/max, split TP, breakeven toggle |
+| ⚙️ Order | margin mode (ISOLATED/CROSS), leverage (1–125, auto/fixed), entry (risk % / fixed USDT) |
 | ⛔ Vetoes | 6 hard veto bisa di on/off (default semua ON) |
 | Posisi Terbuka | entry, SL, TP tiap posisi |
 | Event Terakhir | approved / rejected / TP hit / SL hit + alasannya |
 
+**Setting per mode.** Setiap mode (LIVE / Testnet / Paper) punya profil
+setting sendiri — ganti tab, atur, simpan. Contoh: demo pakai leverage
+20x fixed 50 USDT, live tetap 3x risk-based. Default semua mode = profil
+aman (isolated, auto leverage ≤3x, entry ikut risiko 1%).
+
+**Kontrol order penuh (kartu ⚙️ Order):**
+
+- *Margin mode*: ISOLATED atau CROSS
+- *Leverage*: auto (ikut max leverage) atau fixed 1–125x
+- *Entry*: risk % (sizing dari risiko per trade) atau fixed USDT per posisi
+
+Kalau menyimpang dari default aman, dashboard menampilkan peringatan
+kuning, dan executor mencatatnya di log. Kill switch, exposure caps, dan
+veto aktif tetap berlaku apa pun setting order-nya.
+
 Semua setting tersimpan di `dashboard_settings.json` dan **langsung
-berlaku di scan berikutnya tanpa restart bot**. Perubahan setting yang
-mengetatkan risiko (risk %, leverage) tidak akan pernah melonggarkan
-default kode (1%/trade, max 3x).
+berlaku di scan berikutnya tanpa restart bot**.
 
 ### 7. Menjalankan 24/7 di Termux
 
@@ -519,7 +553,7 @@ jalan 24/7 di Termux.
 
 ### Pre-deploy checklist (from the quant-trading skill)
 
-- [ ] Full test suite green (`pytest tests/ -q`) — currently 188 passed.
+- [ ] Full test suite green (`pytest tests/ -q`) — currently 205 passed.
 - [ ] Paper-mode smoke run completed with no errors.
 - [ ] Testnet key created by the user; `--testnet --once` places/cancels cleanly.
 - [ ] Kill switch verified on testnet (force a >3% day or lower the cap temporarily).
