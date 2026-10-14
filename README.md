@@ -377,6 +377,28 @@ export BINANCE_TESTNET_KEY=... BINANCE_TESTNET_SECRET=...
   cross-validation vs GAS signals (roadmap item 5) is done, risk limits are
   reviewed, and the user gives explicit approval.
 
+### Dashboard (live web UI)
+
+`dashboard.py` — web UI kecil (stdlib only, tanpa dependency baru) yang
+menampilkan data bot secara live: saldo futures, posisi terbuka, PnL harian,
+status kill switch, signal & event terakhir (approved/rejected/TP/SL), plus
+pengaturan auto-trade.
+
+```bash
+.venv/bin/python dashboard.py --mode live --port 8080
+# buka http://localhost:8080 di browser HP
+```
+
+- Tab **LIVE / Testnet / Paper** untuk ganti mode tampilan.
+- **Auto-trade toggle**: OFF = scan tetap jalan tapi tidak buka posisi baru
+  (posisi yang sudah terbuka tetap dikelola). Perubahan langsung berlaku
+  tanpa restart loop.
+- **Risiko per trade / max leverage / interval scan**: hanya bisa
+  *mengetatkan* dari default kode (1% / 3x) — tidak bisa dilonggarkan
+  dari UI. Disimpan di `dashboard_settings.json` (gitignored, per-host).
+- Keys hanya dibaca dari environment di sisi server; tidak ada secret
+  yang dikirim ke browser. Bind default `127.0.0.1` (localhost saja).
+
 ### Pre-deploy checklist (from the quant-trading skill)
 
 - [ ] Full test suite green (`pytest tests/ -q`) — currently 112 passed.
