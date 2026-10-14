@@ -1,0 +1,272 @@
+"""Binance USD-M Futures REST client (testnet-first).
+
+Raw HTTPS + HMAC-SHA256 signing via `requests` — no exchange SDK, keeping the
+project dependency-light (same philosophy as Phase 1). Keys are passed in at
+construction time (from env vars); this module NEVER logs them.
+
+Endpoints used:
+  GET  /fapi/v1/exchangeInfo   (public)  - symbol status + filters
+  GET  /fapi/v1/account        (signed)  - balances + positions
+  POST /fapi/v1/leverage       (signed)  - set leverage
+  POST /fapi/v1/marginType      (signed)  - set ISOLATED / CROSSED
+  POST /fapi/v1/order          (signed)  - place order
+  GET  /fapi/v1/order          (signed)  - query order
+  DELETE /fapi/v1/order        (signed)  - cancel order
+  GET  /fapi/v1/openOrders     (signed)  - open orders
+
+Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import logging
+import time
+from urllib.parse import urlencode
+
+import requests
+
+import config
+
+log = logging.getLogger("executor.exchange")
+
+
+class ExchangeError(Exception):
+    """Any exchange-side failure (network, auth, API error)."""
+
+
+def _redact(params: dict) -> dict:
+    """Copy of params safe for logging (signature only, never the secret)."""
+    return {k: ("<sig>" if k == "signature" else v) for k, v in params.items()}
+
+
+class ExchangeClient:
+    """Thin signed wrapper around Binance USD-M Futures REST."""
+
+    def __init__(self, api_key: str, api_secret: str,
+                 base_url: str = config.BINANCE_FUTURES_BASE_URL,
+                 recv_window_ms: int = config.EXEC_RECV_WINDOW_MS,
+                 session: requests.Session | None = None):
+        if not api_key or not api_secret:
+            raise ValueError("api_key and api_secret are required")
+        self._key = api_key
+        # NOTE: the secret is used only for HMAC signing, never stored in logs.
+        self._secret = api_secret.encode()
+        self.base_url = base_url.rstrip("/")
+        self.recv_window = recv_window_ms
+        self.session = session or requests.Session()
+        self._exchange_info: dict | None = None
+        self._exchange_info_ts: float = 0.0
+
+    # ------------------------------------------------------------ plumbing
+    def _sign(self, params: dict) -> dict:
+        params = dict(params)
+        params["timestamp"] = int(time.time() * 1000)
+        params["recvWindow"] = self.recv_window
+        query = urlencode(params)
+        sig = hmac.new(self._secret, query.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = sig
+        return params
+
+    def _request(self, method: str, path: str, params: dict | None = None,
+                 signed: bool = True) -> dict:
+        params = dict(params or {})
+        if signed:
+            params = self._sign(params)
+            headers = {"X-MBX-APIKEY": self._key}
+        else:
+            headers = {}
+        url = self.base_url + path
+        try:
+            r = self.session.request(method, url, params=params,
+                                     headers=headers,
+                                     timeout=config.HTTP_TIMEOUT_SEC)
+        except requests.RequestException as e:
+            raise ExchangeError(f"{method} {path} network error: {e}")
+        if r.status_code >= 400:
+            body = r.text[:300]
+            log.warning("%s %s -> HTTP %s %s params=%s",
+                        method, path, r.status_code, body, _redact(params))
+            raise ExchangeError(f"{method} {path} HTTP {r.status_code}: {body}")
+        try:
+            return r.json()
+        except ValueError:
+            raise ExchangeError(f"{method} {path}: non-JSON response")
+
+    # ----------------------------------------------------- public metadata
+    def get_exchange_info(self) -> dict:
+        """Cached exchangeInfo (refreshed at most every 10 minutes)."""
+        now = time.time()
+        if self._exchange_info is None or now - self._exchange_info_ts > 600:
+            self._exchange_info = self._request(
+                "GET", "/fapi/v1/exchangeInfo", signed=False)
+            self._exchange_info_ts = now
+        return self._exchange_info
+
+    def get_symbol_filters(self, symbol: str) -> dict | None:
+        """Tradability + LOT_SIZE / PRICE_FILTER / MIN_NOTIONAL for a symbol.
+
+        Returns None when the symbol is not a tradable PERPETUAL contract.
+        """
+        info = self.get_exchange_info()
+        for s in info.get("symbols", []):
+            if s.get("symbol") != symbol:
+                continue
+            if s.get("status") != "TRADING":
+                return None
+            if s.get("contractType") != "PERPETUAL":
+                return None
+            out = {"status": s["status"]}
+            for f in s.get("filters", []):
+                ft = f.get("filterType")
+                if ft == "PRICE_FILTER":
+                    out["tickSize"] = float(f["tickSize"])
+                elif ft == "LOT_SIZE":
+                    out["stepSize"] = float(f["stepSize"])
+                    out["minQty"] = float(f["minQty"])
+                    out["maxQty"] = float(f["maxQty"])
+                elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
+                    # MIN_NOTIONAL (older) / NOTIONAL (newer) filter names.
+                    out["minNotional"] = float(
+                        f.get("minNotional", f.get("notional", 0)))
+            if "stepSize" not in out or "tickSize" not in out:
+                return None
+            return out
+        return None
+
+    # ------------------------------------------------------------- account
+    def get_balance(self, asset: str = "USDT") -> float | None:
+        """Available futures wallet balance for the asset, or None on failure."""
+        try:
+            acct = self._request("GET", "/fapi/v2/account")
+        except ExchangeError:
+            return None
+        for a in acct.get("assets", []):
+            if a.get("asset") == asset:
+                try:
+                    return float(a.get("availableBalance", 0))
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def get_positions(self) -> list[dict]:
+        """Open positions (positionAmt != 0), normalized to a small dict."""
+        try:
+            acct = self._request("GET", "/fapi/v2/account")
+        except ExchangeError:
+            return []
+        out = []
+        for p in acct.get("positions", []):
+            try:
+                amt = float(p.get("positionAmt", 0))
+            except (TypeError, ValueError):
+                continue
+            if amt == 0:
+                continue
+            out.append({
+                "symbol": p.get("symbol"),
+                "side": "LONG" if amt > 0 else "SHORT",
+                "qty": abs(amt),
+                "entry_price": float(p.get("entryPrice", 0) or 0),
+                "unrealized_pnl": float(p.get("unRealizedProfit", 0) or 0),
+                "leverage": int(p.get("leverage", 0) or 0),
+            })
+        return out
+
+    def set_leverage(self, symbol: str, leverage: int) -> bool:
+        try:
+            self._request("POST", "/fapi/v1/leverage",
+                          {"symbol": symbol, "leverage": int(leverage)})
+            return True
+        except ExchangeError as e:
+            log.warning("set_leverage %s -> %s", symbol, e)
+            return False
+
+    def set_margin_type(self, symbol: str,
+                        margin_type: str = "ISOLATED") -> bool:
+        """Idempotent-ish: 'already ISOLATED' (-4046) counts as success."""
+        try:
+            self._request("POST", "/fapi/v1/marginType",
+                          {"symbol": symbol, "marginType": margin_type})
+            return True
+        except ExchangeError as e:
+            if "-4046" in str(e):  # "No need to change margin type."
+                return True
+            log.warning("set_margin_type %s -> %s", symbol, e)
+            return False
+
+    # --------------------------------------------------------------- orders
+    def place_order(self, symbol: str, side: str, type: str,
+                    quantity: float | None = None,
+                    price: float | None = None,
+                    stop_price: float | None = None,
+                    time_in_force: str = "GTC",
+                    reduce_only: bool = False,
+                    working_type: str = "MARK_PRICE",
+                    client_order_id: str | None = None) -> dict | None:
+        """Place one futures order. Returns the order dict, or None on failure."""
+        params: dict = {"symbol": symbol, "side": side, "type": type}
+        if quantity is not None:
+            params["quantity"] = quantity
+        if price is not None:
+            params["price"] = price
+        if stop_price is not None:
+            params["stopPrice"] = stop_price
+        if type in ("LIMIT", "STOP", "TAKE_PROFIT"):
+            params["timeInForce"] = time_in_force
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        if type in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"):
+            params["workingType"] = working_type
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
+        try:
+            return self._request("POST", "/fapi/v1/order", params)
+        except ExchangeError as e:
+            log.warning("place_order %s %s %s -> %s",
+                        symbol, side, type, e)
+            return None
+
+    def get_order(self, symbol: str, order_id: int | None = None,
+                  orig_client_order_id: str | None = None) -> dict | None:
+        params: dict = {"symbol": symbol}
+        if order_id is not None:
+            params["orderId"] = order_id
+        elif orig_client_order_id:
+            params["origClientOrderId"] = orig_client_order_id
+        else:
+            raise ValueError("order_id or orig_client_order_id required")
+        try:
+            return self._request("GET", "/fapi/v1/order", params)
+        except ExchangeError as e:
+            log.warning("get_order %s -> %s", symbol, e)
+            return None
+
+    def cancel_order(self, symbol: str, order_id: int | None = None,
+                     orig_client_order_id: str | None = None) -> bool:
+        params: dict = {"symbol": symbol}
+        if order_id is not None:
+            params["orderId"] = order_id
+        elif orig_client_order_id:
+            params["origClientOrderId"] = orig_client_order_id
+        else:
+            raise ValueError("order_id or orig_client_order_id required")
+        try:
+            self._request("DELETE", "/fapi/v1/order", params)
+            return True
+        except ExchangeError as e:
+            # -2011 (unknown order) means it is already gone — fine.
+            if "-2011" in str(e):
+                return True
+            log.warning("cancel_order %s -> %s", symbol, e)
+            return False
+
+    def get_open_orders(self, symbol: str | None = None) -> list[dict]:
+        params = {"symbol": symbol} if symbol else {}
+        try:
+            out = self._request("GET", "/fapi/v1/openOrders", params)
+            return out if isinstance(out, list) else []
+        except ExchangeError as e:
+            log.warning("get_open_orders -> %s", e)
+            return []
