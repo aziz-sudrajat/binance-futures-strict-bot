@@ -35,14 +35,16 @@ SETTINGS_PATH = config.DASHBOARD_SETTINGS_FILE
 DEFAULTS = config.DASHBOARD_DEFAULTS
 
 
-def load_settings(path: str = SETTINGS_PATH,
+def load_settings(path: str | None = None,
                   mode: str = "live") -> dict:
     """Current settings for a mode, merged over defaults.
 
     The file holds per-mode sections {"live": {...}, "testnet": {...}}.
+    path resolves at call time so tests / callers can redirect it.
     A legacy flat file (no mode keys) is treated as the live section.
     Missing/corrupt -> defaults.
     """
+    path = path or SETTINGS_PATH
     s = dict(DEFAULTS)
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -129,6 +131,13 @@ def validate_settings(data: dict) -> dict:
                 f"mtf_30m_mode must be one of {list(config.DASH_MTF_MODES)}")
         out["mtf_30m_mode"] = v
 
+    if "signal_mode" in data:
+        v = data["signal_mode"]
+        if v not in config.SIGNAL_MODES:
+            raise ValueError(
+                f"signal_mode must be one of {list(config.SIGNAL_MODES)}")
+        out["signal_mode"] = v
+
     for i in (1, 2, 3):
         k = f"tp_split_{i}"
         if k in data:
@@ -198,9 +207,10 @@ def validate_settings(data: dict) -> dict:
     return out
 
 
-def save_settings(data: dict, path: str = SETTINGS_PATH,
+def save_settings(data: dict, path: str | None = None,
                   mode: str = "live") -> dict:
     """Validate + atomically persist a mode's settings. Returns cleaned dict."""
+    path = path or SETTINGS_PATH
     cleaned = validate_settings(data)
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -264,6 +274,22 @@ def _fmt_ts(ts_ms: int) -> str:
         return "-"
 
 
+def apply_signal_mode_preset(settings: dict, mode: str) -> dict:
+    """Apply a signal-mode preset bundle onto a settings dict (in place).
+
+    The mode is a preset, not a lock: individual knobs can still be
+    fine-tuned afterwards. Raises ValueError for an unknown mode.
+    """
+    try:
+        bundle = config.SIGNAL_MODE_PRESETS[mode]
+    except KeyError:
+        raise ValueError(
+            f"signal_mode must be one of {list(config.SIGNAL_MODES)}")
+    settings["signal_mode"] = mode
+    settings.update(bundle)
+    return settings
+
+
 def scanner_status() -> dict:
     """Scanner (stage 1) status + fresh signals from signals.db."""
     out: dict = {"state": None, "db": {"fresh": 0}, "signals": []}
@@ -299,6 +325,7 @@ def scanner_status() -> dict:
 # Canonical settings field spec shared by the dashboard, TUI and the
 # `binance` terminal shell.
 SETTING_FIELDS: list[tuple[str, str, str]] = [
+    ("signal_mode", "Mode sinyal (preset)", "choice:ketat,sedang,biasa"),
     ("auto_trade", "Auto-trade", "bool"),
     ("universe_mode", "Universe mode", "choice:curated,top_volume"),
     ("universe_top_n", "Universe top N", "int"),
@@ -552,6 +579,13 @@ th{color:#8b949e;font-weight:600}
   <div class="dim" style="font-size:12px" id="u-count"></div>
 </div>
 <div class="card"><h2>🎯 Signal — Quality &amp; Filter</h2>
+  <div class="setrow"><label><b>Mode sinyal</b><br>
+    <span class="dim" style="font-size:12px">preset: ketat / sedang / biasa</span></label>
+    <select id="s-mode">
+      <option value="ketat">KETAT — GAS STRICT</option>
+      <option value="sedang">SEDANG — lebih longgar</option>
+      <option value="biasa">BIASA — paling longgar</option>
+    </select></div>
   <div class="setrow"><label>Min quality score<br>
     <span class="dim" style="font-size:12px">STRICT default 70</span></label>
     <input type="number" id="s-minq" step="1" min="50" max="95"></div>
@@ -662,7 +696,7 @@ async function refresh(){
     $('s-lev').value = st.max_leverage;
     $('s-int').value = st.poll_interval_min;
     $('s-minq').value = st.min_quality_score;
-    $('s-mtf').value = st.mtf_30m_mode;
+    $('s-mode').value = st.signal_mode || 'ketat';    $('s-mtf').value = st.mtf_30m_mode;
     $('s-bull').checked = !!st.bullish_only;
     $('s-vol').value = st.min_24h_volume_usd;
     $('s-fresh').value = st.freshness_max_drift_pct;
@@ -808,8 +842,15 @@ async function refreshScanner(){
     el.innerHTML = h;
   }catch(e){ el.innerHTML='<span class="red">✗</span>'; }
 }
-$('scan').onclick = async ()=>{
-  $('scan').disabled=true; $('scan').textContent='Scanning…';
+$('s-mode').onchange = async ()=>{
+  const v = $('s-mode').value;
+  if(!confirm('Ganti mode sinyal ke '+v.toUpperCase()+'? Preset akan menimpa knob signal & veto.')){ refresh(); return; }
+  const r = await (await fetch('/api/settings?mode='+mode,{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({signal_mode:v})})).json();
+  if(r.error){ alert('gagal: '+r.error); } else { refresh(); }
+};
+$('scan').onclick = async ()=>{  $('scan').disabled=true; $('scan').textContent='Scanning…';
   $('radar').innerHTML='<span class="dim">menghubungi exchange…</span>';
   try{
     const r = await (await fetch('/api/radar?mode='+mode)).json();
@@ -907,7 +948,19 @@ class Handler(BaseHTTPRequestHandler):
         # just the auto-trade toggle) don't reset the other knobs.
         mode = self._mode()
         merged = load_settings(mode=mode)
-        merged.update(data if isinstance(data, dict) else {})
+        incoming = data if isinstance(data, dict) else {}
+        # signal_mode is a preset: expand it into the individual knobs
+        # before validation so the bundle always lands atomically.
+        if ("signal_mode" in incoming
+                and incoming["signal_mode"] != merged.get("signal_mode")):
+            try:
+                apply_signal_mode_preset(merged, incoming["signal_mode"])
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            incoming = {k: v for k, v in incoming.items()
+                        if k != "signal_mode"}
+        merged.update(incoming)
         try:
             cleaned = save_settings(merged, path=SETTINGS_PATH, mode=mode)
         except ValueError as e:
