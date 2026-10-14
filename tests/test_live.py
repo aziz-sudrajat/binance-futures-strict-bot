@@ -1,0 +1,137 @@
+"""Live-mode safety tests for run_executor --live.
+
+Live = real money. These tests pin the hard safety properties:
+- --live refuses without BINANCE_LIVE_KEY/BINANCE_LIVE_SECRET (never falls back)
+- --live refuses every TEST ONLY flag (--fixed-margin-usdt, --leverage,
+  --leverage-tiers, --leverage-default, --manual)
+- --live is mutually exclusive with --paper/--testnet
+- --live builds against the mainnet base URL with production risk defaults
+  (1%/trade, max 3x) and separate state files
+"""
+import argparse
+
+import pytest
+
+import config
+from run_executor import build, require_live_keys
+
+
+def _args(**over):
+    base = dict(paper=False, testnet=False, live=True, once=True, loop=False,
+                interval=5, fixed_margin_usdt=None, leverage=None,
+                leverage_tiers=None, leverage_default=None, manual=None)
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+LIVE_ENV = {"BINANCE_LIVE_KEY": "k", "BINANCE_LIVE_SECRET": "s"}
+
+
+# ---------------------------------------------------------- key requirement
+def test_require_live_keys_refuses_empty():
+    with pytest.raises(SystemExit):
+        require_live_keys({})
+
+
+def test_require_live_keys_refuses_partial():
+    with pytest.raises(SystemExit):
+        require_live_keys({"BINANCE_LIVE_KEY": "k"})
+
+
+def test_require_live_keys_accepts_full():
+    assert require_live_keys(LIVE_ENV) == ("k", "s")
+
+
+def test_build_live_refuses_without_keys(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "EXEC_LIVE_STATE_FILE",
+                        str(tmp_path / "state-live.json"))
+    monkeypatch.setattr(config, "EXEC_LIVE_LIFECYCLE_FILE",
+                        str(tmp_path / "lifecycle-live.jsonl"))
+    with pytest.raises(SystemExit):
+        build(_args(), env={})
+
+
+# ------------------------------------------------- TEST ONLY flag refusals
+@pytest.mark.parametrize("flag", ["fixed_margin_usdt", "leverage",
+                                   "leverage_default", "manual"])
+def test_build_live_refuses_test_only_flags(flag, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "EXEC_LIVE_STATE_FILE",
+                        str(tmp_path / "state-live.json"))
+    monkeypatch.setattr(config, "EXEC_LIVE_LIFECYCLE_FILE",
+                        str(tmp_path / "lifecycle-live.jsonl"))
+    val = "BTCUSDT=20" if flag == "leverage_tiers" else (
+        "BTCUSDT" if flag == "manual" else 10)
+    with pytest.raises(SystemExit) as ei:
+        build(_args(**{flag: val}), env=dict(LIVE_ENV))
+    assert "TEST ONLY" in str(ei.value)
+
+
+def test_build_live_refuses_leverage_tiers(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "EXEC_LIVE_STATE_FILE",
+                        str(tmp_path / "state-live.json"))
+    monkeypatch.setattr(config, "EXEC_LIVE_LIFECYCLE_FILE",
+                        str(tmp_path / "lifecycle-live.jsonl"))
+    with pytest.raises(SystemExit) as ei:
+        build(_args(leverage_tiers="BTCUSDT=20"), env=dict(LIVE_ENV))
+    assert "TEST ONLY" in str(ei.value)
+
+
+# ------------------------------------------------------- mode exclusivity
+@pytest.mark.parametrize("extra", [dict(paper=True), dict(testnet=True)])
+def test_build_live_mutually_exclusive(extra, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "EXEC_LIVE_STATE_FILE",
+                        str(tmp_path / "state-live.json"))
+    monkeypatch.setattr(config, "EXEC_LIVE_LIFECYCLE_FILE",
+                        str(tmp_path / "lifecycle-live.jsonl"))
+    with pytest.raises(SystemExit):
+        build(_args(**extra), env=dict(LIVE_ENV))
+
+
+def test_build_no_mode_refuses(tmp_path, monkeypatch):
+    a = _args(live=False)  # all three modes off
+    with pytest.raises(SystemExit):
+        build(a, env=dict(LIVE_ENV))
+
+
+# ------------------------------------------------- live build correctness
+def test_build_live_uses_mainnet_and_safe_defaults(tmp_path, monkeypatch):
+    state_p = tmp_path / "state-live.json"
+    life_p = tmp_path / "lifecycle-live.jsonl"
+    monkeypatch.setattr(config, "EXEC_LIVE_STATE_FILE", str(state_p))
+    monkeypatch.setattr(config, "EXEC_LIVE_LIFECYCLE_FILE", str(life_p))
+    executor, mode = build(_args(), env=dict(LIVE_ENV))
+    assert mode == f"LIVE ({config.BINANCE_FUTURES_MAINNET_URL})"
+    assert executor.exchange.base_url == config.BINANCE_FUTURES_MAINNET_URL
+    # production risk defaults, no test overrides
+    assert executor.fixed_margin_usdt is None
+    assert executor.leverage_override is None
+    assert executor.leverage_tiers is None
+    assert executor.leverage_default is None
+    assert config.RISK_PCT_PER_TRADE == 1.0
+    assert config.MAX_LEVERAGE == 3
+    # separate state files, never the shared testnet/paper ones
+    assert executor.state.path == str(state_p)
+    assert executor.lifecycle.path == str(life_p)
+    assert "live" in executor.state.path
+
+
+def test_build_live_honours_base_url_override(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "EXEC_LIVE_STATE_FILE",
+                        str(tmp_path / "state-live.json"))
+    monkeypatch.setattr(config, "EXEC_LIVE_LIFECYCLE_FILE",
+                        str(tmp_path / "lifecycle-live.jsonl"))
+    env = dict(LIVE_ENV, BINANCE_FUTURES_BASE_URL="https://fapi.example")
+    executor, mode = build(_args(), env=env)
+    assert mode == "LIVE (https://fapi.example)"
+    assert executor.exchange.base_url == "https://fapi.example"
+
+
+def test_live_never_uses_testnet_key_env(tmp_path, monkeypatch):
+    """Testnet keys must not satisfy --live (no cross-mode fallback)."""
+    monkeypatch.setattr(config, "EXEC_LIVE_STATE_FILE",
+                        str(tmp_path / "state-live.json"))
+    monkeypatch.setattr(config, "EXEC_LIVE_LIFECYCLE_FILE",
+                        str(tmp_path / "lifecycle-live.jsonl"))
+    with pytest.raises(SystemExit):
+        build(_args(), env={"BINANCE_TESTNET_KEY": "k",
+                            "BINANCE_TESTNET_SECRET": "s"})
