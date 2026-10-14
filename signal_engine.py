@@ -349,58 +349,73 @@ def mtf_trend_direction(closes: list) -> str:
     return "NEUTRAL"
 
 
-def mtf_confirm_strict(c30: dict) -> dict:
+def mtf_confirm_strict(c30: dict, direction: str = "BULLISH") -> dict:
     """GAS: mtfConfirmPass_ STRICT branch (L2091-2101)."""
     if not c30:
         return {"pass": False, "reason": "no 30m data"}
     sig = str(c30.get("signal") or "")
-    if sig.startswith("BULL") and c30.get("trade_plan"):
+    want_bear = direction == "BEARISH"
+    aligned = sig.startswith("BEAR") if want_bear else sig.startswith("BULL")
+    if aligned and c30.get("trade_plan"):
         return {"pass": True, "boost": config.MTF_CONFIRM_BOOST}
-    return {"pass": False, "reason": f"30m {sig} (STRICT requires BULLISH WATCH)"}
+    need = "BEARISH" if want_bear else "BULLISH"
+    return {"pass": False,
+            "reason": f"30m {sig} (STRICT requires {need} WATCH)"}
 
 
-def mtf_confirm_lean(c30: dict) -> dict:
+def mtf_confirm_lean(c30: dict, direction: str = "BULLISH") -> dict:
     """GAS: mtfConfirmPass_ LEAN branch — the GAS *default* behavior (L2091-2110).
 
-    Bearish 30m fails; full BULLISH WATCH passes with boost 8; a NEUTRAL 30m
-    with bull_score >= bear_score passes as a 'lean' with boost 3; otherwise
-    passes weak with a -5 penalty. Kept for MTF_30M_MODE='LEAN' parity with
-    GAS; the STRICT default below is deliberately stricter (audit D5).
+    BULLISH direction: bearish 30m fails; full BULLISH WATCH passes with
+    boost 8; a NEUTRAL 30m with bull_score >= bear_score passes as a 'lean'
+    with boost 3; otherwise passes weak with a -5 penalty. Kept for
+    MTF_30M_MODE='LEAN' parity with GAS; the STRICT default below is
+    deliberately stricter (audit D5). Mirrored for BEARISH direction.
     """
     if not c30:
         return {"pass": False, "reason": "no 30m data"}
     sig = str(c30.get("signal") or "")
     is_bull = sig.startswith("BULL")
     is_bear = sig.startswith("BEAR")
-    if is_bear:
-        return {"pass": False, "reason": f"30m bearish ({sig})"}
-    if is_bull and c30.get("trade_plan"):
-        return {"pass": True, "boost": config.MTF_CONFIRM_BOOST}
+    want_bear = direction == "BEARISH"
+    # A 30m hostile to the signal direction fails outright.
+    if (is_bull and want_bear) or (is_bear and not want_bear):
+        return {"pass": False, "reason": f"30m {sig.lower()} against signal"}
+    # Full aligned setup passes with boost.
+    if ((is_bear and want_bear) or (is_bull and not want_bear)):
+        if c30.get("trade_plan"):
+            return {"pass": True, "boost": config.MTF_CONFIRM_BOOST}
     bull_score = float(c30.get("bull_score") or 0)
     bear_score = float(c30.get("bear_score") or 0)
-    if bull_score >= bear_score:
+    if (bear_score >= bull_score) if want_bear else (bull_score >= bear_score):
         return {"pass": True, "boost": config.MTF_LEAN_BOOST, "lean": True}
     return {"pass": True, "boost": 0, "penalty": -5, "weak": True}
 
 
-def mtf_confirm(c30: dict, mode: str | None = None) -> dict:
+def mtf_confirm(c30: dict, mode: str | None = None,
+                direction: str = "BULLISH") -> dict:
     """30m confirmation honoring config.MTF_30M_MODE (default 'STRICT')."""
     mode = str(mode or config.MTF_30M_MODE).upper()
     if mode == "LEAN":
-        return mtf_confirm_lean(c30)
-    return mtf_confirm_strict(c30)
+        return mtf_confirm_lean(c30, direction)
+    return mtf_confirm_strict(c30, direction)
 
 
-def mtf_cascade_check(klines_4h: list, klines_1d: list, a30: dict) -> dict:
-    """GAS: mtfCascadeCheck_ (L3156). 4h + 1d bullish, 30m per MTF_30M_MODE."""
+def mtf_cascade_check(klines_4h: list, klines_1d: list, a30: dict,
+                      direction: str = "BULLISH") -> dict:
+    """GAS: mtfCascadeCheck_ (L3156). 4h + 1d trend aligned with the signal
+    direction, 30m per MTF_30M_MODE."""
+    want = "BEARISH" if direction == "BEARISH" else "BULLISH"
     try:
         t4 = mtf_trend_direction([float(c["close"]) for c in klines_4h])
-        if t4 != "BULLISH":
-            return {"pass": False, "stage": "4h", "reason": f"4h trend {t4.lower()}"}
+        if t4 != want:
+            return {"pass": False, "stage": "4h",
+                    "reason": f"4h trend {t4.lower()} (need {want.lower()})"}
         t1 = mtf_trend_direction([float(c["close"]) for c in klines_1d])
-        if t1 != "BULLISH":
-            return {"pass": False, "stage": "1d", "reason": f"1d trend {t1.lower()}"}
-        chk = mtf_confirm(a30)
+        if t1 != want:
+            return {"pass": False, "stage": "1d",
+                    "reason": f"1d trend {t1.lower()} (need {want.lower()})"}
+        chk = mtf_confirm(a30, direction=direction)
         if not chk["pass"]:
             return {"pass": False, "stage": "30m", "reason": "30m: " + chk["reason"]}
         # The 30m check result is threaded through so the quality gate can
@@ -436,25 +451,31 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
     if vol < config.MIN_24H_VOLUME_USD:
         return None, f"24h volume ${vol:,.0f} below ${config.MIN_24H_VOLUME_USD:,}"
 
-    # 2. 15m setup: BULLISH WATCH + plan + strength >= 3.
-    # LONG-only by construction: vetoes, deltas, cascade, plan geometry and
-    # the executor are all bullish-oriented — there is no SHORT path. Hence
-    # non-bullish 15m setups are ALWAYS rejected here, regardless of the
-    # bullish_only knob (kept for GAS-parity display / future use). Letting a
-    # BEARISH WATCH through would emit direction="LONG" with an inverted
-    # (bearish) plan — stop above entry — which must never reach the executor.
+    # 2. 15m setup: directional WATCH + plan + strength >= 3.
+    # Direction: BULLISH WATCH -> LONG; BEARISH WATCH -> SHORT. In
+    # bullish-only modes (ketat/sedang, GAS parity) non-bullish setups are
+    # rejected here. In bidirectional mode (biasa) BEARISH WATCH continues
+    # down a fully mirrored SHORT pipeline (cascade, vetoes, deltas,
+    # freshness, executor) — never an inverted LONG.
     try:
         a15 = analyze_candles(symbol, "15m", market.get_klines(symbol, "15m"))
     except Exception as e:  # noqa: BLE001
         return None, f"15m data error: {e}"
-    if not str(a15["signal"]).startswith("BULL"):
-        return None, f"bullish-only: 15m signal {a15['signal']}"
+    sig15 = str(a15["signal"])
+    is_bull = sig15.startswith("BULL")
+    is_bear = sig15.startswith("BEAR")
+    if config.BULLISH_ONLY and not is_bull:
+        return None, f"bullish-only: 15m signal {sig15}"
+    if not is_bull and not is_bear:
+        return None, f"15m: no directional setup ({sig15})"
+    direction = "BULLISH" if is_bull else "BEARISH"
     if not a15["trade_plan"]:
         return None, "15m: no trade plan"
     if a15["strength"] < config.MIN_STRENGTH:
         return None, f"15m strength {a15['strength']}/5 below {config.MIN_STRENGTH}"
 
-    # 3. MTF cascade: 4h + 1d trend, 30m per MTF_30M_MODE (default STRICT).
+    # 3. MTF cascade: 4h + 1d trend aligned with the signal direction,
+    # 30m per MTF_30M_MODE (default STRICT).
     # Any fetch/analysis exception rejects the symbol — never skip-and-pass.
     try:
         k4h = market.get_klines(symbol, "4h")
@@ -462,7 +483,7 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
         a30 = analyze_candles(symbol, "30m", market.get_klines(symbol, "30m"))
     except Exception as e:  # noqa: BLE001
         return None, f"MTF data error: {e}"
-    casc = mtf_cascade_check(k4h, k1d, a30)
+    casc = mtf_cascade_check(k4h, k1d, a30, direction)
     if not casc["pass"]:
         return None, f"STRICT cascade: {casc['reason']}"
 
@@ -491,7 +512,7 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
         book = market.get_order_book(symbol)
     except Exception:  # noqa: BLE001 - run_vetoes retries and holds on failure
         book = None
-    blocks = run_vetoes(symbol, "BULLISH", market, snap, book=book,
+    blocks = run_vetoes(symbol, direction, market, snap, book=book,
                         skip_deriv_vetoes=degraded,
                         disabled=getattr(config, "DISABLED_VETOES", ()))
     if blocks:
@@ -510,28 +531,28 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
         components[name] = int(d)
         delta_notes.append(f"{name}: {note}")
 
-    _add("mtf_30m", mtf_30m_delta(casc["chk"]))
+    _add("mtf_30m", mtf_30m_delta(casc["chk"], direction))
     try:
         a4h = analyze_candles(symbol, "4h", k4h)
     except Exception as e:  # noqa: BLE001 - soft scoring (GAS L3304)
         components["mtf_4h"] = 0
         delta_notes.append(f"mtf_4h: data tidak tersedia ({e})")
     else:
-        _add("mtf_4h", mtf_4h_delta(a4h))
+        _add("mtf_4h", mtf_4h_delta(a4h, direction))
     try:
         h1_closes = [float(c["close"]) for c in market.get_klines(symbol, "1h")]
     except Exception as e:  # noqa: BLE001 - soft scoring (GAS L3228)
         components["h1"] = 0
         delta_notes.append(f"h1: data tidak tersedia ({e})")
     else:
-        _add("h1", h1_trend_delta(h1_closes))
+        _add("h1", h1_trend_delta(h1_closes, direction))
     try:
         btc_chg = btc_1h_change_pct(market)  # cached by the V15 veto check
     except Exception as e:  # noqa: BLE001 - veto already held on failure
         components["btc_warn"] = 0
         delta_notes.append(f"btc_warn: data tidak tersedia ({e})")
     else:
-        _add("btc_warn", btc_breadth_warn_delta(btc_chg))
+        _add("btc_warn", btc_breadth_warn_delta(btc_chg, direction))
 
     # Derivatives warn tiers. Veto tiers (V9-V12) already rejected above, so
     # the required inputs are present here; optional inputs (smart money,
@@ -555,19 +576,19 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
                                   adv["oi_usd"], adv["volume_24h"],
                                   adv.get("spike") or 0.0)
         _add("lev_warn", leverage_warn_delta(lev))
-        _add("funding", funding_delta(snap.get("aggregate_funding"), "BULLISH"))
+        _add("funding", funding_delta(snap.get("aggregate_funding"), direction))
         sq = squeeze_risk_index(adv["retail_long"], adv["funding"],
                                 adv["oi_change"], adv.get("long_liq_usd") or 0.0,
                                 adv.get("short_liq_usd") or 0.0,
-                                adv.get("spike") or 0.0, "BULLISH")
+                                adv.get("spike") or 0.0, direction)
         _add("squeeze_warn", squeeze_warn_delta(sq))
         _add("whale_warn", whale_warn_delta(adv.get("top_long"),
-                                            adv.get("divergence"), "BULLISH"))
+                                            adv.get("divergence"), direction))
         smart = smart_money_score(adv)
-        _add("smart_money", smart_money_delta(smart, "BULLISH"))
+        _add("smart_money", smart_money_delta(smart, direction))
         regime = market_regime(adv)
         _add("liq_event", liq_event_delta(regime))
-        _add("liq_wall_warn", liq_wall_warn_delta(book, "BULLISH"))
+        _add("liq_wall_warn", liq_wall_warn_delta(book, direction))
 
     deriv = derivatives_score(snap)  # informational (scan-time heuristic)
     q = quality_score(a15["strength"], components)
@@ -578,11 +599,14 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
                        + ", ".join(f"{k}{v:+d}" for k, v in components.items()
                                    if v) + ")")
 
-    # 7. Freshness (GAS: freshnessCheck_, L5075): LIVE ticker price, one-sided —
-    # reject only when price ran >0.4% ABOVE the entry zone (stale entry for
-    # longs). Price below/at the zone is fine (pullback entry). FAIL-CLOSED:
-    # an unavailable live price holds the signal (audit C2/C3/D1 — GAS returned
-    # ok:true on price_unavailable; we deliberately do not reproduce that).
+    # 7. Freshness (GAS: freshnessCheck_, L5075): LIVE ticker price, one-sided
+    # per direction. LONG: reject only when price ran >limit ABOVE the entry
+    # zone (stale entry — chasing). Price below/at the zone is fine (pullback
+    # entry). SHORT (mirror): reject when price ran >limit BELOW entry_low —
+    # the pullback-short entry is stale once price already broke down.
+    # FAIL-CLOSED: an unavailable live price holds the signal (audit C2/C3/D1
+    # — GAS returned ok:true on price_unavailable; we deliberately do not
+    # reproduce that).
     plan = a15["trade_plan"]
     try:
         live = market.get_live_price(symbol)
@@ -590,14 +614,23 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
         live = None
     if live is None or not _finite(live) or live <= 0:
         return None, "freshness: live price unavailable — holding (fail-closed)"
-    drift_pct = (live - plan["entry_high"]) / plan["entry_high"] * 100
-    if drift_pct > config.FRESHNESS_MAX_DRIFT_PCT:
-        return None, (f"freshness: live price +{drift_pct:.2f}% above entry zone "
-                       f"(limit +{config.FRESHNESS_MAX_DRIFT_PCT}%) — stale entry")
+    if direction == "BEARISH":
+        drift_pct = ((plan["entry_low"] - live) / plan["entry_low"] * 100
+                     if plan["entry_low"] > 0 else 0.0)
+        if drift_pct > config.FRESHNESS_MAX_DRIFT_PCT:
+            return None, (f"freshness: live price -{drift_pct:.2f}% below entry "
+                          f"zone (limit -{config.FRESHNESS_MAX_DRIFT_PCT}%) — "
+                          f"stale entry for short")
+    else:
+        drift_pct = (live - plan["entry_high"]) / plan["entry_high"] * 100
+        if drift_pct > config.FRESHNESS_MAX_DRIFT_PCT:
+            return None, (f"freshness: live price +{drift_pct:.2f}% above entry "
+                          f"zone (limit +{config.FRESHNESS_MAX_DRIFT_PCT}%) — "
+                          f"stale entry")
 
     signal = {
         "symbol": symbol,
-        "direction": "LONG",  # STRICT is bullish-only by construction
+        "direction": "SHORT" if direction == "BEARISH" else "LONG",
         "interval": "15m",
         "entry": plan["entry"],
         "entry_low": plan["entry_low"],
