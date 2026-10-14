@@ -98,7 +98,9 @@ def _refuse_live_test_params(args) -> None:
             "ERROR: --live refuses TEST ONLY flags: "
             + ", ".join(offenders) + ".\n"
             "Live trading always uses the production risk defaults "
-            "(RISK_PCT_PER_TRADE, MAX_LEVERAGE) and real STRICT signals only.")
+            "(RISK_PCT_PER_TRADE, MAX_LEVERAGE) and real STRICT signals only. "
+            "For full order control (fixed leverage/entry, margin mode) use "
+            "the dashboard Order settings instead.")
 
 
 def build(args, env: dict | None = None):
@@ -144,12 +146,15 @@ def build(args, env: dict | None = None):
         mode = "PAPER"
     risk = RiskManager(state, exchange.get_balance)
     tiers = _parse_leverage_tiers(args.leverage_tiers)
+    settings_mode = "live" if is_live else ("testnet" if args.testnet
+                                            else "paper")
     executor = Executor(market, exchange, risk, state, lifecycle,
                         poll_interval_min=args.interval,
                         fixed_margin_usdt=args.fixed_margin_usdt,
                         leverage_override=args.leverage,
                         leverage_tiers=tiers,
-                        leverage_default=args.leverage_default)
+                        leverage_default=args.leverage_default,
+                        settings_mode=settings_mode)
     return executor, mode
 
 
@@ -212,6 +217,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="print the futures USDT balance and exit "
                          "(needs --live or --testnet keys)")
     args = ap.parse_args(argv)
+    # BOT_MODE env (set by `source switch.sh live|demo`) selects the mode
+    # when no explicit flag is given.
+    if not args.live and not args.testnet:
+        m = (os.environ.get("BOT_MODE") or "").strip().lower()
+        if m == "live":
+            args.live = True
+        elif m in ("demo", "testnet"):
+            args.testnet = True
     if args.testnet or args.live:
         args.paper = False
     if args.leverage is not None and not 1 <= args.leverage <= 125:
