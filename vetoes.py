@@ -125,7 +125,8 @@ def btc_1h_change_pct(market) -> float:
 # ------------------------------------------------------------------ vetoes
 def run_vetoes(symbol: str, direction: str, market, snap: dict,
                book: dict | None = None,
-               skip_deriv_vetoes: bool = False) -> list:
+               skip_deriv_vetoes: bool = False,
+               disabled: object = None) -> list:
     """Evaluate every deterministic hard veto.
 
     Returns a list of blocks; each block is a (code, kind, reason) tuple
@@ -148,10 +149,20 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
     circuit breaker still runs on real historical BTC 1h klines. Every skip
     is documented in the backtest report: backtest results are UPPER BOUNDS
     on what the full production pipeline would admit.
+
+    `disabled`: veto codes the operator turned off via the dashboard
+    (config.DISABLED_VETOES). A disabled veto is SKIPPED entirely — not even
+    its fail-closed hold applies. This is an explicit operator choice;
+    by default every veto is enabled.
     """
     symbol = symbol.upper()
     direction = direction.upper()
     blocks = []
+    off = set(disabled or ())
+
+    def _block(code: str, kind: str, reason: str) -> None:
+        if code not in off:
+            blocks.append((code, kind, reason))
 
     # V15 — BTC circuit breaker (GAS: deepCheckBtcBreadth_ L3634).
     # The breaker guards LONG exposure only (GAS comment L3655-3656).
@@ -159,13 +170,13 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
     try:
         chg = btc_1h_change_pct(market)
     except Exception as e:  # noqa: BLE001 - unevaluable breaker -> hold
-        blocks.append(("btc_breaker", "hold",
-                       f"BTC circuit breaker unevaluable ({e}) — holding (fail-closed)"))
+        _block("btc_breaker", "hold",
+                       f"BTC circuit breaker unevaluable ({e}) — holding (fail-closed)")
     else:
         if direction == "BULLISH" and chg <= -config.BTC_DUMP_VETO_PCT:
-            blocks.append(("btc_breaker", "veto",
+            _block("btc_breaker", "veto",
                            f"BTC dump {chg:.2f}%/1h <= -{config.BTC_DUMP_VETO_PCT:g}% "
-                           f"— circuit breaker, LONG held"))
+                           f"— circuit breaker, LONG held")
 
     if skip_deriv_vetoes:
         return blocks  # V9-V12, V13 skipped: no historical feed (documented)
@@ -175,44 +186,47 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
         adv = market.get_advanced_derivatives(symbol)
     except Exception as e:  # noqa: BLE001 - unevaluable -> hold
         adv = None
-        blocks.append(("adv_deriv", "hold",
-                       f"advanced derivatives unavailable ({e}) — holding (fail-closed)"))
+        # The adv feed serves leverage_risk/squeeze/whale: if the operator
+        # disabled all three, its unavailability holds nothing.
+        if not {"leverage_risk", "squeeze", "whale"} <= off:
+            _block("adv_deriv", "hold",
+                   f"advanced derivatives unavailable ({e}) — holding (fail-closed)")
 
     if adv is not None:
         # V9 — leverage-risk veto (GAS L3338; index L1016-1022).
         lev_req = (adv.get("retail_long"), adv.get("funding"),
                    adv.get("oi_usd"), adv.get("volume_24h"))
         if not all(_finite(v) for v in lev_req):
-            blocks.append(("leverage_risk", "hold",
-                           "leverage-risk inputs incomplete — holding (fail-closed)"))
+            _block("leverage_risk", "hold",
+                           "leverage-risk inputs incomplete — holding (fail-closed)")
         else:
             lev = leverage_risk_index(*lev_req, adv.get("spike") or 0.0)
             if lev >= config.DERIV_LEVERAGE_RISK_VETO:
-                blocks.append(("leverage_risk", "veto",
+                _block("leverage_risk", "veto",
                                f"leverage risk index {lev}/100 >= "
-                               f"{config.DERIV_LEVERAGE_RISK_VETO} — crowded, flush risk"))
+                               f"{config.DERIV_LEVERAGE_RISK_VETO} — crowded, flush risk")
 
         # V10 — funding extreme against the signal (GAS L3346-3354).
         # Positive funding = longs pay shorts = crowded long (GAS L3347).
         funding = snap.get("aggregate_funding")
         if not _finite(funding):
-            blocks.append(("funding", "hold",
-                           "funding unavailable — holding (fail-closed)"))
+            _block("funding", "hold",
+                           "funding unavailable — holding (fail-closed)")
         else:
             funding = float(funding)
             crowded_long = funding > 0
             against = ((direction == "BULLISH" and crowded_long)
                        or (direction == "BEARISH" and not crowded_long))
             if abs(funding) >= config.DERIV_FUNDING_EXTREME and against:
-                blocks.append(("funding", "veto",
+                _block("funding", "veto",
                                f"funding {funding:+.4%} extreme and against {direction} "
-                               f"(crowded {'long' if crowded_long else 'short'}, squeeze risk)"))
+                               f"(crowded {'long' if crowded_long else 'short'}, squeeze risk)")
 
         # V11 — squeeze risk in the signal direction (GAS L3360).
         sq_req = (adv.get("retail_long"), adv.get("funding"), adv.get("oi_change"))
         if not all(_finite(v) for v in sq_req):
-            blocks.append(("squeeze", "hold",
-                           "squeeze-risk inputs incomplete — holding (fail-closed)"))
+            _block("squeeze", "hold",
+                           "squeeze-risk inputs incomplete — holding (fail-closed)")
         else:
             sq = squeeze_risk_index(
                 sq_req[0], sq_req[1], sq_req[2],
@@ -220,25 +234,25 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
                 adv.get("spike") or 0.0, direction)
             if sq >= config.DERIV_SQUEEZE_RISK_VETO:
                 side = "long" if direction == "BULLISH" else "short"
-                blocks.append(("squeeze", "veto",
+                _block("squeeze", "veto",
                                f"{side} squeeze risk {sq}/100 >= "
-                               f"{config.DERIV_SQUEEZE_RISK_VETO} — stop-hunt risk"))
+                               f"{config.DERIV_SQUEEZE_RISK_VETO} — stop-hunt risk")
 
         # V12 — top-trader / whale extreme divergence (GAS L3366-3379).
         top_long, div = adv.get("top_long"), adv.get("divergence")
         if not (_finite(top_long) and _finite(div)):
-            blocks.append(("whale", "hold",
-                           "top-trader positioning unavailable — holding (fail-closed)"))
+            _block("whale", "hold",
+                           "top-trader positioning unavailable — holding (fail-closed)")
         else:
             ext = config.DERIV_TOP_TRADER_EXTREME_LONG
             whale_against = (
                 (direction == "BULLISH" and top_long <= ext and div <= -15)
                 or (direction == "BEARISH" and top_long >= 100 - ext and div >= 15))
             if whale_against:
-                blocks.append(("whale", "veto",
+                _block("whale", "veto",
                                f"top traders extremely against {direction} "
                                f"(top long {top_long:.1f}%, whale-crowd divergence "
-                               f"{div:+.1f}pp)"))
+                               f"{div:+.1f}pp)")
 
     # V13 — liquidity wall blocking the move (GAS: deepCheckLiquidity_ L3395).
     if book is None:
@@ -246,11 +260,11 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
             book = market.get_order_book(symbol)
         except Exception as e:  # noqa: BLE001 - unevaluable -> hold
             book = None
-            blocks.append(("liq_wall", "hold",
-                           f"order book unavailable ({e}) — holding (fail-closed)"))
+            _block("liq_wall", "hold",
+                           f"order book unavailable ({e}) — holding (fail-closed)")
     wall_reason = _blocking_wall(book, direction) if book is not None else None
     if wall_reason:
-        blocks.append(("liq_wall", "veto", wall_reason))
+        _block("liq_wall", "veto", wall_reason)
 
     return blocks
 
