@@ -79,6 +79,7 @@ def validate_settings(data: dict) -> dict:
 
     _bool("auto_trade")
     _bool("bullish_only")
+    _bool("mtf_require_1d")
     _bool("breakeven_after_tp1")
     for code in config.DASH_VETO_CODES:
         _bool(f"veto_{code}")
@@ -334,6 +335,7 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("poll_interval_min", "Scan interval (min)", "int"),
     ("min_quality_score", "Min quality score", "int"),
     ("mtf_30m_mode", "MTF 30m mode", "choice:STRICT,LEAN"),
+    ("mtf_require_1d", "MTF: 1d wajib selaras", "bool"),
     ("bullish_only", "Bullish only", "bool"),
     ("min_24h_volume_usd", "Min 24h volume USD", "float"),
     ("freshness_max_drift_pct", "Freshness drift %", "float"),
@@ -595,6 +597,10 @@ th{color:#8b949e;font-weight:600}
       <option value="STRICT">STRICT</option>
       <option value="LEAN">LEAN</option>
     </select></div>
+  <div class="setrow"><label><b>MTF: 1d wajib selaras</b><br>
+    <span class="dim" style="font-size:12px">OFF = 1d jadi penalti skor, bukan veto (mode biasa)</span></label>
+    <label class="switch"><input type="checkbox" id="s-req1d">
+    <span class="sl"></span></label></div>
   <div class="setrow"><label><b>Bullish only</b><br>
     <span class="dim" style="font-size:12px">OFF = izinkan juga signal SHORT</span></label>
     <label class="switch"><input type="checkbox" id="s-bull">
@@ -697,6 +703,7 @@ async function refresh(){
     $('s-int').value = st.poll_interval_min;
     $('s-minq').value = st.min_quality_score;
     $('s-mode').value = st.signal_mode || 'ketat';    $('s-mtf').value = st.mtf_30m_mode;
+    $('s-req1d').checked = st.mtf_require_1d !== false;
     $('s-bull').checked = !!st.bullish_only;
     $('s-vol').value = st.min_24h_volume_usd;
     $('s-fresh').value = st.freshness_max_drift_pct;
@@ -783,6 +790,7 @@ async function postSettings(body, quiet){
 }
 $('s-auto').onchange = ()=>postSettings({auto_trade:$('s-auto').checked}, true);
 $('s-bull').onchange = ()=>postSettings({bullish_only:$('s-bull').checked}, true);
+$('s-req1d').onchange = ()=>postSettings({mtf_require_1d:$('s-req1d').checked}, true);
 $('s-be').onchange = ()=>postSettings({breakeven_after_tp1:$('s-be').checked}, true);
 $('save').onclick = ()=>{
   postSettings({
@@ -792,6 +800,7 @@ $('save').onclick = ()=>{
     poll_interval_min:parseInt($('s-int').value),
     min_quality_score:parseInt($('s-minq').value),
     mtf_30m_mode:$('s-mtf').value,
+    mtf_require_1d:$('s-req1d').checked,
     bullish_only:$('s-bull').checked,
     min_24h_volume_usd:parseFloat($('s-vol').value),
     freshness_max_drift_pct:parseFloat($('s-fresh').value),
