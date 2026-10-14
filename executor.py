@@ -88,6 +88,36 @@ def compute_qty(balance: float, entry: float, stop: float,
     return qty, (f"risk ${risk_usdt:.2f} / stop-dist {per_unit} -> qty {qty}")
 
 
+def compute_test_qty(fixed_margin_usdt: float, leverage: int, entry: float,
+                     filters: dict) -> tuple[float, str]:
+    """Fixed-margin test sizing. Returns (qty, note); qty == 0 means skip.
+
+    notional = fixed_margin_usdt * leverage; qty = notional / entry, floored
+    to stepSize, honoring minQty / minNotional. The per-symbol exposure cap
+    and the other risk gates still apply downstream in risk.check_can_open.
+    TEST ONLY - never used for live trading.
+    """
+    if fixed_margin_usdt is None or fixed_margin_usdt <= 0:
+        return 0.0, "fixed margin must be > 0"
+    if leverage is None or leverage <= 0:
+        return 0.0, "leverage must be > 0"
+    if entry is None or entry <= 0:
+        return 0.0, "entry must be > 0"
+    step = filters.get("stepSize", 0.0) or 0.0
+    min_qty = filters.get("minQty", 0.0) or 0.0
+    min_notional = filters.get("minNotional", 0.0) or 0.0
+    notional = fixed_margin_usdt * leverage
+    qty = floor_to_step(notional / entry, step)
+    if qty < min_qty:
+        return 0.0, (f"qty {qty} < minQty {min_qty} "
+                     f"(margin ${fixed_margin_usdt:.2f} x{leverage})")
+    if qty * entry < min_notional:
+        return 0.0, (f"notional ${qty * entry:.2f} < minNotional "
+                     f"${min_notional:.2f}")
+    return qty, (f"test margin ${fixed_margin_usdt:.2f} x{leverage} -> "
+                 f"notional ${notional:.2f} -> qty {qty}")
+
+
 def split_tp_qty(qty: float, step: float, min_qty: float,
                  ratios: tuple = config.TP_SPLIT) -> tuple[list[float], str] | tuple[None, str]:
     """Split qty across TP1..TP3 per ratios (floored to step, sum preserved).
@@ -123,7 +153,11 @@ class Executor:
                  lifecycle: LifecycleLogger | None = None,
                  universe: list[str] | None = None,
                  poll_interval_min: int = config.EXEC_POLL_INTERVAL_MIN,
-                 evaluate_fn=None):
+                 evaluate_fn=None,
+                 fixed_margin_usdt: float | None = None,
+                 leverage_override: int | None = None,
+                 leverage_tiers: dict | None = None,
+                 leverage_default: int | None = None):
         self.market = market
         self.exchange = exchange
         self.risk = risk
@@ -131,12 +165,42 @@ class Executor:
         self.lifecycle = lifecycle or LifecycleLogger()
         self.universe = universe or list(config.UNIVERSE)
         self.poll_interval_min = poll_interval_min
+        # TEST MODE overrides (never for live): fixed margin per position and
+        # explicit leverage, bypassing the RISK_PCT_PER_TRADE/MAX_LEVERAGE
+        # defaults. Risk gates (kill switch, caps) still apply downstream.
+        self.fixed_margin_usdt = fixed_margin_usdt
+        self.leverage_override = leverage_override
+        # Per-symbol leverage tiers (test mode). None -> config defaults.
+        self.leverage_tiers = leverage_tiers
+        self.leverage_default = leverage_default
+        if fixed_margin_usdt is not None or leverage_override is not None:
+            log.warning("TEST MODE: fixed_margin_usdt=%s leverage_override=%s "
+                        "- overrides RISK_PCT_PER_TRADE/MAX_LEVERAGE defaults",
+                        fixed_margin_usdt, leverage_override)
         if evaluate_fn is None:
             from signal_engine import evaluate_symbol as _ev
             evaluate_fn = _ev
         self.evaluate_fn = evaluate_fn
 
     # ------------------------------------------------------------- helpers
+    def _resolve_leverage(self, symbol: str) -> int:
+        """Leverage for a symbol. Resolution order:
+        1. explicit single override (--leverage),
+        2. per-symbol tier (test mode only),
+        3. normal risk default MAX_LEVERAGE.
+        """
+        if self.leverage_override:
+            return self.leverage_override
+        if self.fixed_margin_usdt is not None:
+            # CLI tiers merge over config tiers (CLI wins on conflict).
+            tiers = dict(config.TEST_LEVERAGE_TIERS)
+            if self.leverage_tiers:
+                tiers.update(self.leverage_tiers)
+            default = (self.leverage_default if self.leverage_default is not None
+                       else config.TEST_LEVERAGE_DEFAULT)
+            return tiers.get(symbol, default)
+        return min(config.MAX_LEVERAGE, 125)
+
     def _open_positions(self) -> dict:
         return {pid: p for pid, p in self.state.get("positions", {}).items()
                 if not p.get("closed")}
@@ -203,6 +267,80 @@ class Executor:
             summary["rejected"] += 1
 
     # ------------------------------------------------------------ open flow
+    def manual_entry(self, symbol: str, balance: float | None = None,
+                     atr_mult: float = 1.5) -> tuple[bool, str]:
+        """Manual market LONG entry (TEST ONLY).
+
+        BYPASSES every STRICT signal gate — no score, no MTF cascade, no
+        vetoes, no volume check. Only the mechanical safety layer still
+        applies: live-price freshness, symbol filters, leverage/margin
+        setup, fixed-margin sizing, risk gates (kill switch, caps), and
+        the standard SL/TP bracket machinery.
+
+        Levels: entry = live market price; SL = entry - atr_mult x ATR(15m);
+        TP1/2/3 at the config RR ladder (1.5 / 2.25 / 3.0). Idempotent per
+        15m candle via the signal id.
+        """
+        from data import normalize_symbol
+        from indicators import atr_wilder
+
+        symbol = normalize_symbol(symbol)
+        if not symbol:
+            return False, "unknown symbol"
+        # 1. Live price (fail-closed).
+        try:
+            live = self.market.get_live_price(symbol)
+        except Exception:  # noqa: BLE001
+            live = None
+        if live is None or live <= 0:
+            return False, "live price unavailable - holding (fail-closed)"
+        # 2. ATR from 15m candles (fail-closed on thin data).
+        try:
+            candles = self.market.get_klines(symbol, "15m", limit=60)
+        except Exception:  # noqa: BLE001
+            candles = []
+        if len(candles) < config.ATR_PERIOD + 2:
+            return False, (f"only {len(candles)} 15m candles - "
+                           f"need {config.ATR_PERIOD + 2} for ATR")
+        atr = atr_wilder(candles, config.ATR_PERIOD)
+        if not atr or atr <= 0:
+            return False, "ATR unavailable - holding (fail-closed)"
+        # 3. Bracket levels around the live price.
+        entry = float(live)
+        stop = entry - atr_mult * atr
+        risk_dist = entry - stop
+        signal = {
+            "symbol": symbol, "direction": "LONG", "interval": "15m",
+            "entry": entry, "entry_low": entry, "entry_high": entry,
+            "stop_loss": stop,
+            "tp1": entry + risk_dist * config.TP1_RR,
+            "tp2": entry + risk_dist * config.TP2_RR,
+            "tp3": entry + risk_dist * config.TP3_RR,
+            "quality": 0, "manual": True,
+            "note": "manual market entry - bypasses STRICT gates",
+        }
+        # 4. Idempotency per 15m candle; then the standard open flow.
+        close_ms = signal_candle_close_ms(self.market, symbol)
+        sid = f"{symbol}:manual:{close_ms}"
+        if self.state.seen_signal(sid):
+            return False, f"manual entry already attempted this candle ({sid})"
+        if balance is None:
+            try:
+                balance = self.exchange.get_balance()
+            except Exception:  # noqa: BLE001
+                balance = None
+        lev = self._resolve_leverage(symbol)
+        margin = self.fixed_margin_usdt
+        ok, note = self._try_open(symbol, signal, sid, balance)
+        if ok:
+            return True, (f"MANUAL LONG {symbol} @ {entry:.6g} "
+                          f"({lev}x isolated"
+                          f"{f', ${margin:.0f} margin' if margin else ''}) | "
+                          f"SL {stop:.6g} | "
+                          f"TP1 {signal['tp1']:.6g} TP2 {signal['tp2']:.6g} "
+                          f"TP3 {signal['tp3']:.6g} | {note}")
+        return False, f"manual entry rejected: {note}"
+
     def _try_open(self, symbol: str, signal: dict, sid: str,
                   balance: float | None) -> tuple[bool, str]:
         entry = float(signal["entry"])
@@ -225,13 +363,17 @@ class Executor:
         filters = self.exchange.get_symbol_filters(symbol)
         if not filters:
             return self._reject(symbol, sid, "symbol not tradable on exchange")
-        lev = min(config.MAX_LEVERAGE, 125)
+        lev = self._resolve_leverage(symbol)
         self.exchange.set_leverage(symbol, lev)
         self.exchange.set_margin_type(symbol, "ISOLATED")
 
         # 3. Sizing.
-        qty, note = compute_qty(balance, entry, float(signal["stop_loss"]),
-                                filters)
+        if self.fixed_margin_usdt is not None:
+            qty, note = compute_test_qty(self.fixed_margin_usdt, lev, entry,
+                                         filters)
+        else:
+            qty, note = compute_qty(balance, entry, float(signal["stop_loss"]),
+                                    filters)
         if qty <= 0:
             return self._reject(symbol, sid, f"sizing: {note}")
         notional = qty * entry
@@ -266,6 +408,8 @@ class Executor:
         self.state.get("positions", {})[pos_id] = {
             "symbol": symbol, "signal_id": sid, "direction": "LONG",
             "qty": qty, "entry_price": entry_px,
+            "leverage": lev,
+            "margin_usdt": round(qty * entry_px / lev, 2) if lev else 0.0,
             "stop_loss": float(signal["stop_loss"]),
             "tp": {
                 "tp1": {"price": float(signal["tp1"]), "qty": tp_qty[0],
@@ -408,13 +552,20 @@ class Executor:
         self.state.save()
 
     def _place_brackets(self, pos_id: str, pos: dict) -> bool:
-        """Place SL (STOP_MARKET) + TP1-3 (LIMIT, reduceOnly). All-or-nothing:
-        on any failure, cancel whatever was placed and return False."""
+        """Place SL (STOP_MARKET via Algo Order API) + TP1-3 (LIMIT, reduceOnly).
+        All-or-nothing: on any failure, cancel whatever was placed and False.
+
+        NOTE: Binance migrated conditional orders to /fapi/v1/algoOrder
+        (2025-12-09); /fapi/v1/order rejects STOP_MARKET with -4120.
+        """
         symbol = pos["symbol"]
-        placed: list[int] = []
+        placed_algo: list[int] = []
+        placed_regular: list[int] = []
 
         def _undo():
-            for oid in placed:
+            for aid in placed_algo:
+                self.exchange.cancel_algo_order(symbol, aid)
+            for oid in placed_regular:
                 self.exchange.cancel_order(symbol, order_id=oid)
 
         tick = None
@@ -427,15 +578,16 @@ class Executor:
         def _px(p: float) -> float:
             return round(p / tick) * tick if tick else p
 
-        sl = self.exchange.place_order(
+        sl = self.exchange.place_algo_order(
             symbol, "SELL", "STOP_MARKET", quantity=pos["qty"],
-            stop_price=_px(pos["stop_loss"]), reduce_only=True,
+            trigger_price=_px(pos["stop_loss"]), reduce_only=True,
             working_type="MARK_PRICE",
-            client_order_id=self._leg_id(pos_id, "SL"))
-        if not sl:
+            client_algo_id=self._leg_id(pos_id, "SL"))
+        if not sl or not sl.get("algoId"):
             return False
-        placed.append(sl["orderId"])
-        pos["sl_order_id"] = sl["orderId"]
+        placed_algo.append(sl["algoId"])
+        pos["sl_order_id"] = sl["algoId"]
+        pos["sl_is_algo"] = True
 
         for leg in ("tp1", "tp2", "tp3"):
             tp = pos["tp"][leg]
@@ -448,14 +600,36 @@ class Executor:
             if not o:
                 _undo()
                 pos["sl_order_id"] = None
+                pos["sl_is_algo"] = False
                 return False
-            placed.append(o["orderId"])
+            placed_regular.append(o["orderId"])
             tp["order_id"] = o["orderId"]
         return True
 
+    # ------------------------------------------------------- SL (algo) helpers
+    def _sl_cancel(self, symbol: str, pos: dict) -> bool:
+        """Cancel the SL leg, routing to the algo endpoint when needed."""
+        aid = pos.get("sl_order_id")
+        if not aid:
+            return True
+        if pos.get("sl_is_algo"):
+            return self.exchange.cancel_algo_order(symbol, aid)
+        return self.exchange.cancel_order(symbol, order_id=aid)
+
+    def _sl_status(self, symbol: str, pos: dict) -> dict | None:
+        """Fetch the SL leg's current state, or None."""
+        aid = pos.get("sl_order_id")
+        if not aid:
+            return None
+        if pos.get("sl_is_algo"):
+            return self.exchange.get_algo_order(symbol, aid)
+        return self.exchange.get_order(symbol, order_id=aid)
+
     def _move_sl_to_breakeven(self, pos_id: str, pos: dict, sid: str) -> None:
         symbol = pos["symbol"]
-        self.exchange.cancel_order(symbol, order_id=pos.get("sl_order_id"))
+        # Route through _sl_cancel: the working SL may be an algo order
+        # (sl_is_algo=True); cancel_order alone would leave it live.
+        self._sl_cancel(symbol, pos)
         tick = None
         try:
             tick = (self.exchange.get_symbol_filters(symbol) or {}).get("tickSize")
@@ -468,6 +642,7 @@ class Executor:
             client_order_id=self._leg_id(pos_id, "SLBE"))
         if sl:
             pos["sl_order_id"] = sl["orderId"]
+            pos["sl_is_algo"] = False  # breakeven leg is a regular STOP_MARKET
             pos["breakeven_moved"] = True
             pos["stop_loss"] = be
             log.info("%s SL moved to breakeven @ %s", pos_id, be)
@@ -488,8 +663,7 @@ class Executor:
             event, why = TP1_HIT, "tp1_hit (remainder)"
         else:
             # SL filled (or position vanished): check the SL order.
-            o = (self.exchange.get_order(symbol, order_id=pos.get("sl_order_id"))
-                 if pos.get("sl_order_id") else None)
+            o = self._sl_status(symbol, pos)
             if o and o.get("status") == "FILLED":
                 fill_px = float(o.get("avgPrice") or pos["stop_loss"])
                 pnl = (fill_px - pos["entry_price"]) * pos["qty"]
@@ -505,7 +679,7 @@ class Executor:
             if oid and not pos["tp"][leg]["filled"]:
                 self.exchange.cancel_order(symbol, order_id=oid)
         if pos.get("sl_order_id"):
-            self.exchange.cancel_order(symbol, order_id=pos["sl_order_id"])
+            self._sl_cancel(symbol, pos)
         pos["closed"] = True
         pos["closed_reason"] = why
         pos["closed_at"] = int(time.time() * 1000)
