@@ -80,6 +80,12 @@ def validate_settings(data: dict) -> dict:
     _bool("auto_trade")
     _bool("bullish_only")
     _bool("mtf_require_1d")
+    _bool("mtf_require_1h")
+    _bool("btc_align_required")
+    _bool("pattern_required")
+    _bool("news_check")
+    _bool("liq_review")
+    _bool("whale_review")
     _bool("breakeven_after_tp1")
     for code in config.DASH_VETO_CODES:
         _bool(f"veto_{code}")

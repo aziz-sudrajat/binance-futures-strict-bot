@@ -43,22 +43,26 @@ auto-trade jalan. TUI curses lama (`tui.py`) tetap ada sebagai alternatif.
 ## Mode sinyal: ketat / sedang / biasa
 
 `signal-mode` (atau dropdown "Mode sinyal" di web dashboard, atau
-`set signal_mode <mode>`) menerapkan preset ke knob-knob signal & veto:
+`set signal_mode <mode>`) menerapkan preset berlapis:
 
 | | ketat | sedang | biasa |
 |---|---|---|---|
+| **15m indikator** (MACD, MA/EMA, RSI) | ✅ | ✅ | ✅ |
+| **MTF 4h/1h/30m/15m selaras** | ✅ | ✅ | — |
+| **Arah BTC selaras** | ✅ | ✅ | — |
+| **Pattern** (engulfing/hammer/star) | ✅ | — | — |
+| **News** (sentimen CoinTelegraph) | ✅ | — | — |
+| **Likuidasi** (spike review) | ✅ | — | — |
+| **Whale** (top-trader review) | ✅ | — | — |
+| **Veto + derivatif + quality gate** | ✅ (≥70) | — | — |
 | Min quality | 70 | 60 | 50 |
-| MTF 30m | STRICT | LEAN | LEAN |
-| MTF 1d leg | hard gate | hard gate | soft delta (bonus/penalti skor) |
 | Bullish only | ya | ya | tidak (LONG+SHORT) |
 | Min volume 24h | $2jt | $1jt | $500rb |
 | Freshness drift | 0.4% | 0.6% | 1.0% |
-| Veto aktif | semua (6) | semua kecuali liq-wall | leverage + funding saja |
 
-Mode `biasa` itu bidirectional: setup BEARISH WATCH yang lolos semua gate
-(mirror dari pipeline LONG: cascade bearish, veto bearish, freshness
-mirror) jadi signal SHORT dan dieksekusi sebagai posisi short di Binance.
-`ketat`/`sedang` tetap LONG-only (paritas GAS).
+- `biasa`: sinyal = setup 15m saja (MACD, MA/EMA, RSI). Bidirectional.
+- `sedang`: biasa + semua TF (4h, 1h, 30m, 15m) harus satu arah + arah BTC 15m harus sama.
+- `ketat`: sedang + review pattern, news, likuidasi, whale, + veto/derivatif/quality gate penuh.
 
 Mode adalah preset, bukan kunci — knob individual tetap bisa di-fine-tune
 manual setelahnya (`set` / editor `setting`). Berlaku tanpa restart.
