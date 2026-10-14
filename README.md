@@ -305,6 +305,7 @@ Isi dashboard (auto-refresh 5 detik):
 | 🎯 Signal | min quality score, MTF 30m mode, bullish-only, min volume, freshness |
 | 🛡️ TP & SL | TP1/2/3 (x risk), stop ATR min/max, split TP, breakeven toggle |
 | ⚙️ Order | margin mode (ISOLATED/CROSS), leverage (1–125, auto/fixed), entry (risk % / fixed USDT) |
+| 🌐 Universe | 55 coin curated, atau top-N coin by volume 24h (10–100) |
 | ⛔ Vetoes | 6 hard veto bisa di on/off (default semua ON) |
 | Posisi Terbuka | entry, SL, TP tiap posisi |
 | Event Terakhir | approved / rejected / TP hit / SL hit + alasannya |
@@ -313,6 +314,17 @@ Isi dashboard (auto-refresh 5 detik):
 setting sendiri — ganti tab, atur, simpan. Contoh: demo pakai leverage
 20x fixed 50 USDT, live tetap 3x risk-based. Default semua mode = profil
 aman (isolated, auto leverage ≤3x, entry ikut risiko 1%).
+
+**Universe (kartu 🌐).** Dua mode:
+
+- *curated* — 55 coin liquid (BTC, ETH, SOL, … sampai meme coin bervolume)
+- *top_volume* — top-N coin berdasarkan volume 24h aktual dari exchange
+  (N = 10–100, default 30). Daftar diambil fresh tiap scan; kalau fetch
+  gagal, otomatis fallback ke curated list.
+
+Satu coin yang error/delist tidak pernah menghentikan scan — dilewati
+saja. Catatan: scan harfiah 400+ coin Binance tiap 5 menit tidak
+feasible (rate limit), jadi top-100 adalah batas praktis "hampir semua".
 
 **Kontrol order penuh (kartu ⚙️ Order):**
 
@@ -588,7 +600,7 @@ jalan 24/7 di Termux.
 
 ### Pre-deploy checklist (from the quant-trading skill)
 
-- [ ] Full test suite green (`pytest tests/ -q`) — currently 212 passed.
+- [ ] Full test suite green (`pytest tests/ -q`) — currently 225 passed.
 - [ ] Paper-mode smoke run completed with no errors.
 - [ ] Testnet key created by the user; `--testnet --once` places/cancels cleanly.
 - [ ] Kill switch verified on testnet (force a >3% day or lower the cap temporarily).
