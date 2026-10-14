@@ -295,6 +295,41 @@ def scanner_status() -> dict:
     return out
 
 
+# (key, label, kind) — kind: bool | int | float | choice:A,B,C
+# Canonical settings field spec shared by the dashboard, TUI and the
+# `binance` terminal shell.
+SETTING_FIELDS: list[tuple[str, str, str]] = [
+    ("auto_trade", "Auto-trade", "bool"),
+    ("universe_mode", "Universe mode", "choice:curated,top_volume"),
+    ("universe_top_n", "Universe top N", "int"),
+    ("risk_pct_per_trade", "Risk %/trade", "float"),
+    ("max_leverage", "Max leverage", "int"),
+    ("poll_interval_min", "Scan interval (min)", "int"),
+    ("min_quality_score", "Min quality score", "int"),
+    ("mtf_30m_mode", "MTF 30m mode", "choice:STRICT,LEAN"),
+    ("bullish_only", "Bullish only", "bool"),
+    ("min_24h_volume_usd", "Min 24h volume USD", "float"),
+    ("freshness_max_drift_pct", "Freshness drift %", "float"),
+    ("tp1_rr", "TP1 (x risk)", "float"),
+    ("tp2_rr", "TP2 (x risk)", "float"),
+    ("tp3_rr", "TP3 (x risk)", "float"),
+    ("stop_atr_min", "Stop ATR min", "float"),
+    ("stop_atr_max", "Stop ATR max", "float"),
+    ("breakeven_after_tp1", "Breakeven after TP1", "bool"),
+    ("margin_mode", "Margin mode", "choice:ISOLATED,CROSS"),
+    ("leverage_mode", "Leverage mode", "choice:auto,fixed"),
+    ("leverage", "Leverage 1-125", "int"),
+    ("entry_mode", "Entry mode", "choice:risk,fixed_usdt"),
+    ("fixed_usdt", "Fixed USDT / posisi", "float"),
+    ("veto_leverage_risk", "Veto: leverage risk", "bool"),
+    ("veto_funding", "Veto: funding extreme", "bool"),
+    ("veto_squeeze", "Veto: squeeze risk", "bool"),
+    ("veto_whale", "Veto: whale divergence", "bool"),
+    ("veto_liq_wall", "Veto: liquidity wall", "bool"),
+    ("veto_btc_breaker", "Veto: BTC breaker", "bool"),
+]
+
+
 def run_radar(mode: str = "live") -> list[dict]:
     """Signal Radar: evaluate the whole universe with the CURRENT studio
     settings and rank by quality (approved first). Uses the real engine —
