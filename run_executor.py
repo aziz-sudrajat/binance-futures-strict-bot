@@ -192,6 +192,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="single scan cycle then exit")
     ap.add_argument("--loop", action="store_true",
                     help="run scan cycles forever")
+    ap.add_argument("--from-db", action="store_true",
+                    help="two-stage mode: execute fresh signals from signals.db "
+                         "(written by scanner.py) instead of scanning the "
+                         "market directly")
+    ap.add_argument("--db", default="signals.db",
+                    help="signal database path (default signals.db)")
     ap.add_argument("--interval", type=int,
                     default=config.EXEC_POLL_INTERVAL_MIN,
                     help="minutes between scans")
@@ -258,10 +264,11 @@ def main(argv: list[str] | None = None) -> int:
         print(note, flush=True)
         return 0 if ok else 1
     if args.once:
-        summary = executor.scan_once()
+        summary = (executor.scan_from_db(args.db) if args.from_db
+                   else executor.scan_once())
         log.info("once summary: %s", summary)
     else:
-        executor.run_loop()
+        executor.run_loop(from_db=args.from_db, db_path=args.db)
     return 0
 
 
