@@ -25,3 +25,6 @@ dashboard_settings.json
 # Mode key files (filled by the user, never commit)
 .env.live
 .env.demo
+
+signals.db
+scanner_state.json
