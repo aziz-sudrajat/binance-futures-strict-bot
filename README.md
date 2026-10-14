@@ -264,7 +264,31 @@ Flag eksplisit (`--live`, `--testnet`, `--mode live`) selalu menang atas
 `--live` **menolak** semua flag TEST ONLY (`--fixed-margin-usdt`,
 `--leverage*`, `--manual`) dan tidak akan fallback ke testnet/paper.
 
-### 6. Dashboard Trading Studio
+### 7. Dashboard Trading Studio — dua pilihan UI
+
+**A. TUI — murni di terminal (tanpa browser):**
+
+```bash
+.venv/bin/python tui.py              # mode ikut $BOT_MODE
+.venv/bin/python tui.py --mode live  # paksa mode
+```
+
+Tampilan live auto-refresh 5 detik: saldo, PnL harian, kill switch,
+posisi terbuka, event terakhir. Tombol:
+
+| Tombol | Fungsi |
+|---|---|
+| `1` `2` `3` | ganti mode live / testnet / paper |
+| `r` | Signal Radar (scan 9 coin, ranking terkuat, jalan di background) |
+| `s` | editor setting (semua knob: signal, TP/SL, order, vetoes) |
+| `a` | toggle auto-trade |
+| `q` | keluar |
+
+Di layar setting: `↑↓`/`jk` pilih, `spasi` toggle/pindah pilihan,
+`enter` edit angka, `s` kembali. Semua perubahan tersimpan otomatis dan
+berlaku di scan berikutnya tanpa restart bot.
+
+**B. Web UI — via browser HP:**
 
 ```bash
 .venv/bin/python dashboard.py --mode live --port 8080
@@ -303,7 +327,7 @@ veto aktif tetap berlaku apa pun setting order-nya.
 Semua setting tersimpan di `dashboard_settings.json` dan **langsung
 berlaku di scan berikutnya tanpa restart bot**.
 
-### 7. Menjalankan 24/7 di Termux
+### 8. Menjalankan 24/7 di Termux
 
 ```bash
 termux-wake-lock          # cegah Android membunuh proses
@@ -318,7 +342,18 @@ tmux new -s dash          # tab 2: dashboard
 Matikan **battery optimization** untuk aplikasi Termux di Settings Android.
 Untuk melihat lagi: `tmux attach -t bot`.
 
-### 8. Update ke versi terbaru
+**Pola yang disarankan (3 tab tmux):**
+
+| Tab | Perintah | Fungsi |
+|---|---|---|
+| `bot` | `.venv/bin/python run_executor.py --loop` | mesin trading (ikut `$BOT_MODE`) |
+| `tui` | `.venv/bin/python tui.py` | UI terminal live — monitor + ubah setting |
+| `dash` | `.venv/bin/python dashboard.py --port 8080` | UI browser (opsional) |
+
+TUI dan web dashboard membaca/menulis file setting yang sama dengan
+bot, jadi perubahan dari mana pun langsung berlaku di scan berikutnya.
+
+### 9. Update ke versi terbaru
 
 ```bash
 cd binance-futures-strict-bot
@@ -326,7 +361,7 @@ git pull
 .venv/bin/pip install -r requirements.txt   # kalau ada deps baru
 ```
 
-### 9. Troubleshooting
+### 10. Troubleshooting
 
 | Gejala | Penyebab & solusi |
 |---|---|
@@ -553,7 +588,7 @@ jalan 24/7 di Termux.
 
 ### Pre-deploy checklist (from the quant-trading skill)
 
-- [ ] Full test suite green (`pytest tests/ -q`) — currently 205 passed.
+- [ ] Full test suite green (`pytest tests/ -q`) — currently 212 passed.
 - [ ] Paper-mode smoke run completed with no errors.
 - [ ] Testnet key created by the user; `--testnet --once` places/cancels cleanly.
 - [ ] Kill switch verified on testnet (force a >3% day or lower the cap temporarily).
