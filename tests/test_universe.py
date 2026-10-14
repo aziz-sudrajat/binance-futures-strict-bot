@@ -81,7 +81,7 @@ def test_universe_settings_validate():
 
 
 @pytest.mark.parametrize("bad", [
-    {"universe_mode": "all"},
+    {"universe_mode": "bogus"},
     {"universe_top_n": 5},
     {"universe_top_n": 101},
     {"universe_top_n": "banyak"},
@@ -89,3 +89,88 @@ def test_universe_settings_validate():
 def test_universe_settings_reject(bad):
     with pytest.raises(ValueError):
         validate_settings(bad)
+
+
+@pytest.mark.parametrize("mode", ["curated", "top_volume", "top_movers", "all"])
+def test_universe_settings_accept_all_modes(mode):
+    out = validate_settings({"universe_mode": mode})
+    assert out["universe_mode"] == mode
+
+
+# ------------------------------------------------ top_movers (GAS parity)
+
+def _movers_market(tickers, symbols=None):
+    class M:
+        def get_swap_tickers(self):
+            return tickers
+
+        def list_okx_swap_symbols(self):
+            return symbols if symbols is not None else []
+    return M()
+
+
+MOVERS_TICKERS = [
+    # symbol, base, vol_usd_24h, chg_pct_24h
+    {"symbol": "PUMPUSDT", "base": "PUMP", "last": 2.0,
+     "vol_usd_24h": 50_000_000, "chg_pct_24h": 40.0},   # top mover
+    {"symbol": "DUMPUSDT", "base": "DUMP", "last": 1.0,
+     "vol_usd_24h": 50_000_000, "chg_pct_24h": -35.0},  # 2nd (|chg|)
+    {"symbol": "CALMUSDT", "base": "CALM", "last": 1.0,
+     "vol_usd_24h": 500_000_000, "chg_pct_24h": 1.0},   # huge vol, tiny move
+    {"symbol": "USDCUSDT", "base": "USDC", "last": 1.0,
+     "vol_usd_24h": 900_000_000, "chg_pct_24h": 25.0},  # stablecoin -> out
+    {"symbol": "QUIETUSDT", "base": "QUIET", "last": 1.0,
+     "vol_usd_24h": 100_000, "chg_pct_24h": 60.0},      # below min vol -> out
+]
+
+
+def test_select_top_movers_ranking_and_filters():
+    from executor import select_top_movers
+    out = select_top_movers(MOVERS_TICKERS, 10, min_vol_usd=500_000)
+    # |40|*log10(50M) > |35|*log10(50M) > |1|*log10(500M); stables & quiet cut
+    assert out == ["PUMPUSDT", "DUMPUSDT", "CALMUSDT"]
+    assert "USDCUSDT" not in out
+    assert "QUIETUSDT" not in out
+
+
+def test_select_top_movers_n_clamped():
+    from executor import select_top_movers
+    assert select_top_movers(MOVERS_TICKERS, 1, 0) == ["PUMPUSDT"]
+    assert select_top_movers([], 10, 0) == []
+
+
+def test_resolve_top_movers():
+    syms = resolve_universe(object(),
+                            {"universe_mode": "top_movers",
+                             "universe_top_n": 10,
+                             "min_24h_volume_usd": 500_000},
+                            market=_movers_market(MOVERS_TICKERS))
+    assert syms == ["PUMPUSDT", "DUMPUSDT", "CALMUSDT"]
+
+
+def test_resolve_top_movers_failure_falls_back():
+    class Bad:
+        def get_swap_tickers(self):
+            raise RuntimeError("no network")
+    assert resolve_universe(object(), {"universe_mode": "top_movers"},
+                            market=Bad()) == config.UNIVERSE
+
+
+def test_resolve_all():
+    syms = resolve_universe(
+        object(), {"universe_mode": "all"},
+        market=_movers_market([], symbols=["BTCUSDT", "USDCUSDT", "ETHUSDT"]))
+    assert syms == ["BTCUSDT", "ETHUSDT"]  # stables excluded
+
+
+def test_resolve_all_failure_falls_back():
+    class Bad:
+        def list_okx_swap_symbols(self):
+            raise RuntimeError("no network")
+    assert resolve_universe(object(), {"universe_mode": "all"},
+                            market=Bad()) == config.UNIVERSE
+
+
+def test_resolve_unknown_mode_falls_back_to_curated():
+    assert resolve_universe(object(), {"universe_mode": "bogus"}) == \
+        config.UNIVERSE

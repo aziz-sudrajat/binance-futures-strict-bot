@@ -61,6 +61,22 @@ mirror) jadi signal SHORT dan dieksekusi sebagai posisi short di Binance.
 Mode adalah preset, bukan kunci — knob individual tetap bisa di-fine-tune
 manual setelahnya (`set` / editor `setting`). Berlaku tanpa restart.
 
+## Universe: curated / top_volume / top_movers / all
+
+`set universe_mode <mode>` (atau dropdown web dashboard, atau editor `setting`):
+
+| Mode | Isi | Catatan |
+|---|---|---|
+| `curated` | 55 coin liquid bawaan | default lama |
+| `top_volume` | top-N by volume 24h (N = `universe_top_n`, 10–100) | butuh koneksi exchange |
+| `top_movers` | top-N by \|% 24h\| × log(volume) dari OKX (GAS parity) | **default baru** — mancing di tempat volatil |
+| `all` | semua perpetual USDT OKX (~485 coin, stablecoin dikecualikan) | scan penuh beberapa menit |
+
+`top_movers` meniru `getTopMovers_` di GAS: coin yang paling bergerak
+(pump/dump) dengan volume cukup — di sanalah signal biasanya muncul.
+`scan all` di terminal memaksa sekali-scan universe penuh tanpa mengubah
+setting tersimpan. Semua mode fail-safe: gagal fetch → fallback curated.
+
 Port of the **decision pipeline** from the GAS signal bot
 (`workspace/user/files/AZZATSSINS-20261013-imageperf-v4_5_02o2.gs`, 8.659 lines)
 to Python. Only the STRICT signal logic is ported — the autopost/publishing
@@ -360,7 +376,7 @@ Isi dashboard (auto-refresh 5 detik):
 | 🎯 Signal | min quality score, MTF 30m mode, bullish-only, min volume, freshness |
 | 🛡️ TP & SL | TP1/2/3 (x risk), stop ATR min/max, split TP, breakeven toggle |
 | ⚙️ Order | margin mode (ISOLATED/CROSS), leverage (1–125, auto/fixed), entry (risk % / fixed USDT) |
-| 🌐 Universe | 55 coin curated, atau top-N coin by volume 24h (10–100) |
+| 🌐 Universe | curated (55 coin), top-N volume, top-N movers (GAS), atau semua perpetual OKX |
 | ⛔ Vetoes | 6 hard veto bisa di on/off (default semua ON) |
 | Posisi Terbuka | entry, SL, TP tiap posisi |
 | Event Terakhir | approved / rejected / TP hit / SL hit + alasannya |

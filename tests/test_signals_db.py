@@ -63,3 +63,46 @@ def test_to_signal_roundtrip(tmp_path):
     assert sig["symbol"] == "BTCUSDT"
     assert sig["tp3"] == 106.0
     db.close()
+
+
+def _sig_strength(sym="BTCUSDT", q=98.0, strength=5):
+    s = _sig(sym, q)
+    s["strength"] = strength
+    return s
+
+
+def test_strength_migration_and_ordering(tmp_path):
+    db = SignalDB(str(tmp_path / "s.db"))
+    # same quality -> stronger strength wins, then earliest id
+    db.upsert_signal(_sig_strength("AAAUSDT", 98.0, 4), "S1", expiry_min=30)
+    db.upsert_signal(_sig_strength("BBBUSDT", 98.0, 5), "S2", expiry_min=30)
+    db.upsert_signal(_sig_strength("CCCUSDT", 98.0, 5), "S3", expiry_min=30)
+    fresh = db.get_fresh_signals()
+    assert [f["symbol"] for f in fresh] == ["BBBUSDT", "CCCUSDT", "AAAUSDT"]
+    assert fresh[0]["strength"] == 5
+    db.close()
+
+
+def test_migration_on_existing_db_without_strength(tmp_path):
+    import sqlite3
+    import signals_db as sdb
+    p = str(tmp_path / "old.db")
+    # realistic "old" DB: previous code version's schema (no strength column —
+    # the CREATE TABLE never had it; only _migrate adds it)
+    conn = sqlite3.connect(p)
+    conn.executescript(sdb.SCHEMA)
+    conn.execute("INSERT INTO signals (symbol, signal_id, direction, quality,"
+                 " created_at, expires_at, status)"
+                 " VALUES ('BTCUSDT','OLD','LONG',80,1,9999999999999,'new')")
+    conn.commit()
+    conn.close()
+    conn = sqlite3.connect(p)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(signals)")]
+    assert "strength" not in cols  # old code never created it
+    conn.close()
+    db = SignalDB(p)  # must not crash; column added by _migrate
+    cols = {r["name"] for r in db._conn.execute("PRAGMA table_info(signals)")}
+    assert "strength" in cols
+    fresh = db.get_fresh_signals()
+    assert len(fresh) == 1 and fresh[0]["symbol"] == "BTCUSDT"
+    db.close()
