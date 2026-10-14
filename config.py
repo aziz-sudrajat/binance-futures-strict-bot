@@ -172,6 +172,11 @@ UNIVERSE = [
 UNIVERSE_TOP_N_DEFAULT = 30
 UNIVERSE_TOP_N_MAX = 100
 
+# ------------------------------------------------------- signal cache (DB)
+# Two-stage pipeline: scanner.py scans ALL OKX coins -> signals.db;
+# run_executor.py --from-db executes the freshest signals from the DB.
+DB_SCAN_LIMIT = 20  # max fresh signals considered per executor cycle
+
 # ------------------------------------------------------------ data / caching
 # GAS: klinesTtlSec_ per interval (L418-428), DERIVATIVES_CACHE_SECONDS=120 (L50)
 KLINES_TTL_SEC = {"5m": 300, "15m": 480, "30m": 720, "1h": 1200, "4h": 2400, "1d": 7200}
