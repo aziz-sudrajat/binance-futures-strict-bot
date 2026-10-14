@@ -39,6 +39,8 @@ import dashboard
 # (key, label, kind) — kind: bool | int | float | choice:A,B,C
 FIELDS: list[tuple[str, str, str]] = [
     ("auto_trade", "Auto-trade", "bool"),
+    ("universe_mode", "Universe mode", "choice:curated,top_volume"),
+    ("universe_top_n", "Universe top N", "int"),
     ("risk_pct_per_trade", "Risk %/trade", "float"),
     ("max_leverage", "Max leverage", "int"),
     ("poll_interval_min", "Scan interval (min)", "int"),
