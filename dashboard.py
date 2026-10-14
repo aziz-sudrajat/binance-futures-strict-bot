@@ -264,6 +264,37 @@ def _fmt_ts(ts_ms: int) -> str:
         return "-"
 
 
+def scanner_status() -> dict:
+    """Scanner (stage 1) status + fresh signals from signals.db."""
+    out: dict = {"state": None, "db": {"fresh": 0}, "signals": []}
+    try:
+        with open("scanner_state.json", encoding="utf-8") as f:
+            out["state"] = json.load(f)
+    except (OSError, ValueError):
+        pass
+    try:
+        from signals_db import SignalDB
+        db = SignalDB("signals.db")
+        try:
+            db.expire_old()
+            out["db"] = db.stats()
+            rows = db.get_fresh_signals(limit=20)
+            now_ms = int(time.time() * 1000)
+            out["signals"] = [{
+                "symbol": r["symbol"],
+                "direction": r["direction"],
+                "quality": r["quality"],
+                "entry": r["entry"],
+                "age_min": round((now_ms - r["created_at"]) / 60000, 1),
+                "expires_min": round((r["expires_at"] - now_ms) / 60000, 1),
+            } for r in rows]
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001 - db may not exist yet
+        pass
+    return out
+
+
 def run_radar(mode: str = "live") -> list[dict]:
     """Signal Radar: evaluate the whole universe with the CURRENT studio
     settings and rank by quality (approved first). Uses the real engine —
@@ -451,6 +482,12 @@ th{color:#8b949e;font-weight:600}
   <button class="save" id="scan" style="margin-top:0">Scan Signal Sekarang</button>
   <div id="radar"><span class="dim">belum di-scan</span></div>
 </div>
+<div class="card"><h2>🛰️ Scanner (OKX → DB)</h2>
+  <div class="dim" style="font-size:13px;margin-bottom:8px">scanner.py
+  (tahap 1) scan SEMUA coin OKX lalu tulis signal bagus ke signals.db;
+  executor --from-db (tahap 2) eksekusi yang fresh dari DB.</div>
+  <div id="scanner"><span class="dim">memuat…</span></div>
+</div>
 <div class="card"><h2>Auto Trade</h2>
   <div class="setrow"><label><b>Auto-trade aktif</b><br>
     <span class="dim" style="font-size:12px">OFF = scan tetap jalan tapi
@@ -567,6 +604,7 @@ function setTab(){
 }
 async function refresh(){
   setTab();
+  try{ refreshScanner(); }catch(e){}
   try{
     const s = await (await fetch('/api/status?mode='+mode)).json();
     $('m-mode').textContent = s.mode.toUpperCase() +
@@ -706,6 +744,35 @@ $('save').onclick = ()=>{
     fixed_usdt:parseFloat($('s-fixedu').value),
   });
 };
+async function refreshScanner(){
+  const el = $('scanner');
+  try{
+    const r = await (await fetch('/api/scanner')).json();
+    const st = r.state, db = r.db || {};
+    let h = '';
+    if(st){
+      const ago = st.at ? Math.round((Date.now()-st.at)/60000) : '?';
+      h += '<div class="row"><span>Pass terakhir</span><b>'+ago+' mnt lalu</b></div>'+
+        '<div class="row"><span>Coin di-scan</span><b>'+st.symbols+'</b></div>'+
+        '<div class="row"><span>Approved / error</span><b class="green">'+
+        st.approved+'</b> / <b class="red">'+st.errors+'</b></div>';
+    }else{
+      h += '<div class="dim">scanner belum pernah jalan</div>';
+    }
+    h += '<div class="row"><span>Signal fresh di DB</span><b>'+
+      (db.fresh||0)+'</b></div>';
+    const sigs = r.signals || [];
+    if(sigs.length){
+      h += '<table><tr><th>Symbol</th><th>Dir</th><th>Q</th>'+
+        '<th>Entry</th><th>Umur</th></tr>'+
+        sigs.map(x=>'<tr><td><b>'+x.symbol+'</b></td><td>'+
+          x.direction+'</td><td><b class="green">'+x.quality+'</b></td><td>'+
+          (+x.entry).toFixed(4)+'</td><td class="dim">'+x.age_min+'m</td></tr>'
+        ).join('')+'</table>';
+    }
+    el.innerHTML = h;
+  }catch(e){ el.innerHTML='<span class="red">✗</span>'; }
+}
 $('scan').onclick = async ()=>{
   $('scan').disabled=true; $('scan').textContent='Scanning…';
   $('radar').innerHTML='<span class="dim">menghubungi exchange…</span>';
@@ -775,6 +842,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/radar":
             try:
                 self._json(200, run_radar(mode=self._mode()))
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"error": str(e)})
+        elif path == "/api/scanner":
+            try:
+                self._json(200, scanner_status())
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"error": str(e)})
         else:
