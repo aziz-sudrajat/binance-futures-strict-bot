@@ -133,13 +133,17 @@ class RiskManager:
 # ---------------------------------------------------------------------------
 
 class PaperBroker:
-    """Simulated futures broker. LONG-only (STRICT engine is bullish-only).
+    """Simulated futures broker. Supports LONG and SHORT positions.
 
     Orders rest until the live price touches them:
       BUY  MARKET        -> fills immediately at live price
+      SELL MARKET        -> fills immediately at live price
       BUY  LIMIT @p      -> fills when live <= p
-      SELL LIMIT @p (reduceOnly) -> fills when live >= p   (take-profits)
-      SELL STOP_MARKET @s (reduceOnly) -> fills when live <= s (stop-loss)
+      SELL LIMIT @p      -> fills when live >= p
+      BUY  STOP_MARKET @s (reduceOnly) -> fills when live >= s (short stop)
+      SELL STOP_MARKET @s (reduceOnly) -> fills when live <= s (long stop)
+
+    Position qty is signed: positive = LONG, negative = SHORT.
     """
 
     _ids = itertools.count(1)
@@ -159,10 +163,12 @@ class PaperBroker:
     def get_positions(self) -> list[dict]:
         out = []
         for symbol, p in self.positions.items():
-            if p["qty"] <= 0:
+            if p["qty"] == 0:
                 continue
             out.append({
-                "symbol": symbol, "side": "LONG", "qty": p["qty"],
+                "symbol": symbol,
+                "side": "LONG" if p["qty"] > 0 else "SHORT",
+                "qty": abs(p["qty"]),
                 "entry_price": p["avg_price"], "unrealized_pnl": 0.0,
                 "leverage": config.MAX_LEVERAGE,
             })
@@ -200,8 +206,10 @@ class PaperBroker:
         live = self._price_fn(symbol)
         if type == "MARKET" and live:
             self._fill(order, live)
-        else:
-            self.orders[oid] = order
+        # Always store the order: the executor polls entry fills via
+        # get_order(), and an immediately-filled MARKET order must be
+        # visible there too (otherwise brackets are never placed).
+        self.orders[oid] = order
         return {"orderId": oid, "clientOrderId": order["clientOrderId"],
                 "status": order["status"]}
 
@@ -230,6 +238,47 @@ class PaperBroker:
                 if o["status"] == "NEW"
                 and (symbol is None or o["symbol"] == symbol)]
 
+    # ------------------------------------------- algo (conditional) orders
+    # Paper mirror of the Algo Order API. Simulated fills treat conditional
+    # orders like their regular counterparts (STOP_MARKET fills like the
+    # paper STOP_MARKET branch in poll()).
+    def place_algo_order(self, symbol: str, side: str, type: str,
+                         quantity: float | None = None,
+                         trigger_price: float | None = None,
+                         price: float | None = None,
+                         reduce_only: bool = False,
+                         working_type: str = "MARK_PRICE",
+                         time_in_force: str = "GTE_GTC",
+                         client_algo_id: str | None = None) -> dict | None:
+        o = self.place_order(symbol, side, type, quantity=quantity,
+                             price=price,
+                             stop_price=trigger_price,
+                             reduce_only=reduce_only,
+                             working_type=working_type,
+                             client_order_id=client_algo_id)
+        if not o:
+            return None
+        oid = o["orderId"]
+        self.orders[oid]["algoId"] = oid
+        return {"algoId": oid, "symbol": symbol, "side": side, "type": type,
+                "status": self.orders[oid]["status"]}
+
+    def get_algo_order(self, symbol: str, algo_id: int) -> dict | None:
+        o = self.orders.get(algo_id)
+        if o and o["symbol"] == symbol:
+            d = dict(o)
+            d["algoStatus"] = d.get("status")
+            return d
+        return None
+
+    def cancel_algo_order(self, symbol: str, algo_id: int) -> bool:
+        return self.cancel_order(symbol, order_id=algo_id)
+
+    def get_open_algo_orders(self, symbol: str | None = None) -> list[dict]:
+        return [dict(o) for o in self.orders.values()
+                if o["status"] == "NEW" and o.get("algoId") is not None
+                and (symbol is None or o["symbol"] == symbol)]
+
     # ------------------------------------------------------------- matching
     def poll(self, symbols: list[str]) -> list[dict]:
         """Advance the simulation: fill resting orders against live prices.
@@ -253,6 +302,9 @@ class PaperBroker:
                 elif (o["type"] == "STOP_MARKET" and o["side"] == "SELL"
                       and live <= o["stopPrice"]):
                     fill_px = o["stopPrice"]
+                elif (o["type"] == "STOP_MARKET" and o["side"] == "BUY"
+                      and live >= o["stopPrice"]):
+                    fill_px = o["stopPrice"]
                 if fill_px:
                     fills.append(self._fill(o, fill_px))
         return fills
@@ -263,20 +315,26 @@ class PaperBroker:
         qty = order["origQty"]
         fee = fill_px * qty * self.fee_pct / 100
         symbol = order["symbol"]
+        signed = qty if order["side"] == "BUY" else -qty
         if not order["reduceOnly"]:
             pos = self.positions.setdefault(
                 symbol, {"qty": 0.0, "avg_price": 0.0})
-            new_qty = pos["qty"] + qty
+            new_qty = pos["qty"] + signed
             pos["avg_price"] = (
-                (pos["avg_price"] * pos["qty"] + fill_px * qty) / new_qty
-                if new_qty > 0 else 0.0)
+                (pos["avg_price"] * pos["qty"] + fill_px * signed) / new_qty
+                if new_qty != 0 else 0.0)
             pos["qty"] = new_qty
             self.balance -= fee
         else:
             pos = self.positions.get(symbol, {"qty": 0.0, "avg_price": 0.0})
-            close_qty = min(qty, pos["qty"])
-            pnl = (fill_px - pos["avg_price"]) * close_qty - fee
-            pos["qty"] -= close_qty
+            close_qty = min(qty, abs(pos["qty"]))
+            # LONG (qty>0): (fill - avg) * qty; SHORT (qty<0): (avg - fill) * qty
+            sign = 1.0 if pos["qty"] > 0 else -1.0
+            pnl = sign * (fill_px - pos["avg_price"]) * close_qty - fee
+            if pos["qty"] > 0:
+                pos["qty"] -= close_qty  # LONG: sells reduce toward zero
+            else:
+                pos["qty"] += close_qty  # SHORT: buys reduce toward zero
             self.balance += pnl
             self.realized_pnl += pnl
             order["realizedPnl"] = pnl
