@@ -60,3 +60,31 @@ class LifecycleLogger:
         except FileNotFoundError:
             pass
         return events
+
+    def last_event_ts(self) -> int | None:
+        """Newest event timestamp (ms), or None when the log is empty/missing.
+
+        Reads only the tail of the file so workers can compare against a
+        watermark without parsing the whole log.
+        """
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                # Walk back over at most the last 4KB to find the last line.
+                step = min(size, 4096)
+                f.seek(size - step)
+                tail = f.read().decode("utf-8", errors="replace")
+        except FileNotFoundError:
+            return None
+        for line in reversed(tail.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ts = json.loads(line).get("ts")
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if isinstance(ts, (int, float)):
+                return int(ts)
+        return None

@@ -286,12 +286,38 @@ def test_breakeven_after_tp1(rig):
     pos = executor._open_positions()[pos_id]
     assert pos["breakeven_moved"] is True
     assert pos["sl_order_id"] != old_sl
-    new_sl = exchange.get_order("BTCUSDT", order_id=pos["sl_order_id"])
-    assert new_sl["stopPrice"] == pos["entry_price"]  # == 100.0 (breakeven)
+    # breakeven SL goes through the algo endpoint (HTTP 400 -4120 forbids
+    # STOP_MARKET on /fapi/v1/order)
+    assert pos["sl_is_algo"] is True
+    new_sl = exchange.get_algo_order("BTCUSDT", pos["sl_order_id"])
+    assert new_sl["triggerPrice"] == pos["entry_price"]  # == 100.0 (breakeven)
     # the original SL was an algo order -> must be canceled via the algo route
     assert exchange.get_algo_order("BTCUSDT", old_sl)["status"] == "CANCELED"
     states = [e["state"] for e in lifecycle.read_all()]
     assert "tp1_hit" in states
+
+
+def test_breakeven_failure_keeps_original_sl(rig, monkeypatch):
+    """Regression: if the breakeven algo SL fails (-4120-style), the original
+    SL must stay live — the position must never be left unprotected."""
+    executor, market, exchange, state, lifecycle, risk = rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    pos_id, pos = next(iter(executor._open_positions().items()))
+    old_sl = pos["sl_order_id"]
+    exchange.fill(pos["tp"]["tp1"]["order_id"], 103.0)
+    # Simulate the -4120 rejection on the breakeven placement only.
+    orig_place_algo = exchange.place_algo_order
+    def failing_place_algo(*a, **k):
+        return None
+    monkeypatch.setattr(exchange, "place_algo_order", failing_place_algo)
+    executor._manage_one(pos_id, pos, 10_000.0, summary)
+    pos = executor._open_positions()[pos_id]
+    assert pos["breakeven_moved"] is False
+    assert pos["sl_order_id"] == old_sl
+    # original SL still live — never canceled, never orphaned
+    assert exchange.get_algo_order("BTCUSDT", old_sl)["status"] == "NEW"
 
 
 # ------------------------------------------------------------- risk manager

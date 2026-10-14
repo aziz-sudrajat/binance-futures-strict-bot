@@ -26,9 +26,11 @@ flags (--fixed-margin-usdt, --leverage, --leverage-tiers, --leverage-default,
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
+import time
 
 import config
 from data import MarketData
@@ -264,12 +266,62 @@ def main(argv: list[str] | None = None) -> int:
         print(note, flush=True)
         return 0 if ok else 1
     if args.once:
+        cycle_start_ms = int(time.time() * 1000)
         summary = (executor.scan_from_db(args.db) if args.from_db
                    else executor.scan_once())
         log.info("once summary: %s", summary)
+        _write_last_run(mode, executor.lifecycle, cycle_start_ms, summary)
     else:
         executor.run_loop(from_db=args.from_db, db_path=args.db)
     return 0
+
+
+# Lifecycle states the scheduled worker treats as user-notifiable.
+_NOTABLE_STATES = frozenset({
+    "position_opened", "tp1_hit", "tp2_hit", "tp3_hit", "sl_hit",
+})
+
+
+def _write_last_run(mode: str, lifecycle: LifecycleLogger,
+                    cycle_start_ms: int, summary: dict) -> None:
+    """Write a tiny run-status file for the scheduled worker.
+
+    Lets the worker detect new trading events by reading one small JSON
+    instead of parsing the whole lifecycle log (keeps the worker fast and
+    prevents duplicate "new event" reports when its watermark lags).
+    """
+    notable = []
+    try:
+        for ev in lifecycle.read_all():
+            if ev.get("ts", 0) >= cycle_start_ms \
+                    and ev.get("state") in _NOTABLE_STATES:
+                notable.append({
+                    "ts": ev.get("ts"),
+                    "symbol": ev.get("symbol"),
+                    "state": ev.get("state"),
+                    "qty": ev.get("qty"),
+                    "entry": ev.get("entry"),
+                    "price": ev.get("price"),
+                    "pnl": ev.get("pnl"),
+                })
+    except OSError as e:
+        log.warning("last_run: could not read lifecycle (%s)", e)
+    payload = {
+        "mode": mode,
+        "run_ts_ms": int(time.time() * 1000),
+        "summary": summary,
+        "last_event_ts": lifecycle.last_event_ts(),
+        "notable": notable,
+    }
+    path = os.path.join(os.path.dirname(
+        os.path.abspath(lifecycle.path)), "last_run.json")
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        log.warning("last_run: could not write %s (%s)", path, e)
 
 
 if __name__ == "__main__":

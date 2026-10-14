@@ -900,9 +900,6 @@ class Executor:
 
     def _move_sl_to_breakeven(self, pos_id: str, pos: dict, sid: str) -> None:
         symbol = pos["symbol"]
-        # Route through _sl_cancel: the working SL may be an algo order
-        # (sl_is_algo=True); cancel_order alone would leave it live.
-        self._sl_cancel(symbol, pos)
         tick = None
         try:
             tick = (self.exchange.get_symbol_filters(symbol) or {}).get("tickSize")
@@ -910,20 +907,25 @@ class Executor:
             pass
         be = quantize_price(pos["entry_price"], tick)
         exit_side = "BUY" if pos.get("direction") == "SHORT" else "SELL"
-        sl = self.exchange.place_order(
+        # STOP_MARKET must go through the algo endpoint: Binance rejects it
+        # on /fapi/v1/order with HTTP 400 -4120. Place the new breakeven SL
+        # BEFORE cancelling the old one so the position is never unprotected.
+        sl = self.exchange.place_algo_order(
             symbol, exit_side, "STOP_MARKET", quantity=pos["qty"],
-            stop_price=be, reduce_only=True, working_type="MARK_PRICE",
-            client_order_id=self._leg_id(pos_id, "SLBE"))
-        if sl:
-            pos["sl_order_id"] = sl["orderId"]
-            pos["sl_is_algo"] = False  # breakeven leg is a regular STOP_MARKET
+            trigger_price=be, reduce_only=True, working_type="MARK_PRICE",
+            client_algo_id=self._leg_id(pos_id, "SLBE"))
+        if sl and sl.get("algoId"):
+            # New SL is live: now cancel the old leg (algo or regular).
+            self._sl_cancel(symbol, pos)
+            pos["sl_order_id"] = sl["algoId"]
+            pos["sl_is_algo"] = True  # breakeven leg is an algo STOP_MARKET
             pos["breakeven_moved"] = True
             pos["stop_loss"] = be
             log.info("%s SL moved to breakeven @ %s", pos_id, be)
             self.state.save()
         else:
-            log.error("%s breakeven SL placement FAILED - original SL kept "
-                      "if still live", pos_id)
+            log.error("%s breakeven SL placement FAILED - original SL left "
+                      "live", pos_id)
 
     def _close_position(self, pos_id: str, pos: dict, sid: str,
                         summary: dict, reason: str = "") -> None:
