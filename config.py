@@ -142,6 +142,9 @@ EXEC_SIGNAL_ID_TTL_HOURS = 72             # processed signal IDs are kept this l
 EXEC_RECV_WINDOW_MS = 10000
 EXEC_STATE_FILE = "state.json"
 EXEC_LIFECYCLE_FILE = "lifecycle.jsonl"
+# Dashboard settings (written by dashboard.py, honored by the executor).
+# Missing file -> built-in defaults (current behavior, auto-trade ON).
+DASHBOARD_SETTINGS_FILE = "dashboard_settings.json"
 # Live mode uses SEPARATE state files so testnet/paper records can never
 # contaminate (or be mistaken for) real-money position history.
 EXEC_LIVE_STATE_FILE = "state-live.json"
