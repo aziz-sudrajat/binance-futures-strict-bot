@@ -49,6 +49,58 @@ _INTERVAL_MS = {
 
 _OKX_BASE = "https://www.okx.com"
 
+# News review (ketat mode): public CoinTelegraph RSS, no API key.
+_NEWS_RSS_URL = "https://cointelegraph.com/rss"
+NEWS_TTL_SEC = 900            # cache headlines 15 min
+NEWS_LOOKBACK_H = 24          # review window for coin mentions
+
+# base symbol -> headline search names (lowercase substrings)
+_COIN_NAMES = {
+    "BTC": ["bitcoin", "btc"],
+    "ETH": ["ethereum", "eth"],
+    "BNB": ["bnb", "binance coin"],
+    "SOL": ["solana", "sol"],
+    "XRP": ["xrp", "ripple"],
+    "DOGE": ["dogecoin", "doge"],
+    "ADA": ["cardano", "ada"],
+    "AVAX": ["avalanche", "avax"],
+    "LINK": ["chainlink", "link"],
+    "DOT": ["polkadot", "dot"],
+    "MATIC": ["polygon", "matic"],
+    "ATOM": ["cosmos", "atom"],
+    "NEAR": ["near protocol", "near"],
+    "ARB": ["arbitrum", "arb"],
+    "OP": ["optimism", "op"],
+}
+
+# Keyword sentiment for the ketat news review. Strong words count double.
+_NEWS_NEG_STRONG = ("hack", "exploit", "lawsuit", "fraud", "scam", "bankrupt",
+                    "arrest", "stolen", "theft", "breach", "collapse")
+_NEWS_NEG_MILD = ("crash", "dump", "plunge", "tumble", "slump", "fine",
+                  "penalty", "vulnerab", "attack", "warning", "probe",
+                  "investigat", "sec", "sued")
+_NEWS_POS = ("etf", "approv", "partnership", "adopt", "upgrade", "launch",
+             "all-time high", "record high", "surge", "rally", "bullish",
+             "invest", "backing", "integrat")
+
+
+def _news_sentiment(title: str) -> int:
+    """Crude keyword sentiment: positive minus negative hits."""
+    t = title.lower()
+    score = sum(2 for w in _NEWS_NEG_STRONG if w in t)
+    score += sum(1 for w in _NEWS_NEG_MILD if w in t)
+    score -= sum(1 for w in _NEWS_POS if w in t)
+    return -score  # negative = bearish news, positive = bullish news
+
+
+def _parse_rss_date(pub: str) -> float:
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(pub)
+        return dt.timestamp()
+    except Exception:  # noqa: BLE001
+        return 0.0
+
 
 def normalize_symbol(s: str) -> str:
     """GAS: normalizeSymbol_ (L793). 'btc' -> 'BTCUSDT'."""
@@ -85,6 +137,8 @@ class MarketData:
         self._klines_cache: dict[str, tuple[float, list]] = {}
         self._deriv_cache: dict[str, tuple[float, dict]] = {}
         self._quanto_cache: dict[str, float] = {}  # OKX ctVal per instId
+        self._news_cache: tuple[float, list] | None = None  # (ts, headlines)
+        self._news_ok: bool = False  # True if last RSS fetch succeeded
 
     # ------------------------------------------------------------- klines
     def _klines_ttl(self, interval: str) -> int:
@@ -531,3 +585,57 @@ class MarketData:
             return self._pack_book(bids, asks, "okx_swap")
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"order book unavailable for {symbol}: {e}")
+
+    # ---------------------------------------------------------------- news
+    # CoinTelegraph RSS (public, no key). Cached NEWS_TTL_SEC seconds.
+    # Used by the ketat-mode news review: headlines mentioning the coin in
+    # the last NEWS_LOOKBACK_H hours are keyword-scored for sentiment.
+    # A fetch failure returns [] — the ketat review then FAILS CLOSED
+    # (no signal) rather than trading blind to news.
+    def get_coin_news(self, symbol: str,
+                      hours: int = 24) -> list[dict]:
+        """Headlines mentioning the coin: [{title, ts, sentiment}]."""
+        symbol = normalize_symbol(symbol)
+        headlines = self._fetch_news_headlines()
+        cutoff = time.time() - hours * 3600
+        base = re.sub(r"(USDT|USDC)$", "", symbol)
+        names = _COIN_NAMES.get(base, [base.lower()])
+        out = []
+        for h in headlines:
+            if h["ts"] < cutoff:
+                continue
+            title_l = h["title"].lower()
+            if not any(n in title_l for n in names):
+                continue
+            out.append({"title": h["title"], "ts": h["ts"],
+                        "sentiment": _news_sentiment(h["title"])})
+        return out
+
+    def _fetch_news_headlines(self) -> list[dict]:
+        now = time.time()
+        if self._news_cache and now - self._news_cache[0] < NEWS_TTL_SEC:
+            return self._news_cache[1]
+        headlines: list[dict] = []
+        try:
+            r = self.session.get(_NEWS_RSS_URL, timeout=20)
+            r.raise_for_status()
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(r.content)
+            for item in root.findall(".//item"):
+                title = (item.findtext("title") or "").strip()
+                pub = (item.findtext("pubDate") or "").strip()
+                if not title:
+                    continue
+                ts = _parse_rss_date(pub)
+                headlines.append({"title": title, "ts": ts})
+            self._news_ok = True
+        except Exception:  # noqa: BLE001 - empty list -> ketat fails closed
+            headlines = []
+            self._news_ok = False
+        self._news_cache = (now, headlines)
+        return headlines
+
+    def news_feed_ok(self) -> bool:
+        """True if the news RSS was fetched successfully (cached)."""
+        self._fetch_news_headlines()
+        return self._news_ok

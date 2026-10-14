@@ -25,6 +25,17 @@ MTF_REQUIRE_1D = True          # STRICT cascade: 1d trend alignment is a hard ga
                                # opposed) instead of a hard reject.
 MTF_CONFIRM_1D_BOOST = 6       # soft 1d delta: major trend aligned (relaxed cascade)
 MTF_CONFIRM_1D_PENALTY = 10    # soft 1d delta: major trend opposed (relaxed cascade)
+MTF_REQUIRE_1H = True         # sedang/ketat: 1h trend must align with signal
+                              # direction (user spec 2026-10-15).
+BTC_ALIGN_REQUIRED = True     # sedang/ketat: BTC 15m direction must match the
+                              # signal direction (user spec 2026-10-15).
+PATTERN_REQUIRED = True       # ketat: candlestick pattern must support the
+                              # direction (user spec 2026-10-15).
+NEWS_CHECK = True             # ketat: coin news sentiment review.
+LIQ_REVIEW = True             # ketat: liquidation-spike review.
+WHALE_REVIEW = True           # ketat: whale/top-trader positioning review.
+SIGNAL_MODE = "ketat"         # ketat | sedang | biasa — set from dashboard
+                              # settings via apply_dashboard_overrides.
 
 # ------------------------------------------------- indicator / setup constants
 KLINES_LIMIT = 220              # GAS: CFG.KLINES_LIMIT (L97)
@@ -227,6 +238,12 @@ DASH_NUMERIC_OVERRIDES = {
 DASH_BOOL_OVERRIDES = {
     "bullish_only": "BULLISH_ONLY",
     "mtf_require_1d": "MTF_REQUIRE_1D",
+    "mtf_require_1h": "MTF_REQUIRE_1H",
+    "btc_align_required": "BTC_ALIGN_REQUIRED",
+    "pattern_required": "PATTERN_REQUIRED",
+    "news_check": "NEWS_CHECK",
+    "liq_review": "LIQ_REVIEW",
+    "whale_review": "WHALE_REVIEW",
     "breakeven_after_tp1": "EXEC_BREAKEVEN_AFTER_TP1",
 }
 # MTF 30m leg mode: STRICT (default) or LEAN (GAS default behavior).
@@ -248,11 +265,24 @@ DASH_VETO_CODES = ("leverage_risk", "funding", "squeeze", "whale",
 # The user can still fine-tune knobs afterwards — the mode is a preset,
 # not a lock.
 SIGNAL_MODES = ("ketat", "sedang", "biasa")
+# Signal mode semantics (user spec 2026-10-15):
+#   biasa : 15m indicators only (MACD, MA/EMA, RSI). No MTF, no vetoes,
+#           no derivatives gate — the 15m setup IS the signal.
+#   sedang: biasa + MTF alignment (4h, 1h, 30m, 15m all same direction)
+#           + BTC direction must match.
+#   ketat : sedang + pattern review + news review + liquidation review
+#           + whale review + BTC direction + full veto/derivatives/quality.
 SIGNAL_MODE_PRESETS = {
-    "ketat": {  # today's behavior — GAS STRICT parity
+    "ketat": {
         "min_quality_score": 70,
         "mtf_30m_mode": "STRICT",
         "mtf_require_1d": True,
+        "mtf_require_1h": True,
+        "btc_align_required": True,
+        "pattern_required": True,
+        "news_check": True,
+        "liq_review": True,
+        "whale_review": True,
         "bullish_only": True,
         "min_24h_volume_usd": 2_000_000.0,
         "freshness_max_drift_pct": 0.4,
@@ -263,10 +293,16 @@ SIGNAL_MODE_PRESETS = {
         "veto_liq_wall": True,
         "veto_btc_breaker": True,
     },
-    "sedang": {  # relaxed: lower bar, LEAN 30m, drops the noisiest veto
+    "sedang": {
         "min_quality_score": 60,
-        "mtf_30m_mode": "LEAN",
-        "mtf_require_1d": True,
+        "mtf_30m_mode": "STRICT",
+        "mtf_require_1d": False,
+        "mtf_require_1h": True,
+        "btc_align_required": True,
+        "pattern_required": False,
+        "news_check": False,
+        "liq_review": False,
+        "whale_review": False,
         "bullish_only": True,
         "min_24h_volume_usd": 1_000_000.0,
         "freshness_max_drift_pct": 0.6,
@@ -277,16 +313,21 @@ SIGNAL_MODE_PRESETS = {
         "veto_liq_wall": False,
         "veto_btc_breaker": True,
     },
-    "biasa": {  # permissive: quality floor, bidirectional, core vetoes only,
-        # 1d cascade leg relaxed to a soft delta
+    "biasa": {
         "min_quality_score": 50,
         "mtf_30m_mode": "LEAN",
         "mtf_require_1d": False,
+        "mtf_require_1h": False,
+        "btc_align_required": False,
+        "pattern_required": False,
+        "news_check": False,
+        "liq_review": False,
+        "whale_review": False,
         "bullish_only": False,
         "min_24h_volume_usd": 500_000.0,
         "freshness_max_drift_pct": 1.0,
-        "veto_leverage_risk": True,
-        "veto_funding": True,
+        "veto_leverage_risk": False,
+        "veto_funding": False,
         "veto_squeeze": False,
         "veto_whale": False,
         "veto_liq_wall": False,
@@ -313,7 +354,13 @@ DASHBOARD_DEFAULTS = {
     "freshness_max_drift_pct": 0.4,
     "bullish_only": True,
     "mtf_30m_mode": "STRICT",
-    "mtf_require_1d": True,     # 1d trend alignment: hard gate (ketat/sedang)
+    "mtf_require_1d": True,     # 1d trend alignment: hard gate (ketat)
+    "mtf_require_1h": True,     # 1h trend alignment: hard gate (sedang/ketat)
+    "btc_align_required": True,  # BTC 15m direction must match (sedang/ketat)
+    "pattern_required": True,   # candlestick pattern review (ketat)
+    "news_check": True,         # coin news sentiment review (ketat)
+    "liq_review": True,         # liquidation-spike review (ketat)
+    "whale_review": True,       # whale/top-trader review (ketat)
     # TP / SL
     "tp1_rr": 1.5,
     "tp2_rr": 2.25,
@@ -354,6 +401,7 @@ def _snapshot_originals() -> None:
         _ORIGINALS[attr] = globals()[attr]
     _ORIGINALS["TP_SPLIT"] = TP_SPLIT
     _ORIGINALS["MTF_30M_MODE"] = MTF_30M_MODE
+    _ORIGINALS["SIGNAL_MODE"] = SIGNAL_MODE
     _ORIGINALS["DISABLED_VETOES"] = frozenset()
 
 
@@ -382,6 +430,8 @@ def apply_dashboard_overrides(settings: dict) -> None:
                 globals()[attr] = settings[name]
         if settings.get("mtf_30m_mode") in DASH_MTF_MODES:
             globals()["MTF_30M_MODE"] = settings["mtf_30m_mode"]
+        if settings.get("signal_mode") in SIGNAL_MODES:
+            globals()["SIGNAL_MODE"] = settings["signal_mode"]
         # TP split: three fractions, normalized to sum 1.
         try:
             parts = [float(settings[f"tp_split_{i}"]) for i in (1, 2, 3)]

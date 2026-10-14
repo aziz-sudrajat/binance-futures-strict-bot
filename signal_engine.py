@@ -432,37 +432,307 @@ def mtf_cascade_check(klines_4h: list, klines_1d: list, a30: dict,
         return {"pass": False, "stage": "error", "reason": str(e)}
 
 
-# ---------------------------------------------------------- STRICT pipeline
-def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
-    """Run the full STRICT pipeline. Returns (signal_dict, note) or (None, reason).
+# ------------------------------------------------- mode-based signal layers
+# User spec 2026-10-15:
+#   biasa : 15m indicators only (MACD, MA/EMA, RSI). The 15m setup IS the signal.
+#   sedang: biasa + MTF alignment (4h, 1h, 30m, 15m all same direction)
+#           + BTC 15m direction must match.
+#   ketat : sedang + pattern review + news review + liquidation review
+#           + whale review + full veto/derivatives/quality machinery.
 
+
+def _dir_of_signal(sig: str) -> str:
+    s = str(sig or "")
+    if s.startswith("BULL"):
+        return "BULLISH"
+    if s.startswith("BEAR"):
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def mtf_alignment_check(symbol: str, market, direction: str,
+                        a15: dict | None = None,
+                        a30: dict | None = None) -> tuple[bool, str]:
+    """sedang/ketat: 4h, 1h, 30m, 15m must ALL point the signal direction.
+
+    15m/30m use the indicator setup direction; 4h/1h use the EMA21/50
+    trend. Fail-closed on any data error — never assume alignment.
+    """
+    want = "BULLISH" if direction == "BULLISH" else "BEARISH"
+    try:
+        if a15 is None:
+            a15 = analyze_candles(symbol, "15m",
+                                  market.get_klines(symbol, "15m"))
+        if a30 is None:
+            a30 = analyze_candles(symbol, "30m",
+                                  market.get_klines(symbol, "30m"))
+        k4h = market.get_klines(symbol, "4h")
+        k1h = market.get_klines(symbol, "1h")
+    except Exception as e:  # noqa: BLE001
+        return False, f"MTF data error: {e} — holding (fail-closed)"
+    legs = {
+        "15m": _dir_of_signal(a15.get("signal")),
+        "30m": _dir_of_signal(a30.get("signal")),
+        "4h": mtf_trend_direction([float(c["close"]) for c in k4h]),
+        "1h": mtf_trend_direction([float(c["close"]) for c in k1h]),
+    }
+    bad = [tf for tf, d in legs.items() if d != want]
+    if bad:
+        detail = ", ".join(f"{tf}={legs[tf].lower()}" for tf in
+                           ("15m", "30m", "1h", "4h"))
+        return False, (f"MTF tak selaras ({detail}; "
+                       f"butuh {want.lower()} semua)")
+    return True, f"MTF selaras {want.lower()} (15m/30m/1h/4h)"
+
+
+def btc_direction_check(market, direction: str) -> tuple[bool, str]:
+    """sedang/ketat: BTC 15m indicator direction must match the signal
+    direction. Fail-closed when BTC data is unavailable."""
+    want = "BULLISH" if direction == "BULLISH" else "BEARISH"
+    try:
+        a = analyze_candles("BTCUSDT", "15m",
+                            market.get_klines("BTCUSDT", "15m"))
+    except Exception as e:  # noqa: BLE001
+        return False, f"arah BTC tak tersedia ({e}) — holding (fail-closed)"
+    got = _dir_of_signal(a.get("signal"))
+    if got != want:
+        return False, (f"arah BTC tak selaras (BTC 15m {got.lower()}, "
+                       f"sinyal {want.lower()})")
+    return True, f"BTC selaras {want.lower()} (15m {a.get('signal')})"
+
+
+def _candle_parts(c: dict) -> tuple:
+    o = float(c["open"]); h = float(c["high"])
+    l = float(c["low"]); cl = float(c["close"])
+    body = abs(cl - o)
+    return o, h, l, cl, body, h - l
+
+
+def detect_pattern(candles: list, direction: str) -> str | None:
+    """Ketat pattern review: find a candlestick pattern supporting the
+    direction in recent 15m candles. Returns the pattern name or None.
+
+    Bullish: bullish-engulfing, hammer. Bearish: bearish-engulfing,
+    shooting-star.
+    """
+    if not candles or len(candles) < 2:
+        return None
+    want_bull = direction == "BULLISH"
+    recent = candles[-5:]
+    # Single-candle patterns: hammer / shooting star.
+    for c in recent:
+        o, h, l, cl, body, rng = _candle_parts(c)
+        if rng <= 0:
+            continue
+        lower_wick = min(o, cl) - l
+        upper_wick = h - max(o, cl)
+        is_hammer = (body < rng * 0.35 and lower_wick > body * 2
+                     and upper_wick < body)
+        is_star = (body < rng * 0.35 and upper_wick > body * 2
+                   and lower_wick < body)
+        if want_bull and is_hammer:
+            return "hammer"
+        if not want_bull and is_star:
+            return "shooting-star"
+    # Two-candle patterns: engulfing.
+    for i in range(max(0, len(candles) - 5), len(candles) - 1):
+        po, _ph, _pl, pcl, _pb, _pr = _candle_parts(candles[i])
+        o, _h, _l, cl, _b, _r = _candle_parts(candles[i + 1])
+        bull_eng = pcl < po and cl > o and o <= pcl and cl >= po
+        bear_eng = pcl > po and cl < o and o >= pcl and cl <= po
+        if want_bull and bull_eng:
+            return "bullish-engulfing"
+        if not want_bull and bear_eng:
+            return "bearish-engulfing"
+    return None
+
+
+def news_review(market, symbol: str, direction: str,
+                hours: int = 24) -> tuple[bool, str]:
+    """Ketat: coin news sentiment must not oppose the direction.
+
+    Rejects LONG when strongly bearish headlines dominate the window,
+    SHORT when strongly bullish headlines dominate. Fail-closed when the
+    feed is unreachable.
+    """
+    if not market.news_feed_ok():
+        return False, "news feed tak tersedia — holding (fail-closed)"
+    try:
+        items = market.get_coin_news(symbol, hours=hours)
+    except Exception as e:  # noqa: BLE001
+        return False, f"news review error ({e}) — holding (fail-closed)"
+    if not items:
+        return True, "news: tak ada headline coin 24h terakhir"
+    bear = [n for n in items if n["sentiment"] <= -2]
+    bull = [n for n in items if n["sentiment"] >= 2]
+    severe_bear = any(n["sentiment"] <= -4 for n in items)
+    severe_bull = any(n["sentiment"] >= 4 for n in items)
+    if direction == "BULLISH" and (severe_bear or len(bear) >= 2):
+        worst = min(items, key=lambda n: n["sentiment"])
+        return False, (f"news bearish menolak LONG: "
+                       f"\"{worst['title'][:80]}\"")
+    if direction == "BEARISH" and (severe_bull or len(bull) >= 2):
+        best = max(items, key=lambda n: n["sentiment"])
+        return False, (f"news bullish menolak SHORT: "
+                       f"\"{best['title'][:80]}\"")
+    return True, f"news: {len(items)} headline, tak ada sentimen berlawanan"
+
+
+def liquidation_review(market, symbol: str,
+                       direction: str) -> tuple[bool, str]:
+    """Ketat: reject when a liquidation spike is dominated by the trade's
+    own side (weak hands being wiped in our direction). Fail-closed."""
+    try:
+        adv = market.get_advanced_derivatives(symbol)
+    except Exception as e:  # noqa: BLE001
+        return False, f"data likuidasi tak tersedia ({e}) — holding"
+    spike = adv.get("spike") or 0.0
+    long_liq = adv.get("long_liq_usd") or 0.0
+    short_liq = adv.get("short_liq_usd") or 0.0
+    total = long_liq + short_liq
+    if total <= 0 or spike <= 2.0:
+        return True, "likuidasi: tak ada spike"
+    if direction == "BULLISH" and long_liq / total > 0.6:
+        return False, (f"likuidasi: spike {spike:.1f}x didominasi long "
+                       f"({long_liq / total:.0%}) — buyer lemah tersapu")
+    if direction == "BEARISH" and short_liq / total > 0.6:
+        return False, (f"likuidasi: spike {spike:.1f}x didominasi short "
+                       f"({short_liq / total:.0%}) — seller lemah tersapu")
+    return True, f"likuidasi: spike {spike:.1f}x tak melawan arah"
+
+
+def whale_review(market, symbol: str, direction: str) -> tuple[bool, str]:
+    """Ketat: reject when top traders are extremely positioned against
+    the direction (whale-crowd divergence). Fail-closed."""
+    try:
+        adv = market.get_advanced_derivatives(symbol)
+    except Exception as e:  # noqa: BLE001
+        return False, f"data whale tak tersedia ({e}) — holding"
+    top_long = adv.get("top_long")
+    div = adv.get("divergence")
+    if not (_finite(top_long) and _finite(div)):
+        return False, "posisi top-trader tak tersedia — holding (fail-closed)"
+    ext = config.DERIV_TOP_TRADER_EXTREME_LONG
+    against = (
+        (direction == "BULLISH" and top_long <= ext and div <= -15)
+        or (direction == "BEARISH" and top_long >= 100 - ext and div >= 15))
+    if against:
+        return False, (f"whale melawan {direction.lower()} "
+                       f"(top long {top_long:.1f}%, divergen {div:+.1f}pp)")
+    return True, f"whale: tak ada divergen ekstrem (top long {top_long:.1f}%)"
+
+
+def _layered_quality(strength: int, mode: str) -> int:
+    """Deterministic quality for biasa/sedang from 15m strength + earned
+    layer bonuses. Capped at the 98 GAS quality cap."""
+    base = {3: 60, 4: 75, 5: 90}.get(int(strength), 50)
+    if mode in ("sedang", "ketat"):
+        base += 5  # MTF + BTC alignment earned
+    return min(98, base)
+
+
+# ---------------------------------------------------------- STRICT pipeline
+def _signal_mode() -> str:
+    m = str(getattr(config, "SIGNAL_MODE", "ketat") or "ketat").lower()
+    return m if m in ("biasa", "sedang", "ketat") else "ketat"
+
+
+def _build_signal(symbol: str, direction: str, a15: dict, live: float,
+                  quality: int, mode: str, reviews: list[str],
+                  deriv: dict | None = None, snap: dict | None = None,
+                  deriv_missing: list | None = None,
+                  delta_notes: list | None = None) -> tuple[dict, str]:
+    plan = a15["trade_plan"]
+    sig_dir = "SHORT" if direction == "BEARISH" else "LONG"
+    signal = {
+        "symbol": symbol,
+        "direction": sig_dir,
+        "interval": "15m",
+        "entry": plan["entry"],
+        "entry_low": plan["entry_low"],
+        "entry_high": plan["entry_high"],
+        "stop_loss": plan["stop_loss"],
+        "tp1": plan["tp1"], "tp2": plan["tp2"], "tp3": plan["tp3"],
+        "rr1": plan["rr1"],
+        "quality": quality,
+        "mode": mode,
+        "reviews": reviews,
+        "strength": a15["strength"],
+        "rsi": round(a15["rsi"], 1),
+        "volume_ratio": round(a15["volume_ratio"], 2),
+        "regime": a15["regime"],
+        "deriv_score": (deriv["value"] if deriv else 50),
+        "deriv_bias": (deriv["bias"] if deriv else "neutral"),
+        "deriv_notes": (deriv["notes"] if deriv else []),
+        "deriv_missing": deriv_missing or [],
+        "deriv_provider": (snap.get("provider") if snap else "n/a"),
+        "reasons": a15["reasons"],
+        "price": a15["price"],
+        "live_price": live,
+        "delta_notes": delta_notes or [],
+        "timestamp": int(time.time() * 1000),
+    }
+    note = (f"{mode.upper()} PASS quality {quality}/100 "
+            f"(strength {a15['strength']}/5; "
+            f"{'; '.join(reviews)})")
+    return signal, note
+
+
+def _freshness_check(symbol: str, market, direction: str,
+                     plan: dict) -> tuple[float | None, str | None]:
+    """Shared freshness gate (all modes). Returns (live, None) or
+    (None, reason)."""
+    try:
+        live = market.get_live_price(symbol)
+    except Exception:  # noqa: BLE001 - ticker failure = unavailable
+        live = None
+    if live is None or not _finite(live) or live <= 0:
+        return None, "freshness: live price unavailable — holding (fail-closed)"
+    if direction == "BEARISH":
+        drift_pct = ((plan["entry_low"] - live) / plan["entry_low"] * 100
+                     if plan["entry_low"] > 0 else 0.0)
+        if drift_pct > config.FRESHNESS_MAX_DRIFT_PCT:
+            return None, (f"freshness: live price -{drift_pct:.2f}% below entry "
+                          f"zone — stale entry for short")
+    else:
+        drift_pct = (live - plan["entry_high"]) / plan["entry_high"] * 100
+        if drift_pct > config.FRESHNESS_MAX_DRIFT_PCT:
+            return None, (f"freshness: live price +{drift_pct:.2f}% above entry "
+                          f"zone — stale entry")
+    return live, None
+
+
+def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
+    """Mode-dispatched signal pipeline (user spec 2026-10-15).
+
+    - biasa : 15m indicators only (MACD, MA/EMA, RSI). The 15m setup IS
+      the signal. Mechanical safety (volume, freshness) still applies.
+    - sedang: biasa + MTF alignment (4h, 1h, 30m, 15m all same direction)
+      + BTC 15m direction must match.
+    - ketat : sedang + pattern review + news review + liquidation review
+      + whale review + derivatives coverage + deterministic vetoes +
+      quality gate (>=70).
+
+    Returns (signal_dict, note) or (None, reason).
     `market` is a data.MarketData instance (duck-typed for tests).
     """
     symbol = symbol.upper()
-    # Degraded-derivatives mode (ROADMAP ITEM 4, backtester only): the market
-    # object declares it has no historical derivatives feed. Derivative-
-    # dependent gates/deltas are then SKIPPED — never fabricated — and every
-    # skip is recorded on the signal dict and in the backtest report, so
-    # backtest pass rates are honest UPPER BOUNDS. Production markets never
-    # set this flag (default False): missing derivatives data fails closed.
+    mode = _signal_mode()
     degraded = bool(getattr(market, "degraded_derivatives", False))
-    # 1. Liquidity filter — FAIL-CLOSED (audit D6/M5). GAS applies the
-    # MIN_24H_VOLUME_USD floor at universe-selection time and lets favorites
-    # bypass it; for trading, unavailable or thin volume must block the signal.
+
+    # ---- Stage 0: liquidity filter — FAIL-CLOSED (all modes).
     vol = market.get_24h_quote_volume_usd(symbol)
     if vol is None or not _finite(vol):
         return None, "24h volume unavailable — holding (fail-closed)"
     if vol < config.MIN_24H_VOLUME_USD:
         return None, f"24h volume ${vol:,.0f} below ${config.MIN_24H_VOLUME_USD:,}"
 
-    # 2. 15m setup: directional WATCH + plan + strength >= 3.
-    # Direction: BULLISH WATCH -> LONG; BEARISH WATCH -> SHORT. In
-    # bullish-only modes (ketat/sedang, GAS parity) non-bullish setups are
-    # rejected here. In bidirectional mode (biasa) BEARISH WATCH continues
-    # down a fully mirrored SHORT pipeline (cascade, vetoes, deltas,
-    # freshness, executor) — never an inverted LONG.
+    # ---- Stage 1: 15m indicator setup — MACD, MA/EMA, RSI (all modes).
+    # BULLISH WATCH -> LONG; BEARISH WATCH -> SHORT. In bullish-only modes
+    # (ketat/sedang) non-bullish setups are rejected here.
     try:
-        a15 = analyze_candles(symbol, "15m", market.get_klines(symbol, "15m"))
+        k15 = market.get_klines(symbol, "15m")
+        a15 = analyze_candles(symbol, "15m", k15)
     except Exception as e:  # noqa: BLE001
         return None, f"15m data error: {e}"
     sig15 = str(a15["signal"])
@@ -478,23 +748,82 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
     if a15["strength"] < config.MIN_STRENGTH:
         return None, f"15m strength {a15['strength']}/5 below {config.MIN_STRENGTH}"
 
-    # 3. MTF cascade: 4h + 1d trend aligned with the signal direction,
-    # 30m per MTF_30M_MODE (default STRICT).
-    # Any fetch/analysis exception rejects the symbol — never skip-and-pass.
+    # ---- Stage 1b: freshness (all modes).
+    live, frej = _freshness_check(symbol, market, direction,
+                                  a15["trade_plan"])
+    if frej:
+        return None, frej
+
+    reviews = [f"15m {sig15.lower()} (strength {a15['strength']}/5)"]
+
+    # ================= biasa: 15m indicators only =================
+    if mode == "biasa":
+        quality = _layered_quality(a15["strength"], mode)
+        if quality < config.MIN_QUALITY_SCORE:
+            return None, (f"quality {quality}/100 below biasa minimum "
+                           f"{config.MIN_QUALITY_SCORE}")
+        return _build_signal(symbol, direction, a15, live, quality, mode,
+                             reviews)
+
+    # ---- Stage 2: MTF alignment — 4h, 1h, 30m, 15m same direction
+    # (sedang, ketat). Fail-closed.
     try:
-        k4h = market.get_klines(symbol, "4h")
-        k1d = market.get_klines(symbol, "1d")
         a30 = analyze_candles(symbol, "30m", market.get_klines(symbol, "30m"))
     except Exception as e:  # noqa: BLE001
-        return None, f"MTF data error: {e}"
-    casc = mtf_cascade_check(k4h, k1d, a30, direction)
-    if not casc["pass"]:
-        return None, f"STRICT cascade: {casc['reason']}"
+        return None, f"30m data error: {e} — holding (fail-closed)"
+    ok, note = mtf_alignment_check(symbol, market, direction, a15, a30)
+    if not ok:
+        return None, note
+    reviews.append(note)
 
-    # 4. Derivatives coverage — FAIL-CLOSED (audit D4/H6). A snapshot with no
-    # positioning visibility must HOLD the signal, never auto-neutralize to
-    # score 50 and pass. Required: funding + open interest. Optional
-    # (long/short, taker) gaps are recorded on the signal dict but do not block.
+    # ---- Stage 3: BTC direction must match (sedang, ketat).
+    if config.BTC_ALIGN_REQUIRED:
+        ok, note = btc_direction_check(market, direction)
+        if not ok:
+            return None, note
+        reviews.append(note)
+
+    # ================= sedang: MTF + BTC =================
+    if mode == "sedang":
+        quality = _layered_quality(a15["strength"], mode)
+        if quality < config.MIN_QUALITY_SCORE:
+            return None, (f"quality {quality}/100 below sedang minimum "
+                           f"{config.MIN_QUALITY_SCORE}")
+        return _build_signal(symbol, direction, a15, live, quality, mode,
+                             reviews)
+
+    # ================= ketat: full review stack =================
+    # Stage 4: pattern review.
+    if config.PATTERN_REQUIRED:
+        pat = detect_pattern(k15, direction)
+        if not pat:
+            return None, ("pattern: tak ada pola candlestick 15m yang "
+                          f"mendukung {direction.lower()} (5 candle terakhir)")
+        reviews.append(f"pattern {pat}")
+
+    # Stage 5: news review.
+    if config.NEWS_CHECK:
+        ok, note = news_review(market, symbol, direction)
+        if not ok:
+            return None, note
+        reviews.append(note)
+
+    # Stage 6: liquidation review.
+    if config.LIQ_REVIEW:
+        ok, note = liquidation_review(market, symbol, direction)
+        if not ok:
+            return None, note
+        reviews.append(note)
+
+    # Stage 7: whale review.
+    if config.WHALE_REVIEW:
+        ok, note = whale_review(market, symbol, direction)
+        if not ok:
+            return None, note
+        reviews.append(note)
+
+    # Stage 8: derivatives coverage — FAIL-CLOSED. Required: funding +
+    # open interest.
     snap = market.get_derivatives_snapshot(symbol)
     missing = [name for name, key in config.DERIV_COMPONENT_KEYS.items()
                if not _finite(snap.get(key))]
@@ -506,15 +835,11 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
     deriv_missing = [m for m in missing
                      if m in config.DERIV_OPTIONAL_COMPONENTS]
 
-    # 5. Deterministic hard vetoes (ROADMAP ITEM 2). Same check order as GAS
-    # prePublishDeepCheck_ (vetoes before the quality gate): any fired veto —
-    # or any veto whose required inputs are unavailable — rejects the signal.
-    # A high quality score can never compensate for a veto.
-    # The order book is fetched once and shared with the liquidity-wall
-    # *warn* tier in the quality gate (item 3); a fetch failure holds here.
+    # Stage 9: deterministic hard vetoes. Any fired veto — or any veto
+    # whose required inputs are unavailable — rejects the signal.
     try:
         book = market.get_order_book(symbol)
-    except Exception:  # noqa: BLE001 - run_vetoes retries and holds on failure
+    except Exception:  # noqa: BLE001
         book = None
     blocks = run_vetoes(symbol, direction, market, snap, book=book,
                         skip_deriv_vetoes=degraded,
@@ -523,10 +848,9 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
         why = "; ".join(f"[{code}/{kind}] {reason}"
                         for code, kind, reason in blocks)
         return None, f"veto: {why}"
+    reviews.append("vetoes bersih")
 
-    # 6. Quality gate — ROADMAP ITEM 3. Every scoreDelta contributor is an
-    # explicit, named component (quality_deltas.py), ported from the GAS deep
-    # check. Veto tiers already rejected above; the warn tiers subtract here.
+    # Stage 10: quality gate — warn-tier deltas score 0-100.
     components: dict[str, int] = {}
     delta_notes: list[str] = []
 
@@ -535,44 +859,23 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
         components[name] = int(d)
         delta_notes.append(f"{name}: {note}")
 
-    _add("mtf_30m", mtf_30m_delta(casc["chk"], direction))
-    if not config.MTF_REQUIRE_1D:
-        # Relaxed cascade (biasa mode): the 1d leg is soft-scored instead of
-        # a hard gate — major-trend alignment still moves the quality score
-        # (bonus when aligned, penalty when opposed).
-        _add("mtf_1d", mtf_1d_delta(casc.get("t1d"), direction))
+    _add("mtf_30m", mtf_30m_delta(mtf_confirm(a30, direction=direction),
+                                 direction))
     try:
-        a4h = analyze_candles(symbol, "4h", k4h)
-    except Exception as e:  # noqa: BLE001 - soft scoring (GAS L3304)
+        a4h = analyze_candles(symbol, "4h", market.get_klines(symbol, "4h"))
+    except Exception as e:  # noqa: BLE001
         components["mtf_4h"] = 0
         delta_notes.append(f"mtf_4h: data tidak tersedia ({e})")
     else:
         _add("mtf_4h", mtf_4h_delta(a4h, direction))
     try:
         h1_closes = [float(c["close"]) for c in market.get_klines(symbol, "1h")]
-    except Exception as e:  # noqa: BLE001 - soft scoring (GAS L3228)
+    except Exception as e:  # noqa: BLE001
         components["h1"] = 0
         delta_notes.append(f"h1: data tidak tersedia ({e})")
     else:
         _add("h1", h1_trend_delta(h1_closes, direction))
-    try:
-        btc_chg = btc_1h_change_pct(market)  # cached by the V15 veto check
-    except Exception as e:  # noqa: BLE001 - veto already held on failure
-        components["btc_warn"] = 0
-        delta_notes.append(f"btc_warn: data tidak tersedia ({e})")
-    else:
-        _add("btc_warn", btc_breadth_warn_delta(btc_chg, direction))
 
-    # Derivatives warn tiers. Veto tiers (V9-V12) already rejected above, so
-    # the required inputs are present here; optional inputs (smart money,
-    # regime) degrade to delta 0 with a note when unavailable.
-    # (Cached by run_vetoes above — no extra API call.)
-    #
-    # DEGRADED MODE (backtester): there is no historical derivatives feed, so
-    # every derivatives-dependent delta is 0 with an explicit note — never a
-    # fabricated value. Real warns can only push scores DOWN, therefore
-    # backtest quality scores (and pass rates) are UPPER BOUNDS. The MTF / h1 /
-    # BTC deltas above ran on real historical klines and are unaffected.
     if degraded:
         for _dname in ("lev_warn", "funding", "squeeze_warn", "whale_warn",
                        "smart_money", "liq_event", "liq_wall_warn"):
@@ -599,73 +902,16 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
         _add("liq_event", liq_event_delta(regime))
         _add("liq_wall_warn", liq_wall_warn_delta(book, direction))
 
-    deriv = derivatives_score(snap)  # informational (scan-time heuristic)
+    deriv = derivatives_score(snap)
     q = quality_score(a15["strength"], components)
     if not q["pass"]:
-        return None, (f"quality {q['quality']}/100 below STRICT minimum "
+        return None, (f"quality {q['quality']}/100 below ketat minimum "
                        f"{config.MIN_QUALITY_SCORE} "
                        f"(delta {q['delta']:+d}: "
                        + ", ".join(f"{k}{v:+d}" for k, v in components.items()
                                    if v) + ")")
+    reviews.append(f"quality {q['quality']}/100")
 
-    # 7. Freshness (GAS: freshnessCheck_, L5075): LIVE ticker price, one-sided
-    # per direction. LONG: reject only when price ran >limit ABOVE the entry
-    # zone (stale entry — chasing). Price below/at the zone is fine (pullback
-    # entry). SHORT (mirror): reject when price ran >limit BELOW entry_low —
-    # the pullback-short entry is stale once price already broke down.
-    # FAIL-CLOSED: an unavailable live price holds the signal (audit C2/C3/D1
-    # — GAS returned ok:true on price_unavailable; we deliberately do not
-    # reproduce that).
-    plan = a15["trade_plan"]
-    try:
-        live = market.get_live_price(symbol)
-    except Exception:  # noqa: BLE001 - ticker failure = unavailable
-        live = None
-    if live is None or not _finite(live) or live <= 0:
-        return None, "freshness: live price unavailable — holding (fail-closed)"
-    if direction == "BEARISH":
-        drift_pct = ((plan["entry_low"] - live) / plan["entry_low"] * 100
-                     if plan["entry_low"] > 0 else 0.0)
-        if drift_pct > config.FRESHNESS_MAX_DRIFT_PCT:
-            return None, (f"freshness: live price -{drift_pct:.2f}% below entry "
-                          f"zone (limit -{config.FRESHNESS_MAX_DRIFT_PCT}%) — "
-                          f"stale entry for short")
-    else:
-        drift_pct = (live - plan["entry_high"]) / plan["entry_high"] * 100
-        if drift_pct > config.FRESHNESS_MAX_DRIFT_PCT:
-            return None, (f"freshness: live price +{drift_pct:.2f}% above entry "
-                          f"zone (limit +{config.FRESHNESS_MAX_DRIFT_PCT}%) — "
-                          f"stale entry")
-
-    signal = {
-        "symbol": symbol,
-        "direction": "SHORT" if direction == "BEARISH" else "LONG",
-        "interval": "15m",
-        "entry": plan["entry"],
-        "entry_low": plan["entry_low"],
-        "entry_high": plan["entry_high"],
-        "stop_loss": plan["stop_loss"],
-        "tp1": plan["tp1"], "tp2": plan["tp2"], "tp3": plan["tp3"],
-        "rr1": plan["rr1"],
-        "quality": q["quality"],
-        "score_delta": q["delta"],
-        "delta_breakdown": q["components"],
-        "delta_notes": delta_notes,
-        "strength": a15["strength"],
-        "rsi": round(a15["rsi"], 1),
-        "volume_ratio": round(a15["volume_ratio"], 2),
-        "regime": a15["regime"],
-        "deriv_score": deriv["value"],
-        "deriv_bias": deriv["bias"],
-        "deriv_notes": deriv["notes"],
-        "deriv_missing": deriv_missing,
-        "deriv_provider": snap.get("provider"),
-        "deriv_degraded": degraded,  # True only in backtest degraded mode
-        "reasons": a15["reasons"],
-        "price": a15["price"],
-        "live_price": live,
-        "timestamp": int(time.time() * 1000),
-    }
-    note = (f"STRICT PASS quality {q['quality']}/100 "
-            f"(strength {a15['strength']}/5, deriv {deriv['value']})")
-    return signal, note
+    return _build_signal(symbol, direction, a15, live, q["quality"], mode,
+                         reviews, deriv=deriv, snap=snap,
+                         deriv_missing=deriv_missing, delta_notes=delta_notes)
