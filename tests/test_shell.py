@@ -43,7 +43,7 @@ def test_commands_have_handlers():
     for name in names - {"clear", "exit", "help"}:
         assert name in ("scan", "auto-trade", "setting", "set", "position",
                         "balance", "signals", "scanner", "mode", "events",
-                        "kill", "dashboard"), name
+                        "kill", "dashboard", "signal-mode"), name
 
 
 # ------------------------------------------------------- dispatch
@@ -129,3 +129,60 @@ def test_signals_and_settings_tables():
         [("auto_trade", "Auto-trade", "bool"),
          ("min_quality_score", "Min quality", "int")]))
     assert "min_quality_score" in out2 and "70" in out2
+
+
+# ------------------------------------------------------- signal modes
+def test_signal_mode_presets_match_current_defaults():
+    import config
+    ketat = config.SIGNAL_MODE_PRESETS["ketat"]
+    d = config.DASHBOARD_DEFAULTS
+    for k, v in ketat.items():
+        assert d[k] == v, k  # ketat == today's behavior, no drift
+    assert set(config.SIGNAL_MODE_PRESETS) == {"ketat", "sedang", "biasa"}
+    # strictness ordering: quality bar descends
+    assert (config.SIGNAL_MODE_PRESETS["ketat"]["min_quality_score"]
+            > config.SIGNAL_MODE_PRESETS["sedang"]["min_quality_score"]
+            > config.SIGNAL_MODE_PRESETS["biasa"]["min_quality_score"])
+
+
+def test_apply_signal_mode_preset():
+    import dashboard
+    s = {"signal_mode": "ketat", "min_quality_score": 70}
+    dashboard.apply_signal_mode_preset(s, "biasa")
+    assert s["signal_mode"] == "biasa"
+    assert s["min_quality_score"] == 50
+    assert s["bullish_only"] is False
+    assert s["veto_funding"] is True  # core veto stays on
+    with __import__("pytest").raises(ValueError):
+        dashboard.apply_signal_mode_preset({}, "ngawur")
+
+
+def test_validate_signal_mode():
+    import dashboard
+    out = dashboard.validate_settings({"signal_mode": "sedang"})
+    assert out["signal_mode"] == "sedang"
+    with __import__("pytest").raises(ValueError):
+        dashboard.validate_settings({"signal_mode": "ngawur"})
+
+
+def test_shell_signal_mode_command(tmp_path, monkeypatch):
+    import binance as bsh
+    import dashboard
+    fake_path = str(tmp_path / "settings.json")
+    monkeypatch.setattr(dashboard, "SETTINGS_PATH", fake_path)
+    shell = bsh.BinanceShell()
+    shell.mode = "paper"
+    assert shell.dispatch("signal-mode") is True  # show, no crash
+    assert shell.dispatch("signal-mode sedang") is True
+    st = dashboard.load_settings(mode="paper")
+    assert st["signal_mode"] == "sedang"
+    assert st["min_quality_score"] == 60
+    assert st["veto_liq_wall"] is False
+    # set alias also routes through the preset
+    assert shell.dispatch("set signal_mode biasa") is True
+    st = dashboard.load_settings(mode="paper")
+    assert st["signal_mode"] == "biasa"
+    assert st["bullish_only"] is False
+    # unknown mode rejected, settings untouched
+    assert shell.dispatch("signal-mode ngawur") is True
+    assert dashboard.load_settings(mode="paper")["signal_mode"] == "biasa"
