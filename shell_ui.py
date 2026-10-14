@@ -36,8 +36,8 @@ class Command:
 
 COMMANDS: list[Command] = [
     Command("scan", "Scan sinyal dengan engine STRICT (Signal Radar)",
-            usage="scan [--top N]",
-            examples=("scan", "scan --top 10")),
+            usage="scan [all] [--top N]",
+            examples=("scan", "scan all", "scan --top 10")),
     Command("auto-trade", "Jalankan auto-trade loop (Ctrl+C berhenti)",
             usage="auto-trade [--demo|--live|--paper] [--from-db] [--setting]",
             aliases=("autotrade", "trade"),

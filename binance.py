@@ -111,9 +111,13 @@ class BinanceShell:
 
     def cmd_scan(self, args: list[str]) -> None:
         top = 20
-        if "--top" in args:
+        universe_override = None
+        rest = [a for a in args if a != "all"]
+        if len(rest) != len(args):
+            universe_override = "all"
+        if "--top" in rest:
             try:
-                top = max(1, min(int(args[args.index("--top") + 1]), 100))
+                top = max(1, min(int(rest[rest.index("--top") + 1]), 100))
             except (ValueError, IndexError):
                 self.console.print("[red]--top butuh angka[/red]")
                 return
@@ -122,10 +126,14 @@ class BinanceShell:
                                "selesai dulu[/yellow]")
             return
         result: dict = {}
+        uni_label = ("semua perpetual OKX (ratusan coin, beberapa menit)"
+                     if universe_override == "all"
+                     else "universe setting aktif")
 
         def _run() -> None:
             try:
-                result["rows"] = dashboard.run_radar(mode=self.mode)
+                result["rows"] = dashboard.run_radar(
+                    mode=self.mode, universe_mode=universe_override)
             except Exception as e:  # noqa: BLE001
                 result["error"] = e
 
@@ -134,7 +142,7 @@ class BinanceShell:
         try:
             with self.console.status(
                     "[bold green]scanning dengan engine STRICT…[/bold green]"
-                    "\n[dim](55 coin, bisa 1–2 menit — Ctrl+C batalkan)[/dim]",
+                    f"\n[dim]({uni_label} — Ctrl+C batalkan)[/dim]",
                     spinner="dots"):
                 while self._scan_thread.is_alive():
                     self._scan_thread.join(0.1)

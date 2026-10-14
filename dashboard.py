@@ -191,8 +191,9 @@ def validate_settings(data: dict) -> dict:
     # ---- universe ----
     if "universe_mode" in data:
         v = data["universe_mode"]
-        if v not in ("curated", "top_volume"):
-            raise ValueError("universe_mode must be curated or top_volume")
+        if v not in config.UNIVERSE_MODES:
+            raise ValueError(
+                f"universe_mode must be one of {list(config.UNIVERSE_MODES)}")
         out["universe_mode"] = v
 
     if "universe_top_n" in data:
@@ -328,7 +329,7 @@ def scanner_status() -> dict:
 SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("signal_mode", "Mode sinyal (preset)", "choice:ketat,sedang,biasa"),
     ("auto_trade", "Auto-trade", "bool"),
-    ("universe_mode", "Universe mode", "choice:curated,top_volume"),
+    ("universe_mode", "Universe mode", "choice:curated,top_volume,top_movers,all"),
     ("universe_top_n", "Universe top N", "int"),
     ("risk_pct_per_trade", "Risk %/trade", "float"),
     ("max_leverage", "Max leverage", "int"),
@@ -359,22 +360,28 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
 ]
 
 
-def run_radar(mode: str = "live") -> list[dict]:
+def run_radar(mode: str = "live", universe_mode: str | None = None) -> list[dict]:
     """Signal Radar: evaluate the whole universe with the CURRENT studio
     settings and rank by quality (approved first). Uses the real engine —
     the same pipeline the executor runs. Respects the universe mode
-    (curated / top_volume); ~1s per symbol."""
+    (curated / top_volume / top_movers / all); ~1s per symbol.
+    `universe_mode` optionally overrides the saved setting for one scan."""
     from data import MarketData
     from signal_engine import evaluate_symbol
     from executor import resolve_universe
     settings = load_settings(mode=mode)
+    if universe_mode is not None:
+        if universe_mode not in config.UNIVERSE_MODES:
+            raise ValueError(
+                f"universe_mode must be one of {list(config.UNIVERSE_MODES)}")
+        settings = dict(settings, universe_mode=universe_mode)
     config.apply_dashboard_overrides(settings)
     try:
         exchange = _exchange_for_mode(mode)
     except SystemExit:
         exchange = None  # no keys -> curated fallback inside resolve
-    universe = resolve_universe(exchange, settings)
     market = MarketData()
+    universe = resolve_universe(exchange, settings, market=market)
     out = []
     for symbol in universe:
         try:
@@ -390,6 +397,7 @@ def run_radar(mode: str = "live") -> list[dict]:
             out.append({
                 "symbol": symbol, "state": "approved",
                 "quality": signal.get("quality"),
+                "strength": signal.get("strength"),
                 "direction": signal.get("direction"),
                 "entry": signal.get("entry"),
                 "entry_low": signal.get("entry_low"),
@@ -403,7 +411,9 @@ def run_radar(mode: str = "live") -> list[dict]:
                 "volume_ratio": signal.get("volume_ratio"),
             })
     out.sort(key=lambda r: (r["state"] != "approved",
-                            -((r.get("quality") or -1))))
+                            -((r.get("quality") or -1)),
+                            -((r.get("strength") or -1)),
+                            r["symbol"]))
     return out
 
 
@@ -570,13 +580,16 @@ th{color:#8b949e;font-weight:600}
 <div class="card"><h2>🌐 Universe</h2>
   <div class="setrow"><label>Mode universe<br>
     <span class="dim" style="font-size:12px">curated = 55 coin liquid;
-    top_volume = top-N volume 24h</span></label>
+    top_volume = top-N volume; top_movers = top-N volatilitas (GAS);
+    all = semua perpetual OKX</span></label>
     <select id="s-umode">
       <option value="curated">curated</option>
       <option value="top_volume">top_volume</option>
+      <option value="top_movers">top_movers</option>
+      <option value="all">all</option>
     </select></div>
   <div class="setrow"><label>Top N (10–100)<br>
-    <span class="dim" style="font-size:12px">dipakai kalau top_volume</span></label>
+    <span class="dim" style="font-size:12px">dipakai kalau top_volume / top_movers</span></label>
     <input type="number" id="s-topn" step="5" min="10" max="100"></div>
   <div class="dim" style="font-size:12px" id="u-count"></div>
 </div>
@@ -715,10 +728,12 @@ async function refresh(){
     $('s-sp3').value = st.tp_split_3;
     $('s-be').checked = !!st.breakeven_after_tp1;
     $('s-margin').value = st.margin_mode || 'ISOLATED';
-    $('s-umode').value = st.universe_mode || 'curated';
+    $('s-umode').value = st.universe_mode || 'top_movers';
     $('s-topn').value = st.universe_top_n;
-    $('u-count').innerHTML = st.universe_mode === 'top_volume'
-      ? 'scan <b class="cyan">' + st.universe_top_n + '</b> coin top volume'
+    $('u-count').innerHTML = st.universe_mode === 'all'
+      ? 'scan <b class="cyan">semua</b> perpetual OKX (~ratusan coin)'
+      : st.universe_mode === 'top_volume' || st.universe_mode === 'top_movers'
+      ? 'scan <b class="cyan">' + st.universe_top_n + '</b> coin ' + st.universe_mode
       : 'scan <b class="cyan">55</b> coin curated';
     $('s-levmode').value = st.leverage_mode || 'auto';
     $('s-levx').value = st.leverage;
