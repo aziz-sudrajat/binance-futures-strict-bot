@@ -403,3 +403,18 @@ def test_evaluate_symbol_weak_strength_rejected():
         signal_engine.analyze_candles = orig
     assert signal is None
     assert "strength" in reason
+
+
+def test_bearish_rejected_even_when_bullish_only_off():
+    """Regression: the engine is LONG-only by construction. Flipping the
+    bullish_only knob must never let a BEARISH WATCH through as an inverted
+    LONG (bearish plan + direction LONG = stop above entry)."""
+    import config
+    old = config.BULLISH_ONLY
+    config.BULLISH_ONLY = False
+    try:
+        signal, reason = evaluate_symbol("BTCUSDT", FakeMarket(bullish=False))
+    finally:
+        config.BULLISH_ONLY = old
+    assert signal is None
+    assert "bullish-only" in reason
