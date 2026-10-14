@@ -126,6 +126,10 @@ Notes:
    funding-extreme, squeeze-risk ≥85, whale-divergence, $250k liquidity wall,
    BTC-dump circuit breaker — as non-compensable hard gates (`vetoes.py`).
    Chart-pattern and AI news vetoes stay out until calibrated (audit).
+   **Roadmap:** a news-sentiment feed (e.g. CryptoPanic/CoinDesk API) as an
+   additional signal filter is planned but NOT yet implemented — the dashboard
+   exposes every filter the engine actually runs today (MTF, indicators,
+   liquidity, derivatives, vetoes); nothing is faked.
    Warn-tier score penalties (funding +5, whale −12, liq-warn −8, BTC −2% −15)
    are not ported; they belong to roadmap item 3 (quality recalibration).
 2. **Quality gate (roadmap item 3).** GAS: `quality = 40 + strength×10 +
@@ -168,7 +172,137 @@ Notes:
    neutral-with-bullish-lean 30m setups. This is a deliberate, documented
    divergence (safer direction); set `MTF_30M_MODE='LEAN'` for GAS parity.
 
-## Setup & usage
+## Instalasi & Tutorial Lengkap
+
+### 1. Syarat
+
+- Python 3.10+ dan `git`
+- Koneksi internet (data market dari OKX/Gate.io; order via Binance API)
+- Untuk **live**: HP/komputer di region yang tidak diblokir Binance
+  (Binance mainnet me-return HTTP 451 dari sebagian IP datacenter)
+
+### 2. Install di Termux (Android)
+
+```bash
+pkg update && pkg install python git -y
+git clone https://github.com/aziz-sudrajat/binance-futures-strict-bot
+cd binance-futures-strict-bot
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+### 3. Install di Linux / VPS
+
+```bash
+sudo apt update && sudo apt install python3 python3-venv git -y
+git clone https://github.com/aziz-sudrajat/binance-futures-strict-bot
+cd binance-futures-strict-bot
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+### 4. API Key
+
+**Testnet (uang palsu, untuk latihan):**
+
+1. Buka https://testnet.binancefuture.com, login dengan GitHub/Google
+2. API Management → **Generate HMAC_SHA256 Key**
+3. `export BINANCE_TESTNET_KEY=<key> BINANCE_TESTNET_SECRET=<secret>`
+
+**Live (uang beneran):**
+
+1. Buka https://www.binance.com → API Management → buat API key
+2. Centang **Enable Futures**, pastikan **Enable Withdrawals MATI**
+3. Batasi IP jika bisa
+4. `export BINANCE_LIVE_KEY=<key> BINANCE_LIVE_SECRET=<secret>`
+
+> Key hanya hidup di environment variable. Jangan pernah paste ke chat,
+> jangan commit (sudah di-`.gitignore`).
+
+Agar key permanen antar sesi Termux, tambahkan baris `export` ke `~/.bashrc`.
+
+### 5. Mode jalan
+
+```bash
+# --- PAPER (simulasi, tanpa key, tanpa order) ---
+.venv/bin/python run_executor.py --paper --once   # sekali scan
+.venv/bin/python run_executor.py --paper --loop   # loop tiap 5 menit
+
+# --- TESTNET (order beneran di testnet) ---
+.venv/bin/python run_executor.py --testnet --once
+.venv/bin/python run_executor.py --testnet --loop
+
+# --- LIVE (uang beneran — baca Safety dulu) ---
+.venv/bin/python run_executor.py --live --once
+.venv/bin/python run_executor.py --live --loop
+
+# --- util ---
+.venv/bin/python run_executor.py --live --balance    # cek saldo futures
+.venv/bin/python run_executor.py --testnet --balance # cek saldo testnet
+```
+
+`--live` **menolak** semua flag TEST ONLY (`--fixed-margin-usdt`,
+`--leverage*`, `--manual`) dan tidak akan fallback ke testnet/paper.
+
+### 6. Dashboard Trading Studio
+
+```bash
+.venv/bin/python dashboard.py --mode live --port 8080
+# buka http://localhost:8080 di browser
+```
+
+Isi dashboard (auto-refresh 5 detik):
+
+| Bagian | Fungsi |
+|---|---|
+| Saldo & Status | balance futures, posisi terbuka, PnL hari ini, kill switch |
+| 📡 Signal Radar | scan 1 universe penuh, diurutkan dari signal terkuat |
+| Auto Trade | toggle on/off, risiko/trade, max leverage, interval scan |
+| 🎯 Signal | min quality score, MTF 30m mode, bullish-only, min volume, freshness |
+| 🛡️ TP & SL | TP1/2/3 (x risk), stop ATR min/max, split TP, breakeven toggle |
+| ⛔ Vetoes | 6 hard veto bisa di on/off (default semua ON) |
+| Posisi Terbuka | entry, SL, TP tiap posisi |
+| Event Terakhir | approved / rejected / TP hit / SL hit + alasannya |
+
+Semua setting tersimpan di `dashboard_settings.json` dan **langsung
+berlaku di scan berikutnya tanpa restart bot**. Perubahan setting yang
+mengetatkan risiko (risk %, leverage) tidak akan pernah melonggarkan
+default kode (1%/trade, max 3x).
+
+### 7. Menjalankan 24/7 di Termux
+
+```bash
+termux-wake-lock          # cegah Android membunuh proses
+pkg install tmux -y
+tmux new -s bot           # tab 1: bot
+.venv/bin/python run_executor.py --live --loop
+# Ctrl+B lalu D untuk detach
+tmux new -s dash          # tab 2: dashboard
+.venv/bin/python dashboard.py --mode live --port 8080
+```
+
+Matikan **battery optimization** untuk aplikasi Termux di Settings Android.
+Untuk melihat lagi: `tmux attach -t bot`.
+
+### 8. Update ke versi terbaru
+
+```bash
+cd binance-futures-strict-bot
+git pull
+.venv/bin/pip install -r requirements.txt   # kalau ada deps baru
+```
+
+### 9. Troubleshooting
+
+| Gejala | Penyebab & solusi |
+|---|---|
+| `bash: .venv/bin/python: No such file` | foldernya `.venv` (pakai titik). Buat dulu: `python -m venv .venv` |
+| `ERROR: --live needs BINANCE_LIVE_KEY...` | export key dulu (lihat bagian 4) |
+| HTTP 451 dari mainnet | IP host diblokir Binance → pindah host (HP/VPS region aman) |
+| Dashboard `tidak tersedia` di saldo | key belum di-export di sesi dashboard |
+| Bot berhenti saat HP sleep | `termux-wake-lock` + matikan battery optimization |
+
+## Setup & usage (developer)
 
 ```bash
 cd ~/workspace/binance-futures-bot
@@ -379,29 +513,13 @@ export BINANCE_TESTNET_KEY=... BINANCE_TESTNET_SECRET=...
 
 ### Dashboard (live web UI)
 
-`dashboard.py` — web UI kecil (stdlib only, tanpa dependency baru) yang
-menampilkan data bot secara live: saldo futures, posisi terbuka, PnL harian,
-status kill switch, signal & event terakhir (approved/rejected/TP/SL), plus
-pengaturan auto-trade.
-
-```bash
-.venv/bin/python dashboard.py --mode live --port 8080
-# buka http://localhost:8080 di browser HP
-```
-
-- Tab **LIVE / Testnet / Paper** untuk ganti mode tampilan.
-- **Auto-trade toggle**: OFF = scan tetap jalan tapi tidak buka posisi baru
-  (posisi yang sudah terbuka tetap dikelola). Perubahan langsung berlaku
-  tanpa restart loop.
-- **Risiko per trade / max leverage / interval scan**: hanya bisa
-  *mengetatkan* dari default kode (1% / 3x) — tidak bisa dilonggarkan
-  dari UI. Disimpan di `dashboard_settings.json` (gitignored, per-host).
-- Keys hanya dibaca dari environment di sisi server; tidak ada secret
-  yang dikirim ke browser. Bind default `127.0.0.1` (localhost saja).
+Lihat tutorial lengkap di [Instalasi & Tutorial Lengkap](#instalasi--tutorial-lengkap)
+bagian 6 — mencakup Signal Radar, semua setting signal/TP-SL/veto, dan cara
+jalan 24/7 di Termux.
 
 ### Pre-deploy checklist (from the quant-trading skill)
 
-- [ ] Full test suite green (`pytest tests/ -q`) — currently 112 passed.
+- [ ] Full test suite green (`pytest tests/ -q`) — currently 188 passed.
 - [ ] Paper-mode smoke run completed with no errors.
 - [ ] Testnet key created by the user; `--testnet --once` places/cancels cleanly.
 - [ ] Kill switch verified on testnet (force a >3% day or lower the cap temporarily).
