@@ -300,3 +300,25 @@ def test_strict_pass_regression_with_vetoes():
     assert signal["direction"] == "LONG"
     assert signal["quality"] >= config.MIN_QUALITY_SCORE
     assert "STRICT PASS" in note
+
+
+def test_btc_pump_vetoes_shorts():
+    # +3.1%/1h: every symbol's new SHORT signal is vetoed (mirror of the
+    # BTC-dump breaker for longs).
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        m = FakeMarket()
+        m.btc_1h = candles_from_closes([100.0, 103.1])
+        vetoes.reset_caches()
+        by = blocks_by_code(run_vetoes(symbol, "BEARISH", m, BENIGN_SNAP))
+        kind, reason = by["btc_breaker"]
+        assert kind == "veto", symbol
+        assert "circuit breaker" in reason and "SHORT" in reason, symbol
+
+
+def test_btc_pump_no_veto_for_longs():
+    # A BTC pump does not veto LONGs (asymmetric guard, like the dump side).
+    m = FakeMarket()
+    m.btc_1h = candles_from_closes([100.0, 103.1])
+    vetoes.reset_caches()
+    assert "btc_breaker" not in blocks_by_code(
+        run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
