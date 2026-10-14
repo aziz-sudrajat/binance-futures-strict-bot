@@ -436,12 +436,18 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
     if vol < config.MIN_24H_VOLUME_USD:
         return None, f"24h volume ${vol:,.0f} below ${config.MIN_24H_VOLUME_USD:,}"
 
-    # 2. 15m setup: BULLISH WATCH + plan + strength >= 3
+    # 2. 15m setup: BULLISH WATCH + plan + strength >= 3.
+    # LONG-only by construction: vetoes, deltas, cascade, plan geometry and
+    # the executor are all bullish-oriented — there is no SHORT path. Hence
+    # non-bullish 15m setups are ALWAYS rejected here, regardless of the
+    # bullish_only knob (kept for GAS-parity display / future use). Letting a
+    # BEARISH WATCH through would emit direction="LONG" with an inverted
+    # (bearish) plan — stop above entry — which must never reach the executor.
     try:
         a15 = analyze_candles(symbol, "15m", market.get_klines(symbol, "15m"))
     except Exception as e:  # noqa: BLE001
         return None, f"15m data error: {e}"
-    if config.BULLISH_ONLY and not str(a15["signal"]).startswith("BULL"):
+    if not str(a15["signal"]).startswith("BULL"):
         return None, f"bullish-only: 15m signal {a15['signal']}"
     if not a15["trade_plan"]:
         return None, "15m: no trade plan"
