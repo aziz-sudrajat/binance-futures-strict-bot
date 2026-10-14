@@ -6,6 +6,37 @@
 > mainnet, requires `BINANCE_LIVE_KEY`/`BINANCE_LIVE_SECRET`, and refuses all
 > TEST ONLY flags. Run it only from a non-geo-blocked host.
 
+## Terminal interaktif: `binance`
+
+```bash
+git pull
+.venv/bin/pip install -r requirements.txt
+./binance
+```
+
+Framework-style shell — ketik perintah, bukan hafal tombol:
+
+| Perintah | Fungsi |
+|---|---|
+| `scan [--top N]` | Scan sinyal engine STRICT (Signal Radar) |
+| `auto-trade` | Auto-trade loop mode aktif (Ctrl+C berhenti, live panel) |
+| `auto-trade --demo` / `--live` / `--paper` | Ganti mode lalu jalan |
+| `auto-trade --from-db` | Eksekusi dari signals.db (tahap 2 pipeline) |
+| `auto-trade --setting` | Editor setting interaktif |
+| `setting` / `set <key> <value>` | Lihat/ubah setting studio |
+| `position` | Posisi terbuka (tabel live) |
+| `balance` | Saldo + PnL harian + kill switch |
+| `signals` | Signal fresh dari database scanner |
+| `scanner start|stop|status|once` | Kontrol all-coin scanner (OKX → DB) |
+| `mode [live|demo|paper]` | Ganti/lihat mode |
+| `events [--limit N]` | Event lifecycle terakhir |
+| `kill` | Status kill-switch |
+| `help [perintah]` | Bantuan (ada "did you mean?" untuk typo) |
+
+Bisa juga sekali jalan: `./binance position`, `./binance scan --top 10`.
+Tampilan pakai `rich`: tabel berwarna, panel status, live view saat
+auto-trade jalan. TUI curses lama (`tui.py`) tetap ada sebagai alternatif.
+
 Port of the **decision pipeline** from the GAS signal bot
 (`workspace/user/files/AZZATSSINS-20261013-imageperf-v4_5_02o2.gs`, 8.659 lines)
 to Python. Only the STRICT signal logic is ported — the autopost/publishing
@@ -640,7 +671,7 @@ jalan 24/7 di Termux.
 
 ### Pre-deploy checklist (from the quant-trading skill)
 
-- [ ] Full test suite green (`pytest tests/ -q`) — currently 242 passed.
+- [ ] Full test suite green (`pytest tests/ -q`) — currently 254 passed.
 - [ ] Paper-mode smoke run completed with no errors.
 - [ ] Testnet key created by the user; `--testnet --once` places/cancels cleanly.
 - [ ] Kill switch verified on testnet (force a >3% day or lower the cap temporarily).
