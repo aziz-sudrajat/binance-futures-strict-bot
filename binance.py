@@ -37,7 +37,6 @@ except ImportError:
     pass
 
 from rich.console import Console
-from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
@@ -78,6 +77,7 @@ class BinanceShell:
         self._scanner_thread: threading.Thread | None = None
         self._scanner_stop = threading.Event()
         self._executor_cache: dict[str, object] = {}
+        self._scan_thread: threading.Thread | None = None
 
     # ---------------------------------------------------------- prompt
     def prompt(self) -> str:
@@ -117,13 +117,34 @@ class BinanceShell:
             except (ValueError, IndexError):
                 self.console.print("[red]--top butuh angka[/red]")
                 return
-        self.console.print("[dim]scanning dengan engine STRICT…[/dim]")
-        try:
-            rows = dashboard.run_radar(mode=self.mode)
-        except Exception as e:  # noqa: BLE001
-            self.console.print(f"[red]scan gagal:[/red] {e}")
+        if self._scan_thread and self._scan_thread.is_alive():
+            self.console.print("[yellow]scan masih jalan — tunggu "
+                               "selesai dulu[/yellow]")
             return
-        self.console.print(radar_table(rows, limit=top))
+        result: dict = {}
+
+        def _run() -> None:
+            try:
+                result["rows"] = dashboard.run_radar(mode=self.mode)
+            except Exception as e:  # noqa: BLE001
+                result["error"] = e
+
+        self._scan_thread = threading.Thread(target=_run, daemon=True)
+        self._scan_thread.start()
+        try:
+            with self.console.status(
+                    "[bold green]scanning dengan engine STRICT…[/bold green]"
+                    "\n[dim](55 coin, bisa 1–2 menit — Ctrl+C batalkan)[/dim]",
+                    spinner="dots"):
+                while self._scan_thread.is_alive():
+                    self._scan_thread.join(0.1)
+        except KeyboardInterrupt:
+            self.console.print("\n[yellow]scan dibatalkan[/yellow]")
+            return
+        if "error" in result:
+            self.console.print(f"[red]scan gagal:[/red] {result['error']}")
+            return
+        self.console.print(radar_table(result.get("rows") or [], limit=top))
 
     def cmd_mode(self, args: list[str]) -> None:
         if not args:
@@ -334,6 +355,9 @@ class BinanceShell:
         self.run_autotrade_loop(from_db=from_db)
 
     def run_autotrade_loop(self, from_db: bool = False) -> None:
+        # NOTE: no rich Live here on purpose — Live's in-place redraw
+        # corrupts on some Termux terminals (panels stack instead of
+        # refreshing). Static per-cycle panels work everywhere.
         try:
             executor = self.get_executor()
         except SystemExit as e:
@@ -351,26 +375,45 @@ class BinanceShell:
                 return
         self.console.print(
             f"[green]▶ auto-trade [{self.mode}] berjalan[/green] "
-            f"[dim](sumber: {src}, Ctrl+C berhenti)[/dim]")
+            f"[dim](sumber: {src})[/dim]\n"
+            f"[dim]Ctrl+C kapan saja untuk berhenti dan kembali ke "
+            f"prompt[/dim]")
         cycle = 0
-        with Live(self._autotrade_view(executor, None, cycle, from_db),
-                   console=self.console, refresh_per_second=1) as live:
-            try:
-                while True:
-                    cycle += 1
+        try:
+            while True:
+                cycle += 1
+                self.console.print(
+                    f"\n[bold cyan]━━━ cycle #{cycle} "
+                    f"[{self.mode}] ━━━[/bold cyan]")
+                with self.console.status("[green]scanning…[/green]",
+                                         spinner="dots"):
                     try:
                         summary = (executor.scan_from_db("signals.db")
                                    if from_db else executor.scan_once())
                     except Exception as e:  # noqa: BLE001
-                        summary = {"error": str(e)[:100]}
-                    live.update(self._autotrade_view(executor, summary,
-                                                     cycle, from_db))
-                    interval = executor.poll_interval_min * 60
-                    for _ in range(int(interval)):
-                        time.sleep(1)
-            except KeyboardInterrupt:
-                pass
-        self.console.print("[yellow]■ auto-trade berhenti[/yellow]")
+                        summary = {"error": str(e)[:120]}
+                self.console.print(self._autotrade_view(executor, summary,
+                                                        cycle, from_db))
+                self._sleep_countdown(
+                    int(executor.poll_interval_min * 60))
+        except KeyboardInterrupt:
+            self.console.print("\n[yellow]■ auto-trade berhenti — "
+                               "kembali ke prompt[/yellow]")
+
+    def _sleep_countdown(self, seconds: int) -> None:
+        """Sleep that shows a one-line countdown; Ctrl+C aborts."""
+        try:
+            for remaining in range(seconds, 0, -1):
+                mins, secs = divmod(remaining, 60)
+                self.console.print(
+                    f"\r[dim]cycle berikutnya dalam {mins}:{secs:02d} — "
+                    f"Ctrl+C berhenti[/dim]",
+                    end="")
+                time.sleep(1)
+            self.console.print()
+        except KeyboardInterrupt:
+            self.console.print()
+            raise
 
     def _autotrade_view(self, executor, summary, cycle: int,
                         from_db: bool):
@@ -447,11 +490,16 @@ class BinanceShell:
             except (KeyboardInterrupt, EOFError):
                 self.console.print()
                 break
+            except Exception as e:  # noqa: BLE001 - never crash the shell
+                self.console.print(f"[red]input error:[/red] {e}")
+                continue
             try:
                 if not self.dispatch(line):
                     break
             except SystemExit:
                 break
+            except Exception as e:  # noqa: BLE001 - never crash the shell
+                self.console.print(f"[red]error:[/red] {e}")
         self.console.print("[dim]sampai jumpa 👋[/dim]")
 
 
