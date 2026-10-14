@@ -8,7 +8,7 @@ import pytest
 
 import config
 import executor as ex
-from executor import Executor, compute_qty, split_tp_qty, make_signal_id
+from executor import Executor, compute_qty, compute_test_qty, split_tp_qty, make_signal_id
 from lifecycle import LifecycleLogger
 from risk import PaperBroker, RiskManager, floor_to_step, utc_today
 from run_executor import require_testnet_keys
@@ -42,6 +42,7 @@ class FakeExchange:
         self.filters = {"status": "TRADING", "tickSize": 0.1, "stepSize": 0.001,
                         "minQty": 0.001, "maxQty": 100000.0, "minNotional": 5.0}
         self.margin_calls = []
+        self.leverage_calls = []
 
     def get_balance(self, asset="USDT"):
         return self._balance
@@ -50,6 +51,7 @@ class FakeExchange:
         return list(self.exchange_positions)
 
     def set_leverage(self, symbol, leverage):
+        self.leverage_calls.append((symbol, leverage))
         return True
 
     def set_margin_type(self, symbol, margin_type="ISOLATED"):
@@ -89,6 +91,8 @@ class FakeExchange:
 
     def get_order(self, symbol, order_id=None, orig_client_order_id=None):
         for o in self.orders.values():
+            if "orderId" not in o:  # algo orders live here too; skip them
+                continue
             if order_id is not None and o["orderId"] == order_id:
                 return dict(o)
             if orig_client_order_id and o["clientOrderId"] == orig_client_order_id:
@@ -97,6 +101,8 @@ class FakeExchange:
 
     def cancel_order(self, symbol, order_id=None, orig_client_order_id=None):
         for o in self.orders.values():
+            if "orderId" not in o:
+                continue
             if ((order_id is not None and o["orderId"] == order_id) or
                     (orig_client_order_id and
                      o["clientOrderId"] == orig_client_order_id)):
@@ -107,8 +113,33 @@ class FakeExchange:
 
     def get_open_orders(self, symbol=None):
         return [dict(o) for o in self.orders.values()
-                if o["status"] == "NEW"
+                if "orderId" in o and o["status"] == "NEW"
                 and (symbol is None or o["symbol"] == symbol)]
+
+    # algo-order stand-ins (mirror ExchangeClient.place/cancel/get_algo_order)
+    def place_algo_order(self, symbol, side, type, quantity=None,
+                         trigger_price=None, price=None, reduce_only=False,
+                         working_type="MARK_PRICE", time_in_force="GTE_GTC",
+                         client_algo_id=None):
+        aid = next(self._ids)
+        o = {"algoId": aid, "symbol": symbol, "side": side, "type": type,
+             "origQty": quantity or 0.0, "triggerPrice": trigger_price or 0.0,
+             "price": price or 0.0, "reduceOnly": reduce_only,
+             "clientAlgoId": client_algo_id or f"fake_algo_{aid}",
+             "status": "NEW"}
+        self.orders[aid] = o
+        return {"algoId": aid, "clientAlgoId": o["clientAlgoId"],
+                "status": o["status"]}
+
+    def cancel_algo_order(self, symbol, algo_id):
+        o = self.orders.get(algo_id)
+        if o is not None and o["status"] == "NEW":
+            o["status"] = "CANCELED"
+        return True
+
+    def get_algo_order(self, symbol, algo_id):
+        o = self.orders.get(algo_id)
+        return dict(o) if o is not None else None
 
     # test helper: force an order to FILLED
     def fill(self, order_id, px, qty=None):
@@ -257,7 +288,8 @@ def test_breakeven_after_tp1(rig):
     assert pos["sl_order_id"] != old_sl
     new_sl = exchange.get_order("BTCUSDT", order_id=pos["sl_order_id"])
     assert new_sl["stopPrice"] == pos["entry_price"]  # == 100.0 (breakeven)
-    assert exchange.get_order("BTCUSDT", order_id=old_sl)["status"] == "CANCELED"
+    # the original SL was an algo order -> must be canceled via the algo route
+    assert exchange.get_algo_order("BTCUSDT", old_sl)["status"] == "CANCELED"
     states = [e["state"] for e in lifecycle.read_all()]
     assert "tp1_hit" in states
 
@@ -377,3 +409,248 @@ def test_lifecycle_jsonl_appends(workdir):
     assert len(events) == 2 and events[0]["state"] == "approved"
     with open(path) as f:
         assert len(f.readlines()) == 2  # one JSON object per line
+
+
+# ------------------------------------------- fixed-margin test sizing (test mode)
+
+def test_test_sizing_math():
+    filters = {"stepSize": 0.001, "minQty": 0.001, "minNotional": 5.0}
+    qty, note = compute_test_qty(10.0, 10, 100.0, filters)
+    assert qty == 1.0, note  # $10 x10 = $100 notional / $100 = 1.0
+    qty20, _ = compute_test_qty(10.0, 20, 100.0, filters)
+    assert qty20 == 2.0  # $10 x20 = $200 notional
+
+
+def test_test_sizing_floors_down():
+    filters = {"stepSize": 0.5, "minQty": 0.5, "minNotional": 5.0}
+    qty, _ = compute_test_qty(10.0, 10, 100.0, filters)
+    assert qty == 1.0
+    # raw 100/300 = 0.333 -> floors to 0.0 -> below minQty -> skip
+    qty2, reason = compute_test_qty(10.0, 10, 300.0, filters)
+    assert qty2 == 0.0 and "minQty" in reason
+
+
+def test_test_sizing_min_notional_skips():
+    filters = {"stepSize": 0.001, "minQty": 0.001, "minNotional": 5.0}
+    qty, _ = compute_test_qty(10.0, 1, 100.0, filters)
+    assert qty == 0.1  # $10 notional >= $5 minNotional
+    qty2, reason = compute_test_qty(0.1, 1, 100.0, filters)
+    assert qty2 == 0.0 and "minNotional" in reason
+
+
+def test_test_sizing_invalid_inputs():
+    filters = {"stepSize": 0.001, "minQty": 0.001, "minNotional": 5.0}
+    assert compute_test_qty(0, 10, 100.0, filters)[0] == 0.0
+    assert compute_test_qty(-5, 10, 100.0, filters)[0] == 0.0
+    assert compute_test_qty(10.0, 0, 100.0, filters)[0] == 0.0
+    assert compute_test_qty(10.0, 10, 0.0, filters)[0] == 0.0
+
+
+def test_leverage_override_and_fixed_margin_in_open_flow(workdir):
+    market = FakeMarket(live=100.0)
+    exchange = FakeExchange(balance=10_000.0)
+    exchange.market_price = {"BTCUSDT": 100.0}
+    state = StateStore(os.path.join(workdir, "state.json"))
+    lifecycle = LifecycleLogger(os.path.join(workdir, "lifecycle.jsonl"))
+    risk = RiskManager(state, exchange.get_balance)
+    ev = lambda symbol, m: (_signal(symbol), "stub")  # noqa: E731
+    executor = Executor(market, exchange, risk, state, lifecycle,
+                        universe=["BTCUSDT"], evaluate_fn=ev,
+                        fixed_margin_usdt=10.0, leverage_override=10)
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    assert summary["opened"] == 1, summary
+    assert ("BTCUSDT", 10) in exchange.leverage_calls  # override, not default 3
+    assert ("BTCUSDT", "ISOLATED") in exchange.margin_calls
+    positions = executor._open_positions()
+    pos = next(iter(positions.values()))
+    assert pos["qty"] == 1.0  # $10 x10 / $100 entry
+    assert pos["leverage"] == 10
+    assert pos["margin_usdt"] == 10.0
+
+
+def test_default_sizing_unchanged_without_overrides(workdir):
+    # Without overrides the executor must still use risk-based sizing + 3x.
+    market = FakeMarket(live=100.0)
+    exchange = FakeExchange(balance=10_000.0)
+    exchange.market_price = {"BTCUSDT": 100.0}
+    state = StateStore(os.path.join(workdir, "state.json"))
+    lifecycle = LifecycleLogger(os.path.join(workdir, "lifecycle.jsonl"))
+    risk = RiskManager(state, exchange.get_balance)
+    ev = lambda symbol, m: (_signal(symbol), "stub")  # noqa: E731
+    executor = Executor(market, exchange, risk, state, lifecycle,
+                        universe=["BTCUSDT"], evaluate_fn=ev)
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    assert summary["opened"] == 1, summary
+    assert ("BTCUSDT", config.MAX_LEVERAGE) in exchange.leverage_calls
+    pos = next(iter(executor._open_positions().values()))
+    # risk-based: 1% of $10k = $100 / $2 stop dist = 50 -> capped to
+    # 20% of $10k = $2000 / $100 = 20.0
+    assert pos["qty"] == 20.0
+
+
+# ------------------------------------------------- leverage tiers (test mode)
+
+def _executor_with(workdir, **kw):
+    market = FakeMarket(live=100.0)
+    exchange = FakeExchange(balance=10_000.0)
+    exchange.market_price = {"BTCUSDT": 100.0}
+    state = StateStore(os.path.join(workdir, "state.json"))
+    lifecycle = LifecycleLogger(os.path.join(workdir, "lifecycle.jsonl"))
+    risk = RiskManager(state, exchange.get_balance)
+    ev = lambda symbol, m: (_signal(symbol), "stub")  # noqa: E731
+    return Executor(market, exchange, risk, state, lifecycle,
+                    universe=["BTCUSDT"], evaluate_fn=ev, **kw)
+
+
+def test_resolve_leverage_tiers_from_config(workdir):
+    ex = _executor_with(workdir, fixed_margin_usdt=10.0)
+    assert ex._resolve_leverage("BTCUSDT") == 20
+    assert ex._resolve_leverage("ETHUSDT") == 20
+    assert ex._resolve_leverage("BNBUSDT") == 20
+    assert ex._resolve_leverage("SOLUSDT") == 10
+    assert ex._resolve_leverage("PEPEUSDT") == 10
+
+
+def test_resolve_leverage_single_override_wins(workdir):
+    ex = _executor_with(workdir, fixed_margin_usdt=10.0, leverage_override=15)
+    assert ex._resolve_leverage("BTCUSDT") == 15
+    assert ex._resolve_leverage("SOLUSDT") == 15
+
+
+def test_resolve_leverage_normal_mode_uses_max(workdir):
+    ex = _executor_with(workdir)  # no test mode at all
+    assert ex._resolve_leverage("BTCUSDT") == config.MAX_LEVERAGE
+    assert ex._resolve_leverage("SOLUSDT") == config.MAX_LEVERAGE
+
+
+def test_resolve_leverage_cli_tiers_merge_over_config(workdir):
+    ex = _executor_with(workdir, fixed_margin_usdt=10.0,
+                        leverage_tiers={"SOLUSDT": 25}, leverage_default=5)
+    assert ex._resolve_leverage("SOLUSDT") == 25   # CLI wins
+    assert ex._resolve_leverage("BTCUSDT") == 20   # config tier kept
+    assert ex._resolve_leverage("DOGEUSDT") == 5    # CLI default
+
+
+def test_parse_leverage_tiers():
+    from run_executor import _parse_leverage_tiers
+    assert _parse_leverage_tiers(None) is None
+    assert _parse_leverage_tiers("BTCUSDT=20, ethusdt=15") == {
+        "BTCUSDT": 20, "ETHUSDT": 15}
+    with pytest.raises(SystemExit):
+        _parse_leverage_tiers("BTCUSDT=200")   # out of range
+    with pytest.raises(SystemExit):
+        _parse_leverage_tiers("BTCUSDT")       # missing =LEV
+
+
+def test_tier_leverage_used_in_open_flow(workdir):
+    # SOLUSDT is not in the 20x tier -> 10x; BTCUSDT -> 20x.
+    for symbol, want_lev in (("SOLUSDT", 10), ("BTCUSDT", 20)):
+        market = FakeMarket(live=100.0)
+        exchange = FakeExchange(balance=10_000.0)
+        exchange.market_price = {symbol: 100.0}
+        sub = os.path.join(workdir, symbol)
+        os.makedirs(sub, exist_ok=True)
+        state = StateStore(os.path.join(sub, "state.json"))
+        lifecycle = LifecycleLogger(os.path.join(sub, "lifecycle.jsonl"))
+        risk = RiskManager(state, exchange.get_balance)
+        ev = lambda s, m, _sym=symbol: (_signal(_sym), "stub")  # noqa: E731
+        executor = Executor(market, exchange, risk, state, lifecycle,
+                            universe=[symbol], evaluate_fn=ev,
+                            fixed_margin_usdt=10.0)
+        summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+                   "errors": []}
+        executor._scan_symbol(symbol, 10_000.0, summary)
+        assert summary["opened"] == 1, (symbol, summary)
+        assert (symbol, want_lev) in exchange.leverage_calls, (
+            symbol, exchange.leverage_calls)
+        pos = next(iter(executor._open_positions().values()))
+        assert pos["leverage"] == want_lev
+        # margin $10 fixed; qty reflects tier: $10*10/100=1.0, $10*20/100=2.0
+        assert pos["qty"] == (1.0 if want_lev == 10 else 2.0)
+
+
+# ------------------------------------------------------- manual entry (test)
+
+class CandleMarket(FakeMarket):
+    """FakeMarket with a synthetic 15m candle history for ATR."""
+    def __init__(self, live=2.0, n=30):
+        super().__init__(live=live)
+        base = 1_728_900_000_000
+        self.candles = []
+        px = live * 0.98
+        for i in range(n):
+            o = px
+            h = px * 1.01
+            l = px * 0.99
+            c = px * 1.002
+            self.candles.append({
+                "open_time": base + i * 900_000,
+                "close_time": base + (i + 1) * 900_000 - 1,
+                "open": o, "high": h, "low": l, "close": c,
+            })
+            px = c
+
+    def get_klines(self, symbol, interval, limit=220):
+        return self.candles[-limit:]
+
+
+def _manual_rig(workdir, symbol="GRASSUSDT", **kw):
+    market = CandleMarket(live=2.0)
+    exchange = FakeExchange(balance=10_000.0)
+    exchange.market_price = {symbol: 2.0}
+    state = StateStore(os.path.join(workdir, "state.json"))
+    lifecycle = LifecycleLogger(os.path.join(workdir, "lifecycle.jsonl"))
+    risk = RiskManager(state, exchange.get_balance)
+    return Executor(market, exchange, risk, state, lifecycle,
+                    universe=[symbol], fixed_margin_usdt=10.0, **kw), exchange
+
+
+def test_manual_entry_opens_with_brackets(workdir):
+    executor, exchange = _manual_rig(workdir)
+    ok, note = executor.manual_entry("GRASSUSDT")
+    assert ok, note
+    assert "MANUAL LONG GRASSUSDT" in note
+    assert (("GRASSUSDT", 10) in exchange.leverage_calls)  # default tier
+    assert ("GRASSUSDT", "ISOLATED") in exchange.margin_calls
+    positions = executor._open_positions()
+    assert len(positions) == 1
+    pos = next(iter(positions.values()))
+    assert pos["leverage"] == 10
+    assert pos["margin_usdt"] == 10.0
+    assert pos["brackets_placed"] is True
+    assert pos["stop_loss"] < pos["entry_price"] < pos["tp"]["tp1"]["price"]
+
+
+def test_manual_entry_idempotent_per_candle(workdir):
+    executor, _ = _manual_rig(workdir)
+    ok1, _ = executor.manual_entry("GRASSUSDT")
+    assert ok1
+    ok2, note2 = executor.manual_entry("GRASSUSDT")
+    assert not ok2 and "already attempted" in note2
+    assert len(executor._open_positions()) == 1
+
+
+def test_manual_entry_no_live_price_fail_closed(workdir):
+    executor, _ = _manual_rig(workdir)
+    executor.market.live = 0  # price feed dead
+    ok, note = executor.manual_entry("GRASSUSDT")
+    assert not ok and "live price" in note.lower()
+    assert len(executor._open_positions()) == 0
+
+
+def test_manual_entry_thin_candles_fail_closed(workdir):
+    executor, exchange = _manual_rig(workdir)
+    executor.market.candles = executor.market.candles[:5]
+    ok, note = executor.manual_entry("GRASSUSDT")
+    assert not ok and "candles" in note.lower()
+    assert len(executor._open_positions()) == 0
+
+
+def test_manual_entry_unknown_symbol(workdir):
+    executor, _ = _manual_rig(workdir)
+    ok, note = executor.manual_entry("!!!")
+    assert not ok
