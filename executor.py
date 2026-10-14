@@ -515,7 +515,13 @@ class Executor:
     def _try_open(self, symbol: str, signal: dict, sid: str,
                   balance: float | None) -> tuple[bool, str]:
         entry = float(signal["entry"])
+        direction = str(signal.get("direction", "LONG")).upper()
+        is_short = direction == "SHORT"
+        entry_side = "SELL" if is_short else "BUY"   # open: sell short / buy long
+        exit_side = "BUY" if is_short else "SELL"     # close: buy back / sell
         # 1. Freshness re-check with a LIVE price, right before ordering.
+        # Mirrors the engine gate: LONG rejects price ran above the zone,
+        # SHORT rejects price ran below the zone.
         try:
             live = self.market.get_live_price(symbol)
         except Exception:  # noqa: BLE001
@@ -524,11 +530,19 @@ class Executor:
             return self._reject(
                 symbol, sid, "freshness re-check: live price unavailable "
                              "(fail-closed)")
-        drift = (live - signal["entry_high"]) / signal["entry_high"] * 100
-        if drift > config.FRESHNESS_MAX_DRIFT_PCT:
-            return self._reject(
-                symbol, sid,
-                f"freshness re-check: +{drift:.2f}% above entry zone - stale")
+        if is_short:
+            low = float(signal["entry_low"])
+            drift = (low - live) / low * 100 if low > 0 else 0.0
+            if drift > config.FRESHNESS_MAX_DRIFT_PCT:
+                return self._reject(
+                    symbol, sid,
+                    f"freshness re-check: -{drift:.2f}% below entry zone - stale")
+        else:
+            drift = (live - signal["entry_high"]) / signal["entry_high"] * 100
+            if drift > config.FRESHNESS_MAX_DRIFT_PCT:
+                return self._reject(
+                    symbol, sid,
+                    f"freshness re-check: +{drift:.2f}% above entry zone - stale")
 
         # 2. Exchange tradability + leverage + margin.
         filters = self.exchange.get_symbol_filters(symbol)
@@ -586,7 +600,7 @@ class Executor:
         tick = filters.get("tickSize", 0) or 0
         entry_px = round(entry / tick) * tick if tick else entry
         order = self.exchange.place_order(
-            symbol, "BUY", entry_type,
+            symbol, entry_side, entry_type,
             quantity=qty,
             price=None if entry_type == "MARKET" else entry_px,
             client_order_id=self._leg_id(pos_id, "EN"))
@@ -594,7 +608,7 @@ class Executor:
             return self._reject(symbol, sid, "entry order placement failed")
 
         self.state.get("positions", {})[pos_id] = {
-            "symbol": symbol, "signal_id": sid, "direction": "LONG",
+            "symbol": symbol, "signal_id": sid, "direction": direction,
             "qty": qty, "entry_price": entry_px,
             "leverage": lev,
             "margin_usdt": round(qty * entry_px / lev, 2) if lev else 0.0,
@@ -661,7 +675,8 @@ class Executor:
                 tp["filled"] = True
                 fill_px = float(o.get("avgPrice") or tp["price"])
                 fill_qty = float(o.get("executedQty") or tp["qty"])
-                pnl = (fill_px - pos["entry_price"]) * fill_qty
+                sign = -1.0 if pos.get("direction") == "SHORT" else 1.0
+                pnl = sign * (fill_px - pos["entry_price"]) * fill_qty
                 fee = fill_px * fill_qty * _FEE_PCT / 100
                 net = pnl - fee
                 pos["realized"] = pos.get("realized", 0.0) + net
@@ -749,6 +764,9 @@ class Executor:
         symbol = pos["symbol"]
         placed_algo: list[int] = []
         placed_regular: list[int] = []
+        # Exit side mirrors the position direction: LONG exits with SELL,
+        # SHORT exits with BUY (covers SL stop-market + TP limits).
+        exit_side = "BUY" if pos.get("direction") == "SHORT" else "SELL"
 
         def _undo():
             for aid in placed_algo:
@@ -767,7 +785,7 @@ class Executor:
             return round(p / tick) * tick if tick else p
 
         sl = self.exchange.place_algo_order(
-            symbol, "SELL", "STOP_MARKET", quantity=pos["qty"],
+            symbol, exit_side, "STOP_MARKET", quantity=pos["qty"],
             trigger_price=_px(pos["stop_loss"]), reduce_only=True,
             working_type="MARK_PRICE",
             client_algo_id=self._leg_id(pos_id, "SL"))
@@ -782,7 +800,7 @@ class Executor:
             if tp["qty"] <= 0:
                 continue
             o = self.exchange.place_order(
-                symbol, "SELL", "LIMIT", quantity=tp["qty"],
+                symbol, exit_side, "LIMIT", quantity=tp["qty"],
                 price=_px(tp["price"]), reduce_only=True,
                 client_order_id=self._leg_id(pos_id, leg.upper()))
             if not o:
@@ -824,8 +842,9 @@ class Executor:
         except Exception:  # noqa: BLE001
             pass
         be = round(pos["entry_price"] / tick) * tick if tick else pos["entry_price"]
+        exit_side = "BUY" if pos.get("direction") == "SHORT" else "SELL"
         sl = self.exchange.place_order(
-            symbol, "SELL", "STOP_MARKET", quantity=pos["qty"],
+            symbol, exit_side, "STOP_MARKET", quantity=pos["qty"],
             stop_price=be, reduce_only=True, working_type="MARK_PRICE",
             client_order_id=self._leg_id(pos_id, "SLBE"))
         if sl:
@@ -854,7 +873,8 @@ class Executor:
             o = self._sl_status(symbol, pos)
             if o and o.get("status") == "FILLED":
                 fill_px = float(o.get("avgPrice") or pos["stop_loss"])
-                pnl = (fill_px - pos["entry_price"]) * pos["qty"]
+                sign = -1.0 if pos.get("direction") == "SHORT" else 1.0
+                pnl = sign * (fill_px - pos["entry_price"]) * pos["qty"]
                 fee = fill_px * pos["qty"] * _FEE_PCT / 100
                 net = pnl - fee
                 pos["realized"] = pos.get("realized", 0.0) + net
