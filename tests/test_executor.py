@@ -853,6 +853,42 @@ def test_algo_sl_cancelled_no_phantom_estimate(rig):
     assert pos["realized"] == 0.0, pos["realized"]
 
 
+def test_gone_check_fail_closed_on_positions_error(rig, monkeypatch):
+    """Regression (live 2026-10-15): a transient get_positions() failure
+    (laptop waking from sleep) made the bot log false 'position gone from
+    exchange' sl_hit events and corrupt state. get_positions() must raise
+    on API failure, and _manage_one must skip the gone-check instead of
+    closing a live position."""
+    from exchange import ExchangeError
+    executor, market, exchange, state, lifecycle, risk = rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    pos_id, pos = next(iter(executor._open_positions().items()))
+    assert pos.get("brackets_placed") is True
+
+    def boom():
+        raise ExchangeError("GET /fapi/v2/account network error")
+    monkeypatch.setattr(exchange, "get_positions", boom)
+    executor._manage_one(pos_id, pos, 10_000.0, summary)
+    assert pos.get("closed") is not True
+    states = [e["state"] for e in lifecycle.read_all()]
+    assert "sl_hit" not in states
+
+
+def test_get_positions_raises_on_api_error(monkeypatch):
+    """ExchangeClient.get_positions must propagate API failures (fail-closed),
+    never return a phantom empty list."""
+    from exchange import ExchangeClient, ExchangeError
+    ex = ExchangeClient("k", "s", base_url="https://example.invalid")
+
+    def boom(*a, **k):
+        raise ExchangeError("boom")
+    monkeypatch.setattr(ex, "_request", boom)
+    with pytest.raises(ExchangeError):
+        ex.get_positions()
+
+
 def test_paper_fill_simulation_short():
     prices = {"BTCUSDT": 100.0}
     broker = PaperBroker(10_000.0, price_fn=lambda s: prices[s])
