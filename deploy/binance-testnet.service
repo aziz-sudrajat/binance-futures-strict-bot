@@ -1,0 +1,20 @@
+[Unit]
+Description=Binance Futures Bot (testnet loop)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__BOT_DIR__
+# Key dibaca dari .env (chmod 600, tidak ikut git)
+EnvironmentFile=__BOT_DIR__/.env
+ExecStart=__BOT_DIR__/.venv/bin/python __BOT_DIR__/run_executor.py --testnet --loop --fixed-margin-usdt 10
+Restart=always
+RestartSec=30
+# Jangan spam restart kalau config/key salah
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target
