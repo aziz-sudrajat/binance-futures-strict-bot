@@ -343,7 +343,9 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("risk_pct_per_trade", "Risk %/trade", "float"),
     ("max_leverage", "Max leverage", "int"),
     ("daily_loss_cap_pct", "Daily loss cap % (100=off)", "float"),
+    ("max_exposure_pct_per_symbol", "Max exposure %/coin", "float"),
     ("poll_interval_min", "Scan interval (min)", "int"),
+    ("trading_hours_enabled", "Trading hours gate (LIVE)", "bool"),
     ("min_quality_score", "Min quality score", "int"),
     ("mtf_30m_mode", "MTF 30m mode", "choice:STRICT,LEAN"),
     ("mtf_require_1d", "MTF: 1d wajib selaras", "bool"),
@@ -355,6 +357,9 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("tp3_rr", "TP3 (x risk)", "float"),
     ("stop_atr_min", "Stop ATR min", "float"),
     ("stop_atr_max", "Stop ATR max", "float"),
+    ("tp_split_1", "TP split 1 (fraksi)", "float"),
+    ("tp_split_2", "TP split 2 (fraksi)", "float"),
+    ("tp_split_3", "TP split 3 (fraksi)", "float"),
     ("breakeven_after_tp1", "Breakeven after TP1", "bool"),
     ("margin_mode", "Margin mode", "choice:ISOLATED,CROSS"),
     ("leverage_mode", "Leverage mode", "choice:auto,fixed"),
@@ -607,6 +612,19 @@ th{color:#8b949e;font-weight:600}
     <input type="number" id="s-lev" step="1" min="1" max="3"></div>
   <div class="setrow"><label>Interval scan (menit)</label>
     <input type="number" id="s-int" step="1" min="1" max="60"></div>
+  <div class="setrow"><label>Daily loss cap (%)<br>
+    <span class="dim" style="font-size:12px">kill switch: stop entry baru kalau
+    rugi harian tembus; 100 = off</span></label>
+    <input type="number" id="s-dlcap" step="0.5" min="0" max="100"></div>
+  <div class="setrow"><label>Max exposure / coin (%)<br>
+    <span class="dim" style="font-size:12px">batas notional posisi per coin
+    dari balance</span></label>
+    <input type="number" id="s-maxexp" step="5" min="5" max="500"></div>
+  <div class="setrow"><label><b>Trading hours gate (LIVE)</b><br>
+    <span class="dim" style="font-size:12px">ON = entry baru hanya
+    05:00–18:00 WIB; OFF = kapan saja</span></label>
+    <label class="switch"><input type="checkbox" id="s-th">
+    <span class="sl"></span></label></div>
 </div>
 <div class="card"><h2>🌐 Universe</h2>
   <div class="setrow"><label>Mode universe<br>
@@ -745,6 +763,9 @@ async function refresh(){
     $('s-risk').value = st.risk_pct_per_trade;
     $('s-lev').value = st.max_leverage;
     $('s-int').value = st.poll_interval_min;
+    $('s-dlcap').value = st.daily_loss_cap_pct;
+    $('s-maxexp').value = st.max_exposure_pct_per_symbol;
+    $('s-th').checked = st.trading_hours_enabled !== false;
     $('s-minq').value = st.min_quality_score;
     $('s-mode').value = st.signal_mode || 'ketat';    $('s-mtf').value = st.mtf_30m_mode;
     $('s-req1d').checked = st.mtf_require_1d !== false;
@@ -839,12 +860,16 @@ $('s-auto').onchange = ()=>postSettings({auto_trade:$('s-auto').checked}, true);
 $('s-bull').onchange = ()=>postSettings({bullish_only:$('s-bull').checked}, true);
 $('s-req1d').onchange = ()=>postSettings({mtf_require_1d:$('s-req1d').checked}, true);
 $('s-be').onchange = ()=>postSettings({breakeven_after_tp1:$('s-be').checked}, true);
+$('s-th').onchange = ()=>postSettings({trading_hours_enabled:$('s-th').checked}, true);
 $('save').onclick = ()=>{
   postSettings({
     auto_trade:$('s-auto').checked,
     risk_pct_per_trade:parseFloat($('s-risk').value),
     max_leverage:parseInt($('s-lev').value),
     poll_interval_min:parseInt($('s-int').value),
+    daily_loss_cap_pct:parseFloat($('s-dlcap').value),
+    max_exposure_pct_per_symbol:parseFloat($('s-maxexp').value),
+    trading_hours_enabled:$('s-th').checked,
     min_quality_score:parseInt($('s-minq').value),
     mtf_30m_mode:$('s-mtf').value,
     mtf_require_1d:$('s-req1d').checked,
