@@ -104,6 +104,26 @@ class ExchangeClient:
             self._exchange_info_ts = now
         return self._exchange_info
 
+    def tradable_symbols(self) -> set[str] | None:
+        """Set of TRADING PERPETUAL symbols, or None if unavailable.
+
+        Used as a pre-filter so the scanner doesn't waste engine
+        evaluations on symbols the exchange can't execute (e.g. PEPE,
+        TRUTH, SOXS on testnet). Returns None on any failure — the
+        caller must fail open and rely on the per-symbol check.
+        """
+        try:
+            info = self.get_exchange_info()
+        except Exception:  # noqa: BLE001 - fail open, never break a scan
+            return None
+        try:
+            return {s.get("symbol") for s in info.get("symbols", [])
+                    if s.get("symbol")
+                    and s.get("status") == "TRADING"
+                    and s.get("contractType") == "PERPETUAL"}
+        except Exception:  # noqa: BLE001 - malformed payload
+            return None
+
     def get_symbol_filters(self, symbol: str) -> dict | None:
         """Tradability + LOT_SIZE / PRICE_FILTER / MIN_NOTIONAL for a symbol.
 

@@ -171,6 +171,12 @@ DASHBOARD_SETTINGS_FILE = "dashboard_settings.json"
 EXEC_LIVE_STATE_FILE = "state-live.json"
 EXEC_LIVE_LIFECYCLE_FILE = "lifecycle-live.jsonl"
 EXEC_PAPER_START_BALANCE = 10_000.0       # hypothetical USDT for paper mode
+# Pre-filter the scan universe to exchange-tradable symbols (from cached
+# exchangeInfo). Prevents wasting engine evaluations on symbols that can
+# never be executed (e.g. PEPE/TRUTH/SOXS on testnet). Fail-open: if the
+# filter can't be built, the universe is unfiltered and the per-symbol
+# execution-time check remains the backstop.
+TRADABILITY_PREFILTER = True
 
 # ------------------------------------------------------------------ universe
 # Curated universe of liquid USDT-M perpetuals. The dashboard can switch to
