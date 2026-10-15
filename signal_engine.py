@@ -844,7 +844,8 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
         book = None
     blocks = run_vetoes(symbol, direction, market, snap, book=book,
                         skip_deriv_vetoes=degraded,
-                        disabled=getattr(config, "DISABLED_VETOES", ()))
+                        disabled=getattr(config, "DISABLED_VETOES", ()),
+                        entry_px=live)
     if blocks:
         why = "; ".join(f"[{code}/{kind}] {reason}"
                         for code, kind, reason in blocks)
