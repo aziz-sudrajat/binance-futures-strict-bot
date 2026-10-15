@@ -541,12 +541,13 @@ def test_mtf_1d_delta_soft_scoring():
 
 def test_biasa_preset_relaxes_1d_leg():
     # User spec 2026-10-15: MTF is 4h/1h/30m/15m — no 1d leg in any mode.
+    # Aturan 2026-10-15: SEMUA mode (termasuk biasa) cek MTF 4h/1h/30m/15m.
     assert config.SIGNAL_MODE_PRESETS["ketat"]["mtf_require_1d"] is True
     assert config.SIGNAL_MODE_PRESETS["sedang"]["mtf_require_1d"] is False
     assert config.SIGNAL_MODE_PRESETS["biasa"]["mtf_require_1d"] is False
     assert config.SIGNAL_MODE_PRESETS["sedang"]["mtf_require_1h"] is True
     assert config.SIGNAL_MODE_PRESETS["ketat"]["mtf_require_1h"] is True
-    assert config.SIGNAL_MODE_PRESETS["biasa"]["mtf_require_1h"] is False
+    assert config.SIGNAL_MODE_PRESETS["biasa"]["mtf_require_1h"] is True
 
 
 # ------------------------------------------------- mode layers (2026-10-15)
@@ -572,18 +573,22 @@ def _mode(monkeypatch):
     return _set
 
 
-def test_biasa_mode_15m_only(_mode):
-    # biasa: 15m setup alone passes — no MTF/BTC/pattern/news needed.
+def test_biasa_mode_requires_mtf(_mode):
+    # Aturan user 2026-10-15: SEMUA signal (termasuk biasa) cek MTF
+    # 4h/1h/30m/15m — MTF tak selaras = reject, bukan sekadar penalti.
     _mode("biasa")
-    m = FakeMarket(bullish=True)
-    # break everything above 15m: flat 1h/4h, no pattern, no news feed
-    m.klines["1h"] = candles_from_closes([100.0] * 220)
-    m.klines["4h"] = candles_from_closes([100.0] * 220)
-    m.klines["15m"] = bull_candles()  # no injected pattern
+    m = FakeMarket(bullish=True)  # semua TF bullish -> MTF selaras
     signal, note = evaluate_symbol("ETHUSDT", m)
     assert signal is not None, note
     assert "BIASA PASS" in note
     assert signal["direction"] == "LONG"
+    assert "MTF selaras" in note
+    # MTF rusak (1h flat -> neutral): biasa ikut reject seperti sedang/ketat
+    m2 = FakeMarket(bullish=True)
+    m2.klines["1h"] = candles_from_closes([100.0] * 220)
+    signal, reason = evaluate_symbol("ETHUSDT", m2)
+    assert signal is None
+    assert "MTF tak selaras" in reason
 
 
 def test_biasa_mode_bearish_short(_mode):
