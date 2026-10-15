@@ -62,6 +62,19 @@ class LifecycleLogger:
             pass
         return events
 
+    def has_terminal_event(self, signal_id: str) -> bool:
+        """True when a terminal outcome event was already logged for this
+        signal. Dedupe guard for startup-reconcile retries: a crash between
+        lifecycle.log and state.save must not attribute the same close
+        twice (the PnL was already recorded with the first log).
+        """
+        if not signal_id:
+            return False
+        for e in self.read_all():
+            if e.get("signal_id") == signal_id and e.get("terminal"):
+                return True
+        return False
+
     def last_event_ts(self) -> int | None:
         """Newest event timestamp (ms), or None when the log is empty/missing.
 
