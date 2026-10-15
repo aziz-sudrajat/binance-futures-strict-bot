@@ -178,6 +178,39 @@ EXEC_PAPER_START_BALANCE = 10_000.0       # hypothetical USDT for paper mode
 # execution-time check remains the backstop.
 TRADABILITY_PREFILTER = True
 
+# ------------------------------------------------- trading hours (WIB)
+# New entries are only opened inside this daily window, evaluated in the
+# Asia/Jakarta timezone. Position MANAGEMENT (TP/SL monitoring, breakeven
+# moves, expiry) keeps running around the clock, and the exchange-side
+# SL/TP algo orders protect open positions regardless of this gate.
+# Applies to LIVE entries only; paper/testnet are unaffected (testing).
+# User instruction 2026-10-15: "auto trading jalan 05:00-18:00 WIB aja",
+# confirmed with signal mode ketat.
+TRADING_HOURS_ENABLED = True
+TRADING_HOURS_START = "05:00"   # inclusive, "HH:MM"
+TRADING_HOURS_END = "18:00"     # exclusive, "HH:MM"
+TRADING_HOURS_TZ = "Asia/Jakarta"
+
+
+def within_trading_hours(now=None):
+    """True when `now` falls inside the configured trading window.
+
+    `now`: optional datetime (naive = assumed in TRADING_HOURS_TZ, aware =
+    converted). Returns True unconditionally when TRADING_HOURS_ENABLED
+    is False (dashboard override can disable the gate without restart).
+    """
+    if not TRADING_HOURS_ENABLED:
+        return True
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(TRADING_HOURS_TZ)
+    now = now or datetime.now(tz)
+    now = now.replace(tzinfo=tz) if now.tzinfo is None else now.astimezone(tz)
+    cur = now.strftime("%H:%M")
+    if TRADING_HOURS_START <= TRADING_HOURS_END:
+        return TRADING_HOURS_START <= cur < TRADING_HOURS_END
+    return cur >= TRADING_HOURS_START or cur < TRADING_HOURS_END
+
 # ------------------------------------------------------------------ universe
 # Curated universe of liquid USDT-M perpetuals. The dashboard can switch to
 # "top_volume" mode, which picks the top-N symbols by 24h quote volume from
@@ -262,6 +295,7 @@ DASH_BOOL_OVERRIDES = {
     "liq_review": "LIQ_REVIEW",
     "whale_review": "WHALE_REVIEW",
     "breakeven_after_tp1": "EXEC_BREAKEVEN_AFTER_TP1",
+    "trading_hours_enabled": "TRADING_HOURS_ENABLED",
 }
 # MTF 30m leg mode: STRICT (default) or LEAN (GAS default behavior).
 DASH_MTF_MODES = ("STRICT", "LEAN")
