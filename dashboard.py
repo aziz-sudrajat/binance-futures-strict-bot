@@ -367,6 +367,7 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("veto_whale", "Veto: whale divergence", "bool"),
     ("veto_liq_wall", "Veto: liquidity wall", "bool"),
     ("veto_btc_breaker", "Veto: BTC breaker", "bool"),
+    ("veto_sr_zone", "Veto: S/R zone", "bool"),
 ]
 
 
@@ -811,6 +812,7 @@ const VETOES=[
  ['veto_whale','Whale Divergence','top trader berlawanan arah'],
  ['veto_liq_wall','Liquidity Wall','tembok order block arah'],
  ['veto_btc_breaker','BTC Breaker','BTC dump -3%/1h'],
+ ['veto_sr_zone','S/R Location','short ke support / long ke resistance'],
 ];
 function renderVetoes(st){
   $('vetoes').innerHTML=VETOES.map(v=>
