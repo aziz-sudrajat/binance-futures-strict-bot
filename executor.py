@@ -844,11 +844,19 @@ class Executor:
             self._close_position(pos_id, pos, sid, summary)
             return
         # Cross-check against the exchange: SL may have filled without us
-        # seeing the order event (e.g. after a restart).
-        xp = {p["symbol"]: p for p in self.exchange.get_positions()}
-        if symbol not in xp and pos.get("brackets_placed"):
-            self._close_position(pos_id, pos, sid, summary,
-                                reason="position gone from exchange")
+        # seeing the order event (e.g. after a restart). FAIL-CLOSED: if the
+        # positions snapshot cannot be fetched, skip the check this cycle —
+        # never mistake an API error for "position closed" (2026-10-15:
+        # transient post-sleep failure orphaned real positions).
+        try:
+            xp = {p["symbol"]: p for p in self.exchange.get_positions()}
+        except Exception:  # noqa: BLE001 - keep managing on stale data
+            log.warning("%s: positions fetch failed, skipping gone-check",
+                        pos_id)
+        else:
+            if symbol not in xp and pos.get("brackets_placed"):
+                self._close_position(pos_id, pos, sid, summary,
+                                    reason="position gone from exchange")
         self.state.save()
 
     def _check_entry_fill(self, pos_id: str) -> bool:
