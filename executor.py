@@ -382,6 +382,17 @@ class Executor:
             log.warning("scan with vetoes DISABLED by operator: %s",
                         sorted(config.DISABLED_VETOES))
         self._manage_positions(balance, summary)
+        # Trading-hours gate (LIVE only): new entries only 05:00-18:00 WIB.
+        # Management above always runs; this only skips the entry scan.
+        entries_allowed = (
+            self.settings_mode != "live" or config.within_trading_hours()
+        )
+        if not entries_allowed:
+            log.info("outside trading hours (%s-%s %s): entries paused",
+                     config.TRADING_HOURS_START, config.TRADING_HOURS_END,
+                     config.TRADING_HOURS_TZ)
+            self.state.save()
+            return summary
         universe = resolve_universe(self.exchange, self._dash_settings(),
                                     self.universe, market=self.market)
         universe = self._apply_tradability_prefilter(universe)
@@ -417,6 +428,14 @@ class Executor:
         # Studio settings: applied every cycle, no restart needed.
         config.apply_dashboard_overrides(self._dash_settings())
         self._manage_positions(balance, summary)
+        # Trading-hours gate (LIVE only): no new entries outside 05:00-18:00.
+        if (self.settings_mode == "live"
+                and not config.within_trading_hours()):
+            log.info("outside trading hours (%s-%s %s): db entries paused",
+                     config.TRADING_HOURS_START, config.TRADING_HOURS_END,
+                     config.TRADING_HOURS_TZ)
+            self.state.save()
+            return summary
         db = SignalDB(db_path)
         try:
             db.expire_old()
@@ -998,15 +1017,31 @@ class Executor:
         else:
             # SL filled (or position vanished): check the SL order.
             o = self._sl_status(symbol, pos)
+            estimated = False
             if o and o.get("status") == "FILLED":
                 fill_px = float(o.get("avgPrice") or pos["stop_loss"])
+            elif (o is None and pos.get("sl_is_algo") and pos.get("stop_loss")
+                    and pos.get("qty", 0) > 0):
+                # Triggered algo STOP_MARKET orders vanish from
+                # /fapi/v1/algoOrder ("unknown algo order"), so a genuine SL
+                # fill looks like "order not found". Estimate the fill at the
+                # trigger price instead of silently recording 0.0 for a real
+                # loss. (Seen live: GRASSUSDT and WALUSDT SL fills recorded
+                # as 0.0 while the exchange booked -5.13 / -7.86.)
+                fill_px = float(pos["stop_loss"])
+                estimated = True
+            else:
+                fill_px = None
+            if fill_px is not None:
                 sign = -1.0 if pos.get("direction") == "SHORT" else 1.0
                 pnl = sign * (fill_px - pos["entry_price"]) * pos["qty"]
                 fee = fill_px * pos["qty"] * _FEE_PCT / 100
                 net = pnl - fee
                 pos["realized"] = pos.get("realized", 0.0) + net
                 self.risk.record_realized(net)
-                log.info("%s SL hit @ %s (pnl %+0.2f)", pos_id, fill_px, net)
+                mark = " (est. @ trigger)" if estimated else ""
+                log.info("%s SL hit @ %s%s (pnl %+0.2f)", pos_id, fill_px,
+                         mark, net)
             event, why = SL_HIT, reason or "sl_hit"
         # Cancel any leftover working orders for the symbol legs.
         for leg in ("tp1", "tp2", "tp3"):
