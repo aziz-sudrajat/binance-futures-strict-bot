@@ -112,6 +112,15 @@ LIQ_WALL_VETO_DISTANCE_PCT = 0.5    # GAS CFG L75: wall within 0.5% of mid block
 LIQ_WALL_MIN_NOTIONAL_USD = 250_000 # GAS CFG L76: wall notional threshold
 BTC_DUMP_VETO_PCT = 3.0             # GAS CFG L106: BTC -3%/1h -> veto ALL new signals (LONG-only system)
 BTC_BREAKER_TTL_SEC = 300           # own cache for the market-wide breaker check
+# S/R location veto (user 2026-10-15): never SHORT into 4h support, never
+# LONG into 4h resistance. Support/resistance = 4h swing extremes over the
+# lookback (~2-3 months of 4h candles). The "zone" is SR_ZONE_ATR_MULT x
+# ATR(4h) inside the level — volatility-adaptive per coin. Entries sitting
+# inside the zone edge are vetoed; a breakdown already below support (or
+# breakout above resistance) is allowed.
+SR_ZONE_LOOKBACK_4H = 500
+SR_ZONE_ATR_MULT = 2.5
+BTC_BREAKER_TTL_SEC = 300           # own cache for the market-wide breaker check
 ADV_DERIV_CACHE_SEC = 120           # Gate contract-stats cache (GAS DERIVATIVES_CACHE_SECONDS L50)
 ADV_DERIV_STATS_LIMIT = 48          # 48 x 15m buckets ~ 12h: 16-bucket window + history (GAS L1002)
 ORDER_BOOK_DEPTH_LIMIT = 100        # depth levels fetched for the wall veto
@@ -302,7 +311,7 @@ DASH_MTF_MODES = ("STRICT", "LEAN")
 # Deterministic veto codes the dashboard can toggle (default: all enabled).
 # Disabling a veto is an explicit operator choice and is logged as such.
 DASH_VETO_CODES = ("leverage_risk", "funding", "squeeze", "whale",
-                   "liq_wall", "btc_breaker")
+                   "liq_wall", "btc_breaker", "sr_zone")
 # Signal strictness presets: ketat | sedang | biasa.
 # Choosing a mode applies its bundle to the individual dashboard settings
 # (quality gate, MTF 30m leg, 1d cascade leg, bullish-only, volume gate,
@@ -344,6 +353,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_whale": True,
         "veto_liq_wall": True,
         "veto_btc_breaker": True,
+        "veto_sr_zone": True,
     },
     "sedang": {
         "min_quality_score": 60,
@@ -364,6 +374,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_whale": True,
         "veto_liq_wall": False,
         "veto_btc_breaker": True,
+        "veto_sr_zone": True,
     },
     "biasa": {
         "min_quality_score": 50,
@@ -384,6 +395,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_whale": False,
         "veto_liq_wall": False,
         "veto_btc_breaker": False,
+        "veto_sr_zone": False,
     },
 }
 # Vetoes currently disabled by the dashboard (populated by
@@ -433,6 +445,7 @@ DASHBOARD_DEFAULTS = {
     "veto_whale": True,
     "veto_liq_wall": True,
     "veto_btc_breaker": True,
+    "veto_sr_zone": True,       # S/R location: no short into 4h support / long into 4h resistance
     # universe
     "universe_mode": "top_movers",  # curated | top_volume | top_movers | all (GAS parity: top_movers)
     "universe_top_n": 30,        # 10-100, used when top_volume/top_movers
