@@ -27,7 +27,7 @@ import config
 from lifecycle import LifecycleLogger
 from lifecycle import (
     GENERATED, APPROVED, REJECTED, ENTRY_TRIGGERED, POSITION_OPENED,
-    TP1_HIT, TP2_HIT, TP3_HIT, SL_HIT, EXPIRED, CANCELLED,
+    TP1_HIT, TP2_HIT, TP3_HIT, SL_HIT, MANUAL_CLOSE, EXPIRED, CANCELLED,
 )
 from risk import floor_to_step, quantize_price
 
@@ -1012,6 +1012,72 @@ class Executor:
             log.error("%s breakeven SL placement FAILED - original SL left "
                       "live", pos_id)
 
+    def _classify_vanished_close(self, symbol: str, pos: dict, sid: str,
+                                 pos_id: str) -> tuple:
+        """Classify how a vanished position actually closed, using exchange
+        userTrades as ground truth. Returns (event, why).
+
+        A profitable close is NEVER labeled sl_hit. Realized PnL comes from
+        the exchange's own realizedPnl minus commissions (not 0.0).
+        Fail-closed: if trades are unavailable, label sl_hit with no PnL
+        rather than fabricating a classification.
+        """
+        direction = pos.get("direction", "SHORT")
+        close_side = "BUY" if direction == "SHORT" else "SELL"
+        try:
+            trades = self.exchange.get_user_trades(symbol, limit=30)
+        except Exception as e:  # noqa: BLE001 - fail-closed
+            log.warning("%s: userTrades unavailable (%s) — sl_hit fallback",
+                        pos_id, e)
+            return SL_HIT, "sl_hit (trades unavailable)"
+        opened = pos.get("opened_at", 0) or 0
+        closes = sorted(
+            (t for t in trades
+             if t.get("side") == close_side and t.get("time", 0) >= opened),
+            key=lambda t: t.get("time", 0), reverse=True)
+        if not closes:
+            return SL_HIT, "sl_hit (no close fills found)"
+        # The final close = latest fills covering the remaining qty (partial
+        # TP fills earlier were already accounted in pos["realized"]).
+        remaining = pos.get("qty", 0) or 0
+        take, acc = [], 0.0
+        for t in closes:
+            take.append(t)
+            acc += float(t.get("qty", 0))
+            if remaining > 0 and acc >= remaining - 1e-9:
+                break
+        qty = sum(float(t.get("qty", 0)) for t in take)
+        if qty <= 0:
+            return SL_HIT, "sl_hit (no close fills found)"
+        avg_px = sum(float(t.get("price", 0)) * float(t.get("qty", 0))
+                     for t in take) / qty
+        net = sum(float(t.get("realizedPnl", 0)) - float(t.get("commission", 0))
+                  for t in take)
+
+        def _near(a, b):
+            return b and abs(a - b) / b <= 0.005
+
+        if _near(avg_px, pos.get("stop_loss")):
+            event, why = SL_HIT, "sl_hit"
+        else:
+            event = why = None
+            for leg, evt in (("tp3", TP3_HIT), ("tp2", TP2_HIT),
+                             ("tp1", TP1_HIT)):
+                tp_px = (pos.get("tp") or {}).get(leg, {}).get("price")
+                if _near(avg_px, tp_px):
+                    event, why = evt, f"{evt} (remainder)"
+                    break
+            if event is None:
+                # Not near any bracket level: manual/unknown close. Label it
+                # honestly — a profitable close is not an SL.
+                pnl_word = "profit" if net >= 0 else "loss"
+                event, why = MANUAL_CLOSE, f"manual_close ({pnl_word})"
+        pos["realized"] = pos.get("realized", 0.0) + net
+        pos["close_price"] = avg_px
+        self.risk.record_realized(net)
+        log.info("%s closed: %s @ %s (pnl %+0.4f)", pos_id, why, avg_px, net)
+        return event, why
+
     def _close_position(self, pos_id: str, pos: dict, sid: str,
                         summary: dict, reason: str = "") -> None:
         symbol = pos["symbol"]
@@ -1023,34 +1089,12 @@ class Executor:
         elif pos["tp"]["tp1"]["filled"]:
             event, why = TP1_HIT, "tp1_hit (remainder)"
         else:
-            # SL filled (or position vanished): check the SL order.
-            o = self._sl_status(symbol, pos)
-            estimated = False
-            if o and o.get("status") == "FILLED":
-                fill_px = float(o.get("avgPrice") or pos["stop_loss"])
-            elif (o is None and pos.get("sl_is_algo") and pos.get("stop_loss")
-                    and pos.get("qty", 0) > 0):
-                # Triggered algo STOP_MARKET orders vanish from
-                # /fapi/v1/algoOrder ("unknown algo order"), so a genuine SL
-                # fill looks like "order not found". Estimate the fill at the
-                # trigger price instead of silently recording 0.0 for a real
-                # loss. (Seen live: GRASSUSDT and WALUSDT SL fills recorded
-                # as 0.0 while the exchange booked -5.13 / -7.86.)
-                fill_px = float(pos["stop_loss"])
-                estimated = True
-            else:
-                fill_px = None
-            if fill_px is not None:
-                sign = -1.0 if pos.get("direction") == "SHORT" else 1.0
-                pnl = sign * (fill_px - pos["entry_price"]) * pos["qty"]
-                fee = fill_px * pos["qty"] * _FEE_PCT / 100
-                net = pnl - fee
-                pos["realized"] = pos.get("realized", 0.0) + net
-                self.risk.record_realized(net)
-                mark = " (est. @ trigger)" if estimated else ""
-                log.info("%s SL hit @ %s%s (pnl %+0.2f)", pos_id, fill_px,
-                         mark, net)
-            event, why = SL_HIT, reason or "sl_hit"
+            # Position vanished with no TP leg flagged filled: classify via
+            # exchange userTrades (ground truth). Never default a profitable
+            # close to sl_hit (2026-10-15: LIT +$0.079 and BOME +$0.074 were
+            # profitable closes mislabeled sl_hit with realized $0.00).
+            event, why = self._classify_vanished_close(symbol, pos, sid,
+                                                       pos_id)
         # Cancel any leftover working orders for the symbol legs.
         for leg in ("tp1", "tp2", "tp3"):
             oid = pos["tp"][leg]["order_id"]
