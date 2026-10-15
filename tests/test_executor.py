@@ -933,3 +933,59 @@ def test_write_last_run(tmp_path):
     assert n["symbol"] == "WALUSDT" and n["state"] == "position_opened"
     assert n["qty"] == 10.0 and n["entry"] == 0.06
     assert "rejected" not in _NOTABLE_STATES
+
+
+def test_tradable_symbols_filters_non_trading():
+    from exchange import ExchangeClient
+    ex = ExchangeClient("k", "s")
+    ex._exchange_info = {"symbols": [
+        {"symbol": "BTCUSDT", "status": "TRADING", "contractType": "PERPETUAL"},
+        {"symbol": "PEPEUSDT", "status": "TRADING", "contractType": "PERPETUAL"},
+        {"symbol": "OLDUSDT", "status": "BREAK", "contractType": "PERPETUAL"},
+        {"symbol": "QUSDT", "status": "TRADING", "contractType": "CURRENT_QUARTER"},
+    ]}
+    ex._exchange_info_ts = 9999999999.0  # don't refetch
+    got = ex.tradable_symbols()
+    assert got == {"BTCUSDT", "PEPEUSDT"}
+
+
+def test_tradable_symbols_none_on_failure():
+    from exchange import ExchangeClient
+    ex = ExchangeClient("k", "s")
+    ex._request = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down"))
+    ex._exchange_info = None
+    assert ex.tradable_symbols() is None
+
+
+def test_prefilter_drops_untradable():
+    from executor import Executor
+    from unittest.mock import MagicMock
+    ex = MagicMock()
+    ex.tradable_symbols.return_value = {"BTCUSDT", "ETHUSDT"}
+    executor = Executor.__new__(Executor)
+    executor.exchange = ex
+    got = executor._apply_tradability_prefilter(
+        ["BTCUSDT", "PEPEUSDT", "ETHUSDT", "SOXSUSDT"])
+    assert got == ["BTCUSDT", "ETHUSDT"]
+
+
+def test_prefilter_fail_open_no_method():
+    # PaperBroker has no tradable_symbols -> universe untouched
+    from executor import Executor
+    from unittest.mock import MagicMock
+    ex = MagicMock(spec=[])  # no tradable_symbols attr
+    executor = Executor.__new__(Executor)
+    executor.exchange = ex
+    uni = ["BTCUSDT", "PEPEUSDT"]
+    assert executor._apply_tradability_prefilter(uni) == uni
+
+
+def test_prefilter_fail_open_on_none():
+    from executor import Executor
+    from unittest.mock import MagicMock
+    ex = MagicMock()
+    ex.tradable_symbols.return_value = None
+    executor = Executor.__new__(Executor)
+    executor.exchange = ex
+    uni = ["BTCUSDT", "PEPEUSDT"]
+    assert executor._apply_tradability_prefilter(uni) == uni

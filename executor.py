@@ -384,6 +384,7 @@ class Executor:
         self._manage_positions(balance, summary)
         universe = resolve_universe(self.exchange, self._dash_settings(),
                                     self.universe, market=self.market)
+        universe = self._apply_tradability_prefilter(universe)
         for symbol in universe:
             try:
                 self._scan_symbol(symbol, balance, summary)
@@ -465,6 +466,32 @@ class Executor:
                 log.exception("paper poll failed")
         self.state.save()
         return summary
+
+    def _apply_tradability_prefilter(self, universe: list[str]) -> list[str]:
+        """Drop symbols the exchange can't execute, before engine evaluation.
+
+        Uses the cached exchangeInfo tradable set (no extra API call per
+        cycle). Fail-open: on any failure the universe is returned
+        unfiltered and the per-symbol execution-time check stays as backstop.
+        PaperBroker has no exchangeInfo -> always fail-open (sandbox).
+        """
+        if not config.TRADABILITY_PREFILTER:
+            return universe
+        get_tradable = getattr(self.exchange, "tradable_symbols", None)
+        if not callable(get_tradable):
+            return universe
+        try:
+            tradable = get_tradable()
+        except Exception:  # noqa: BLE001 - fail open
+            return universe
+        if not tradable:
+            return universe
+        filtered = [s for s in universe if s in tradable]
+        dropped = len(universe) - len(filtered)
+        if dropped:
+            log.info("tradability pre-filter: %d/%d symbols tradable "
+                     "(%d skipped)", len(filtered), len(universe), dropped)
+        return filtered
 
     def _scan_symbol(self, symbol: str, balance: float | None,
                      summary: dict) -> None:
