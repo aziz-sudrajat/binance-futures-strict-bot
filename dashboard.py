@@ -341,6 +341,7 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("universe_top_n", "Universe top N", "int"),
     ("risk_pct_per_trade", "Risk %/trade", "float"),
     ("max_leverage", "Max leverage", "int"),
+    ("daily_loss_cap_pct", "Daily loss cap % (100=off)", "float"),
     ("poll_interval_min", "Scan interval (min)", "int"),
     ("min_quality_score", "Min quality score", "int"),
     ("mtf_30m_mode", "MTF 30m mode", "choice:STRICT,LEAN"),
