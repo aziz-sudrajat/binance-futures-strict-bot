@@ -126,7 +126,8 @@ def btc_1h_change_pct(market) -> float:
 def run_vetoes(symbol: str, direction: str, market, snap: dict,
                book: dict | None = None,
                skip_deriv_vetoes: bool = False,
-               disabled: object = None) -> list:
+               disabled: object = None,
+               entry_px: float | None = None) -> list:
     """Evaluate every deterministic hard veto.
 
     Returns a list of blocks; each block is a (code, kind, reason) tuple
@@ -271,6 +272,43 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
     wall_reason = _blocking_wall(book, direction) if book is not None else None
     if wall_reason:
         _block("liq_wall", "veto", wall_reason)
+
+    # V16 — S/R location (user 2026-10-15): never SHORT into 4h support,
+    # never LONG into 4h resistance. Support/resistance are the 4h swing
+    # extremes over SR_ZONE_LOOKBACK_4H candles (~2-3 months); the zone is
+    # SR_ZONE_ATR_MULT x ATR(4h) inside the level (volatility-adaptive).
+    # Only entries sitting *inside the zone edge* are vetoed: a breakdown
+    # already below support (or breakout above resistance) is allowed.
+    # Without an entry price the veto is not applicable (skipped); a failed
+    # 4h history fetch holds the signal (fail-closed).
+    if entry_px is not None and entry_px > 0:
+        try:
+            from indicators import atr_wilder
+            k4 = market.get_klines(symbol, "4h",
+                                   limit=config.SR_ZONE_LOOKBACK_4H)
+            lows = [float(c["low"]) for c in k4 if c.get("low") is not None]
+            highs = [float(c["high"]) for c in k4 if c.get("high") is not None]
+            if len(lows) < 50:
+                raise ValueError("insufficient 4h history for S/R zone")
+            support, resistance = min(lows), max(highs)
+            zone = atr_wilder(k4, 14) * config.SR_ZONE_ATR_MULT
+            if zone <= 0:
+                raise ValueError("ATR(4h) unavailable")
+            if (direction == "BEARISH"
+                    and support < entry_px <= support + zone):
+                _block("sr_zone", "veto",
+                       f"SHORT into 4h support {support:.6g} (entry "
+                       f"{entry_px:.6g} within {zone:.6g} = "
+                       f"{config.SR_ZONE_ATR_MULT:g}x ATR) — bad location")
+            elif (direction == "BULLISH"
+                    and resistance - zone <= entry_px < resistance):
+                _block("sr_zone", "veto",
+                       f"LONG into 4h resistance {resistance:.6g} (entry "
+                       f"{entry_px:.6g} within {zone:.6g} = "
+                       f"{config.SR_ZONE_ATR_MULT:g}x ATR) — bad location")
+        except Exception as e:  # noqa: BLE001 - unevaluable -> hold
+            _block("sr_zone", "hold",
+                   f"4h S/R zone unevaluable ({e}) — holding (fail-closed)")
 
     return blocks
 
