@@ -184,6 +184,29 @@ def test_apply_clamps_out_of_range(dash_env):
     assert config.TP1_RR == 5.0
 
 
+def test_daily_loss_cap_override(dash_env):
+    # Kill-switch cap is a per-cycle dashboard knob (0-100, 100 = off).
+    # User 2026-10-15 "habiskan saja saldonya": cap=100 must flow through.
+    save_settings({"daily_loss_cap_pct": 100}, dash_env)
+    import executor as exmod
+    e = object.__new__(exmod.Executor)
+    e.settings_mode = "live"
+    config.apply_dashboard_overrides(e._dash_settings())
+    assert config.DAILY_LOSS_CAP_PCT == 100
+
+
+def test_validate_daily_loss_cap(dash_env):
+    assert validate_settings({})["daily_loss_cap_pct"] == 3.0
+    assert validate_settings({"daily_loss_cap_pct": 100})[
+        "daily_loss_cap_pct"] == 100
+    assert validate_settings({"daily_loss_cap_pct": 0})[
+        "daily_loss_cap_pct"] == 0
+    with pytest.raises(ValueError):
+        validate_settings({"daily_loss_cap_pct": 101})
+    with pytest.raises(ValueError):
+        validate_settings({"daily_loss_cap_pct": -1})
+
+
 def test_apply_tp_split_normalized(dash_env):
     save_settings({"tp_split_1": 1.0, "tp_split_2": 1.0, "tp_split_3": 2.0},
                   dash_env)

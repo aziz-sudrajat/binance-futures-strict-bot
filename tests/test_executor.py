@@ -341,6 +341,22 @@ def test_kill_switch_triggers_and_resets(workdir, monkeypatch):
     assert ok3 is True
 
 
+def test_widened_loss_cap_keeps_trading_alive(workdir, monkeypatch):
+    # User 2026-10-15 "habiskan saja saldonya": with the cap widened to
+    # 100 via the dashboard knob, a -17.5% day no longer trips the kill
+    # switch and new entries stay allowed.
+    state = StateStore(os.path.join(workdir, "state.json"))
+    balance = {"v": 5.32}
+    rm = RiskManager(state, lambda: balance["v"])
+    rm.ensure_day()
+    balance["v"] = 4.39  # -17.48% day
+    monkeypatch.setattr(config, "DAILY_LOSS_CAP_PCT", 100)
+    ok, _ = rm.check_daily_loss()
+    assert ok is True and not rm.kill_switch_active()
+    ok2, _ = rm.check_can_open("BTCUSDT", 0.5, 0)
+    assert ok2 is True
+
+
 def test_max_positions_cap(workdir):
     state = StateStore(os.path.join(workdir, "state.json"))
     rm = RiskManager(state, lambda: 10_000.0, max_positions=1)
@@ -794,6 +810,47 @@ def test_short_sl_fill_pnl_sign(short_rig):
     assert pos["realized"] < 0, pos["realized"]
     # gross loss ~= -2.0 * qty; allow fee slippage in the bound
     assert pos["realized"] > -(2.0 * qty) * 1.1
+
+
+def test_algo_sl_vanished_records_trigger_estimate(rig):
+    """Regression: a triggered algo STOP_MARKET vanishes from the algo-order
+    endpoint, so the old code recorded the SL loss as 0.0 (seen live with
+    GRASSUSDT and WALUSDT). The executor must estimate the fill at the
+    trigger price instead of dropping a real loss."""
+    executor, market, exchange, state, lifecycle, risk = rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    pos_id, pos = next(iter(executor._open_positions().items()))
+    assert pos["sl_is_algo"] is True
+    entry_px = pos["entry_price"]
+    qty = pos["qty"]
+    trigger = pos["stop_loss"]
+    # Simulate Binance: triggered algo order is gone (-2011), position closed.
+    del exchange.orders[pos["sl_order_id"]]
+    exchange.get_positions = lambda: []
+    executor._close_position(pos_id, pos, pos["signal_id"], summary,
+                             reason="position gone from exchange")
+    assert pos["closed"] is True
+    # LONG SL below entry -> estimated loss, not 0.0.
+    expected = (trigger - entry_px) * qty - trigger * qty * 0.0005
+    assert pos["realized"] == pytest.approx(expected, abs=1e-6)
+    assert pos["realized"] < 0, pos["realized"]
+
+
+def test_algo_sl_cancelled_no_phantom_estimate(rig):
+    """A cancelled (not triggered) algo SL must not produce a phantom
+    estimate: only a vanished order implies the trigger fired."""
+    executor, market, exchange, state, lifecycle, risk = rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    pos_id, pos = next(iter(executor._open_positions().items()))
+    exchange.orders[pos["sl_order_id"]]["status"] = "CANCELED"
+    executor._close_position(pos_id, pos, pos["signal_id"], summary,
+                             reason="position gone from exchange")
+    assert pos["closed"] is True
+    assert pos["realized"] == 0.0, pos["realized"]
 
 
 def test_paper_fill_simulation_short():
