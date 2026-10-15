@@ -37,6 +37,7 @@ except ImportError:
     pass
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
@@ -185,7 +186,7 @@ class BinanceShell:
             try:
                 signal, note = evaluate_symbol(symbol, market)
             except Exception as e:  # noqa: BLE001
-                self.console.print(f"[red]{symbol}: data error — {e}[/red]")
+                self.console.print(f"[red]{escape(str(symbol))}: data error — {escape(str(e))}[/red]")
                 return
             try:
                 a15 = analyze_candles(symbol, "15m",
@@ -198,7 +199,7 @@ class BinanceShell:
                     [float(c["close"]) for c in market.get_klines(symbol, "1d")])
                 live = market.get_live_price(symbol)
             except Exception as e:  # noqa: BLE001
-                self.console.print(f"[red]{symbol}: analisis gagal — {e}[/red]")
+                self.console.print(f"[red]{escape(str(symbol))}: analisis gagal — {escape(str(e))}[/red]")
                 return
         dir_color = ("green" if signal and signal.get("direction") == "LONG"
                      else "red" if signal else "dim")
@@ -246,11 +247,11 @@ class BinanceShell:
         try:
             executor = self.get_executor()
         except SystemExit as e:
-            self.console.print(f"[red]{e}[/red]")
+            self.console.print(f"[red]{escape(str(e))}[/red]")
             return
         plan, err = executor.preview_manual_entry(symbol, direction=direction)
         if err:
-            self.console.print(f"[red]{symbol}: {err}[/red]")
+            self.console.print(f"[red]{escape(str(symbol))}: {escape(str(err))}[/red]")
             return
         dcolor = "green" if direction == "LONG" else "red"
         self.console.print(Panel(
@@ -294,7 +295,7 @@ class BinanceShell:
         try:
             st = dashboard.build_status(self.mode)
         except SystemExit as e:
-            self.console.print(f"[red]{e}[/red]")
+            self.console.print(f"[red]{escape(str(e))}[/red]")
             return
         self.console.print(status_panel(st, self.mode))
 
@@ -302,7 +303,7 @@ class BinanceShell:
         try:
             st = dashboard.build_status(self.mode)
         except SystemExit as e:
-            self.console.print(f"[red]{e}[/red]")
+            self.console.print(f"[red]{escape(str(e))}[/red]")
             return
         self.console.print(status_panel(st, self.mode))
         self.console.print(positions_table(st))
@@ -311,7 +312,7 @@ class BinanceShell:
         try:
             info = dashboard.scanner_status()
         except Exception as e:  # noqa: BLE001
-            self.console.print(f"[red]{e}[/red]")
+            self.console.print(f"[red]{escape(str(e))}[/red]")
             return
         self.console.print(signals_table(info.get("signals") or []))
         db = info.get("db") or {}
@@ -333,7 +334,7 @@ class BinanceShell:
         try:
             st = dashboard.build_status(self.mode)
         except SystemExit as e:
-            self.console.print(f"[red]{e}[/red]")
+            self.console.print(f"[red]{escape(str(e))}[/red]")
             return
         ks = st.get("kill_switch") or {}
         active = bool(ks.get("tripped") or ks.get("active"))
@@ -432,7 +433,7 @@ class BinanceShell:
             try:
                 sett[key] = coerce_setting(kind, val)
             except ValueError as e:
-                self.console.print(f"[red]{e}[/red]")
+                self.console.print(f"[red]{escape(str(e))}[/red]")
                 continue
             dashboard.save_settings(sett, mode=self.mode)
             self.console.print(f"[green]✓ {key} = {sett[key]}[/green] "
@@ -457,7 +458,7 @@ class BinanceShell:
         try:
             coerced = coerce_setting(kind, val)
         except ValueError as e:
-            self.console.print(f"[red]{e}[/red]")
+            self.console.print(f"[red]{escape(str(e))}[/red]")
             return
         sett = dashboard.load_settings(mode=self.mode)
         sett[key] = coerced
@@ -487,7 +488,7 @@ class BinanceShell:
             try:
                 info = dashboard.scanner_status()
             except Exception as e:  # noqa: BLE001
-                self.console.print(f"[red]{e}[/red]")
+                self.console.print(f"[red]{escape(str(e))}[/red]")
                 return
             st = info.get("state") or {}
             db = info.get("db") or {}
@@ -553,7 +554,7 @@ class BinanceShell:
         try:
             executor = self.get_executor()
         except SystemExit as e:
-            self.console.print(f"[red]{e}[/red]")
+            self.console.print(f"[red]{escape(str(e))}[/red]")
             return
         src = "signals.db (scanner)" if from_db else "scan langsung"
         if self.mode == "live":
@@ -677,7 +678,7 @@ class BinanceShell:
         except KeyboardInterrupt:
             self.console.print("\n[dim]dibatalkan[/dim]")
         except Exception as e:  # noqa: BLE001 - shell never dies on a command
-            self.console.print(f"[red]error:[/red] {e}")
+            self.console.print(f"[red]error:[/red] {escape(str(e))}")
         return True
 
     def repl(self) -> None:
@@ -692,7 +693,7 @@ class BinanceShell:
                 self.console.print()
                 break
             except Exception as e:  # noqa: BLE001 - never crash the shell
-                self.console.print(f"[red]input error:[/red] {e}")
+                self.console.print(f"[red]input error:[/red] {escape(str(e))}")
                 continue
             try:
                 if not self.dispatch(line):
@@ -700,7 +701,7 @@ class BinanceShell:
             except SystemExit:
                 break
             except Exception as e:  # noqa: BLE001 - never crash the shell
-                self.console.print(f"[red]error:[/red] {e}")
+                self.console.print(f"[red]error:[/red] {escape(str(e))}")
         self.console.print("[dim]sampai jumpa 👋[/dim]")
 
 

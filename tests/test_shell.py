@@ -282,3 +282,15 @@ def test_positions_table_missing_mark_shows_dash():
     console.print(positions_table(status))
     out = console.export_text()
     assert "SHORT" in out and "81,950.00" in out
+
+
+def test_error_print_escapes_brackets():
+    # Regression: an exception message containing [...] (e.g. "['liq_wall']")
+    # crashed Rich markup parsing and killed the shell instead of showing it.
+    from rich.console import Console
+    from rich.markup import escape
+    console = Console(record=True, width=100)
+    e = ValueError("scan with vetoes DISABLED by operator: ['liq_wall']")
+    console.print(f"[red]error:[/red] {escape(str(e))}")  # must not raise
+    out = console.export_text()
+    assert "liq_wall" in out
