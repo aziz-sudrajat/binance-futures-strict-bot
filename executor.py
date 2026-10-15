@@ -30,16 +30,10 @@ from lifecycle import (
     TP1_HIT, TP2_HIT, TP3_HIT, SL_HIT, MANUAL_CLOSE, EXPIRED, CANCELLED,
 )
 from risk import floor_to_step, quantize_price
-
 log = logging.getLogger("executor")
 
 _FEE_PCT = 0.05  # fee estimate per fill for PnL accounting (matches backtest)
 _ENTRY_TIMEOUT_HOURS = 6  # cancel an unfilled entry order after this long
-
-# Dashboard settings defaults — canonical source is config.DASHBOARD_DEFAULTS
-# (dashboard.py writes dashboard_settings.json; the executor honors it live,
-# without a restart).
-_DASH_DEFAULTS = config.DASHBOARD_DEFAULTS
 
 
 def signal_candle_close_ms(market, symbol: str) -> int:
@@ -296,24 +290,13 @@ class Executor:
         takes effect without restarting the loop. Missing/corrupt file ->
         defaults (current behavior, auto-trade ON).
 
-        The file holds per-mode sections {"live": {...}, "testnet": {...}};
-        the executor's settings_mode picks its section. A legacy flat file
-        (no mode keys) is treated as the live section.
+        Single source of truth: dashboard.load_settings(). The executor
+        must never reimplement the mode-section/legacy-flat merging here —
+        two copies WILL drift (they were byte-identical duplicates until
+        this change; 2026-10-15).
         """
-        s = dict(_DASH_DEFAULTS)
-        try:
-            with open(config.DASHBOARD_SETTINGS_FILE, "r",
-                      encoding="utf-8") as f:
-                loaded = json.load(f) or {}
-            if isinstance(loaded, dict) and any(
-                    k in loaded for k in ("live", "testnet", "paper")):
-                loaded = loaded.get(self.settings_mode) or {}
-            for k in s:
-                if k in loaded:
-                    s[k] = loaded[k]
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            pass
-        return s
+        from dashboard import load_settings  # lazy: keep import graph flat
+        return load_settings(mode=self.settings_mode)
 
     def _effective_risk_pct(self) -> float:
         # Dashboard may only TIGHTEN risk, never exceed the code default.
@@ -889,11 +872,15 @@ class Executor:
             pos["closed"] = True
             pos["closed_reason"] = f"entry order {status}"
             self.lifecycle.log(sid, symbol, CANCELLED,
-                               reason=f"entry order {status}")
+                               reason=f"entry order {status}", terminal=True)
             self.state.save()
         return False
 
     def _expire_stale_entry(self, pos_id: str, pos: dict, sid: str) -> None:
+        # Guard: _check_entry_fill may already have closed this position
+        # (CANCELLED) in the same cycle — never log a second terminal event.
+        if pos.get("closed"):
+            return
         age_h = (time.time() * 1000 - pos["opened_at"]) / 3_600_000
         if age_h < _ENTRY_TIMEOUT_HOURS:
             return
@@ -902,7 +889,7 @@ class Executor:
         pos["closed"] = True
         pos["closed_reason"] = f"entry unfilled after {_ENTRY_TIMEOUT_HOURS}h"
         self.lifecycle.log(sid, symbol, EXPIRED,
-                           reason=pos["closed_reason"])
+                           reason=pos["closed_reason"], terminal=True)
         log.info("%s expired: %s", pos_id, pos["closed_reason"])
         self.state.save()
 
@@ -1015,7 +1002,12 @@ class Executor:
     def _classify_vanished_close(self, symbol: str, pos: dict, sid: str,
                                  pos_id: str) -> tuple:
         """Classify how a vanished position actually closed, using exchange
-        userTrades as ground truth. Returns (event, why).
+        userTrades as ground truth. Returns (event, why, net, avg_px).
+
+        Pure: computes the classification WITHOUT mutating pos or recording
+        PnL — the caller applies those only after the terminal lifecycle
+        event is durably logged, so a failed close can be retried without
+        double-counting.
 
         A profitable close is NEVER labeled sl_hit. Realized PnL comes from
         the exchange's own realizedPnl minus commissions (not 0.0).
@@ -1024,19 +1016,23 @@ class Executor:
         """
         direction = pos.get("direction", "SHORT")
         close_side = "BUY" if direction == "SHORT" else "SELL"
+        opened = pos.get("opened_at", 0) or 0
         try:
-            trades = self.exchange.get_user_trades(symbol, limit=30)
+            # startTime=opened_at: after a long downtime the close fills
+            # can't be pushed out of the limit window by later trades on
+            # the same symbol (reviewer 2026-10-15).
+            trades = self.exchange.get_user_trades(
+                symbol, limit=100, start_time=opened or None)
         except Exception as e:  # noqa: BLE001 - fail-closed
             log.warning("%s: userTrades unavailable (%s) — sl_hit fallback",
                         pos_id, e)
-            return SL_HIT, "sl_hit (trades unavailable)"
-        opened = pos.get("opened_at", 0) or 0
+            return SL_HIT, "sl_hit (trades unavailable)", 0.0, None
         closes = sorted(
             (t for t in trades
              if t.get("side") == close_side and t.get("time", 0) >= opened),
             key=lambda t: t.get("time", 0), reverse=True)
         if not closes:
-            return SL_HIT, "sl_hit (no close fills found)"
+            return SL_HIT, "sl_hit (no close fills found)", 0.0, None
         # The final close = latest fills covering the remaining qty (partial
         # TP fills earlier were already accounted in pos["realized"]).
         remaining = pos.get("qty", 0) or 0
@@ -1048,7 +1044,7 @@ class Executor:
                 break
         qty = sum(float(t.get("qty", 0)) for t in take)
         if qty <= 0:
-            return SL_HIT, "sl_hit (no close fills found)"
+            return SL_HIT, "sl_hit (no close fills found)", 0.0, None
         avg_px = sum(float(t.get("price", 0)) * float(t.get("qty", 0))
                      for t in take) / qty
         net = sum(float(t.get("realizedPnl", 0)) - float(t.get("commission", 0))
@@ -1063,7 +1059,8 @@ class Executor:
             event = why = None
             for leg, evt in (("tp3", TP3_HIT), ("tp2", TP2_HIT),
                              ("tp1", TP1_HIT)):
-                tp_px = (pos.get("tp") or {}).get(leg, {}).get("price")
+                tpleg = (pos.get("tp") or {}).get(leg) or {}
+                tp_px = tpleg.get("price")
                 if _near(avg_px, tp_px):
                     event, why = evt, f"{evt} (remainder)"
                     break
@@ -1072,43 +1069,141 @@ class Executor:
                 # honestly — a profitable close is not an SL.
                 pnl_word = "profit" if net >= 0 else "loss"
                 event, why = MANUAL_CLOSE, f"manual_close ({pnl_word})"
-        pos["realized"] = pos.get("realized", 0.0) + net
-        pos["close_price"] = avg_px
-        self.risk.record_realized(net)
         log.info("%s closed: %s @ %s (pnl %+0.4f)", pos_id, why, avg_px, net)
-        return event, why
+        return event, why, net, avg_px
+
 
     def _close_position(self, pos_id: str, pos: dict, sid: str,
                         summary: dict, reason: str = "") -> None:
         symbol = pos["symbol"]
-        # Determine the terminal event from what filled.
-        if pos["tp"]["tp3"]["filled"]:
+        # Determine the terminal event from what filled. Defensive .get()
+        # chain: a malformed legacy position must not KeyError its way out
+        # of terminal accounting (startup-reconcile path). (pos.get(leg)
+        # or {}): a leg explicitly set to None must not AttributeError.
+        tp = pos.get("tp") or {}
+        net, avg_px = 0.0, None
+        if (tp.get("tp3") or {}).get("filled"):
             event, why = TP3_HIT, "tp3_hit"
-        elif pos["tp"]["tp2"]["filled"]:
+        elif (tp.get("tp2") or {}).get("filled"):
             event, why = TP2_HIT, "tp2_hit (remainder)"
-        elif pos["tp"]["tp1"]["filled"]:
+        elif (tp.get("tp1") or {}).get("filled"):
             event, why = TP1_HIT, "tp1_hit (remainder)"
         else:
             # Position vanished with no TP leg flagged filled: classify via
             # exchange userTrades (ground truth). Never default a profitable
             # close to sl_hit (2026-10-15: LIT +$0.079 and BOME +$0.074 were
             # profitable closes mislabeled sl_hit with realized $0.00).
-            event, why = self._classify_vanished_close(symbol, pos, sid,
-                                                       pos_id)
+            # _classify_vanished_close is pure: it returns (event, why, net,
+            # avg_px) without mutating pos or recording PnL.
+            event, why, net, avg_px = self._classify_vanished_close(
+                symbol, pos, sid, pos_id)
         # Cancel any leftover working orders for the symbol legs.
         for leg in ("tp1", "tp2", "tp3"):
-            oid = pos["tp"][leg]["order_id"]
-            if oid and not pos["tp"][leg]["filled"]:
+            tpleg = tp.get(leg) or {}
+            oid = tpleg.get("order_id")
+            if oid and not tpleg.get("filled"):
                 self.exchange.cancel_order(symbol, order_id=oid)
         if pos.get("sl_order_id"):
             self._sl_cancel(symbol, pos)
         pos["closed"] = True
         pos["closed_reason"] = why
         pos["closed_at"] = int(time.time() * 1000)
+        # terminal=True marks the one outcome event per signal: report.py
+        # must not confuse it with per-leg tp1/2/3 fill events (same state
+        # names) when attributing the trade's final PnL.
         self.lifecycle.log(sid, symbol, event, reason=why,
-                           realized=round(pos.get("realized", 0.0), 4))
+                           realized=round(pos.get("realized", 0.0) + net, 4),
+                           terminal=True)
+        # Mutations only AFTER the terminal event is durably logged: a
+        # failed close can be retried next startup without double-counting.
+        if avg_px is not None:
+            pos["close_price"] = avg_px
+        if net:
+            pos["realized"] = pos.get("realized", 0.0) + net
+            self.risk.record_realized(net)
         summary["managed"] += 1
         self.state.save()
+
+    def _close_reconciled_positions(self, pos_ids: list) -> None:
+        """Attribute terminal lifecycle events to startup-reconciled closes.
+
+        reconcile() marks state positions that vanished from the exchange
+        while the bot was down. Without this step those trades vanish from
+        lifecycle accounting entirely: no outcome event, no PnL attribution,
+        and the daily realized-PnL misses the close. Bracketed positions go
+        through the full _close_position path (userTrades ground truth).
+        Positions without brackets get their entry order verified first: a
+        FILLED entry means the position did exist (crash before brackets),
+        so it is classified via _close_position; otherwise the working
+        entry order is cancelled (never leave a naked fill) and a CANCELLED
+        terminal event is logged.
+        """
+        summary = {"managed": 0, "errors": []}
+        for pos_id in pos_ids or []:
+            pos = self.state.get("positions", {}).get(pos_id)
+            if not pos:
+                continue
+            sid = pos.get("signal_id", "")
+            symbol = pos.get("symbol", "?")
+            if self.lifecycle.has_terminal_event(sid):
+                # Retry dedupe (review 2026-10-16): a previous attempt
+                # already logged this sid's terminal outcome — attributing
+                # again would double-log the event AND double-count PnL
+                # (risk.record_realized saves state AFTER lifecycle.log, so
+                # a crash in that window retries with PnL already recorded).
+                log.warning("reconcile close %s: terminal event for %s "
+                            "already logged — skipping", pos_id, sid)
+                continue
+            try:
+                if pos.get("brackets_placed") or self._entry_filled(pos):
+                    self._close_position(pos_id, pos, sid, summary,
+                                         reason="gone from exchange "
+                                         "at startup")
+                else:
+                    try:
+                        self.exchange.cancel_order(
+                            symbol, order_id=pos.get("entry_order_id"))
+                    except Exception:  # noqa: BLE001 - already gone is fine
+                        pass
+                    self.lifecycle.log(sid, symbol, CANCELLED,
+                                       reason="entry unfilled at startup "
+                                       "reconcile", terminal=True)
+                    pos["closed"] = True
+                    pos["closed_reason"] = "entry unfilled at startup reconcile"
+                    pos["closed_at"] = int(time.time() * 1000)
+                    summary["managed"] += 1
+                    self.state.save()
+            except Exception:  # noqa: BLE001 - one position never kills startup
+                log.exception("reconcile close %s failed", pos_id)
+                summary["errors"].append(f"reconcile close {pos_id} failed")
+                # Attribution failed: clear the closed flag so the next
+                # startup retries (reconcile only skips already-closed
+                # positions). Retry is safe against double-counting: the
+                # has_terminal_event guard at the top of the loop skips any
+                # sid whose terminal outcome was already logged (a crash
+                # between lifecycle.log and the later state.save leaves the
+                # PnL recorded but the position un-closed).
+                pos.pop("closed", None)
+                try:
+                    self.state.save()
+                except Exception:  # noqa: BLE001 - best effort
+                    log.exception("reconcile close %s: state.save failed",
+                                  pos_id)
+        if summary["managed"] or summary["errors"]:
+            log.info("reconcile close: managed=%d errors=%s",
+                     summary["managed"], summary["errors"])
+
+    def _entry_filled(self, pos: dict) -> bool:
+        """True when the entry order actually filled (crash landed between
+        entry fill and bracket placement). Never raises."""
+        oid = pos.get("entry_order_id")
+        if oid is None:
+            return False
+        try:
+            o = self.exchange.get_order(pos.get("symbol", "?"), order_id=oid)
+        except Exception:  # noqa: BLE001 - unknown -> treat as unfilled
+            return False
+        return bool(o and o.get("status") == "FILLED")
 
     # ------------------------------------------------------------------ loop
     def run_loop(self, stop_after: int | None = None,
@@ -1124,6 +1219,7 @@ class Executor:
             if rec["adopted"] or rec["closed"]:
                 log.warning("startup reconcile: adopted=%s closed=%s",
                             rec["adopted"], rec["closed"])
+            self._close_reconciled_positions(rec["closed"])
         except Exception:  # noqa: BLE001 - paper broker always succeeds
             log.exception("startup reconcile failed")
         n = 0
