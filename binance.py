@@ -588,8 +588,17 @@ class BinanceShell:
                         # Escape: the text is rendered with Rich markup in
                         # _autotrade_view; a [...] in the message crashed it.
                         summary = {"error": escape(str(e)[:120])}
-                self.console.print(self._autotrade_view(executor, summary,
-                                                        cycle, from_db))
+                try:
+                    self.console.print(self._autotrade_view(executor, summary,
+                                                            cycle, from_db))
+                except Exception as ve:  # noqa: BLE001
+                    # Diagnostic: show WHERE a render error comes from.
+                    import traceback
+                    self.console.print(
+                        f"[red]render gagal:[/red] "
+                        f"{escape(str(ve)[:200])}")
+                    traceback.print_exc()
+                    return
                 self._sleep_countdown(
                     int(executor.poll_interval_min * 60))
         except KeyboardInterrupt:
