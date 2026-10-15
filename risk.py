@@ -115,10 +115,14 @@ class RiskManager:
         if balance is None:
             # Fail-closed: without a balance we cannot prove we are safe.
             return False, "balance unavailable - holding (fail-closed)"
+        # Read the cap live from config so dashboard overrides apply;
+        # constructor value is the fallback when config is unavailable.
+        cap_pct = getattr(config, "DAILY_LOSS_CAP_PCT",
+                          self.daily_loss_cap_pct)
         loss_pct = (start - balance) / start * 100
-        if loss_pct >= self.daily_loss_cap_pct:
+        if loss_pct >= cap_pct:
             reason = (f"daily loss {loss_pct:.2f}% >= cap "
-                      f"{self.daily_loss_cap_pct}% "
+                      f"{cap_pct}% "
                       f"(start ${start:,.2f} -> now ${balance:,.2f})")
             self.engage_kill_switch(reason)
             return False, reason

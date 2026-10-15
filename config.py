@@ -246,6 +246,10 @@ DASH_NUMERIC_OVERRIDES = {
     # risk: max position notional as % of balance (operator-widened only
     # on explicit instruction; default 20 keeps concentration in check)
     "max_exposure_pct_per_symbol": ("EXEC_MAX_EXPOSURE_PCT_PER_SYMBOL", 5, 500),
+    # kill switch: daily-loss cap as % of day-start balance. 0 = trip on any
+    # daily loss; 100 = effectively off. Widened only on explicit operator
+    # instruction (user 2026-10-15: "habiskan saja saldonya").
+    "daily_loss_cap_pct": ("DAILY_LOSS_CAP_PCT", 0, 100),
 }
 # Boolean engine knobs: setting name -> config attribute.
 DASH_BOOL_OVERRIDES = {
@@ -361,6 +365,9 @@ DASHBOARD_DEFAULTS = {
     "risk_pct_per_trade": 1.0,
     "max_leverage": 3,
     "poll_interval_min": 5,
+    # kill switch: stop new entries if daily loss exceeds this % of the
+    # day-start balance. 100 = effectively off (explicit operator choice).
+    "daily_loss_cap_pct": 3.0,
     # signal
     "signal_mode": "ketat",  # ketat | sedang | biasa (preset bundle)
     "min_quality_score": 70,
