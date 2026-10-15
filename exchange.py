@@ -293,6 +293,17 @@ class ExchangeClient:
             log.warning("get_order %s -> %s", symbol, e)
             return None
 
+    def get_user_trades(self, symbol: str, limit: int = 20) -> list:
+        """Signed GET /fapi/v1/userTrades — ground-truth fills.
+
+        Fail-closed: raises ExchangeError on failure (never fabricate).
+        Each trade: time, side (BUY/SELL), qty, price, realizedPnl,
+        commission. For a SHORT, the closing side is BUY (buyer=True).
+        """
+        params = {"symbol": symbol.upper(),
+                  "limit": max(1, min(1000, int(limit or 20)))}
+        return self._request("GET", "/fapi/v1/userTrades", params)
+
     def cancel_order(self, symbol: str, order_id: int | None = None,
                      orig_client_order_id: str | None = None) -> bool:
         params: dict = {"symbol": symbol}
