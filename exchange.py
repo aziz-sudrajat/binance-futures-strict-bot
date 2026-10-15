@@ -293,15 +293,21 @@ class ExchangeClient:
             log.warning("get_order %s -> %s", symbol, e)
             return None
 
-    def get_user_trades(self, symbol: str, limit: int = 20) -> list:
+    def get_user_trades(self, symbol: str, limit: int = 20,
+                      start_time: int | None = None) -> list:
         """Signed GET /fapi/v1/userTrades — ground-truth fills.
 
         Fail-closed: raises ExchangeError on failure (never fabricate).
         Each trade: time, side (BUY/SELL), qty, price, realizedPnl,
         commission. For a SHORT, the closing side is BUY (buyer=True).
+        start_time (ms): restrict to trades at/after this timestamp —
+        pass the position's opened_at so a long-downtime close can't be
+        pushed out of the `limit` window by later trades on the symbol.
         """
         params = {"symbol": symbol.upper(),
                   "limit": max(1, min(1000, int(limit or 20)))}
+        if start_time:
+            params["startTime"] = int(start_time)
         return self._request("GET", "/fapi/v1/userTrades", params)
 
     def cancel_order(self, symbol: str, order_id: int | None = None,
