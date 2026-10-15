@@ -288,8 +288,34 @@ class FakeMarket:
         return self.klines["15m"][-1]["close"]
 
 
+
+def _benign_4h_for_sr(m, bullish=True):
+    """Patch market 4h history so the sr_zone veto stays quiet: a gentle
+    trend (matching the 15m direction for MTF) with the swing extreme far
+    from any plausible entry. Used by pass-regression tests whose intent is
+    not S/R behavior."""
+    kl4 = []
+    if bullish:
+        for i in range(500):
+            c = 180.0 + i * (12.0 / 500)
+            kl4.append({"high": c + 1.0, "low": c - 1.0, "close": c,
+                        "open": c - 0.5, "volume": 1000.0})
+        kl4[5] = {"high": 250.0, "low": 178.0, "close": 182.0,
+                  "open": 180.0, "volume": 1000.0}
+    else:
+        for i in range(500):
+            c = 220.0 - i * (12.0 / 500)
+            kl4.append({"high": c + 1.0, "low": c - 1.0, "close": c,
+                        "open": c + 0.5, "volume": 1000.0})
+        kl4[5] = {"high": 222.0, "low": 150.0, "close": 218.0,
+                  "open": 220.0, "volume": 1000.0}
+    m.klines["4h"] = kl4
+    return m
+
+
 def test_evaluate_symbol_strict_pass():
-    signal, note = evaluate_symbol("BTCUSDT", FakeMarket(bullish=True))
+    signal, note = evaluate_symbol(
+        "BTCUSDT", _benign_4h_for_sr(FakeMarket(bullish=True)))
     assert signal is not None, note
     assert signal["direction"] == "LONG"
     assert signal["quality"] >= config.MIN_QUALITY_SCORE
@@ -318,7 +344,7 @@ def test_evaluate_symbol_stale_entry_rejected():
     # T1 (reject path): GAS freshnessCheck_ — LIVE price >0.4% above entryHigh
     # -> stale entry. The Python port previously used the last closed 15m
     # candle (up to ~23 min stale); it now uses a live ticker price (audit D1).
-    m = FakeMarket(bullish=True)
+    m = _benign_4h_for_sr(FakeMarket(bullish=True))
     plan = analyze_candles("BTCUSDT", "15m", m.klines["15m"])["trade_plan"]
     m.live_price = plan["entry_high"] * 1.01  # +1% above the zone
     signal, reason = evaluate_symbol("BTCUSDT", m)
@@ -339,7 +365,7 @@ def test_freshness_ticker_failure_rejected():
 def test_freshness_live_price_below_zone_accepts():
     # One-sided check (GAS L5075): live price below/at the zone is a valid
     # pullback entry for longs — only drift ABOVE the zone vetoes.
-    m = FakeMarket(bullish=True)
+    m = _benign_4h_for_sr(FakeMarket(bullish=True))
     plan = analyze_candles("BTCUSDT", "15m", m.klines["15m"])["trade_plan"]
     m.live_price = plan["entry_low"] * 0.999
     signal, note = evaluate_symbol("BTCUSDT", m)
@@ -350,7 +376,7 @@ def test_freshness_live_price_below_zone_accepts():
 def test_derivatives_total_failure_held():
     # T2 (audit D4/H6): snapshot with no usable components -> HOLD,
     # never auto-neutralized to score 50 and passed.
-    m = FakeMarket(bullish=True)
+    m = _benign_4h_for_sr(FakeMarket(bullish=True))
     m.get_derivatives_snapshot = lambda s, period="4h": {
         "symbol": s, "provider": "none",
         "aggregate_long": None, "aggregate_funding": None,
@@ -363,7 +389,7 @@ def test_derivatives_total_failure_held():
 def test_derivatives_optional_gap_flagged_on_signal():
     # Required components (funding + OI) present, optional taker missing ->
     # signal passes with the gap recorded on the signal dict.
-    m = FakeMarket(bullish=True)
+    m = _benign_4h_for_sr(FakeMarket(bullish=True))
     m.get_derivatives_snapshot = lambda s, period="4h": {
         "symbol": s, "provider": "fake",
         "aggregate_long": 52.0, "aggregate_funding": 0.0001,
@@ -448,7 +474,9 @@ def test_bearish_produces_short_when_bidirectional():
     old = config.BULLISH_ONLY
     config.BULLISH_ONLY = False
     try:
-        signal, note = evaluate_symbol("BTCUSDT", FakeMarket(bullish=False))
+        signal, note = evaluate_symbol(
+            "BTCUSDT", _benign_4h_for_sr(FakeMarket(bullish=False),
+                                         bullish=False))
     finally:
         config.BULLISH_ONLY = old
     assert signal is not None, note
