@@ -179,8 +179,9 @@ def status_panel(status: dict, mode: str) -> Panel:
     bal_s = f"{_money(bal)} USDT" if bal_ok else "[red]tidak tersedia[/red]"
     grid.add_row("Mode", f"[bold]{mode.upper()}[/bold]")
     grid.add_row("Saldo", bal_s)
+    pnl_color = "green" if (pnl or 0) >= 0 else "red"
     pnl_s = ("?" if pnl is None
-             else f"[{'green' if pnl >= 0 else 'red'}]{pnl:+.2f} USDT[/]")
+             else f"[{pnl_color}]{pnl:+.2f} USDT[/{pnl_color}]")
     grid.add_row("PnL hari ini", pnl_s)
     grid.add_row("Posisi terbuka", str(status.get("n_positions", 0)))
     grid.add_row("Kill switch",
@@ -210,13 +211,15 @@ def positions_table(status: dict) -> Table:
         mark = p.get("mark", p.get("mark_price"))
         t.add_row(
             f"[bold]{p.get('symbol', '?')}[/bold]",
-            f"[{'green' if side == 'LONG' else 'red'}]{side}[/]",
+            (f"[green]{side}[/green]" if side == "LONG"
+              else f"[red]{side}[/red]"),
             _money(p.get("qty")),
             _money(p.get("entry_price", p.get("entry"))),
             _money(mark) if mark else "[dim]—[/dim]",
             ("[dim]—[/dim]" if upnl is None
-             else f"[{'green' if float(upnl) >= 0 else 'red'}]"
-                  f"{float(upnl):+.2f}[/]"),
+             else (f"[green]{float(upnl):+.2f}[/green]"
+                   if float(upnl) >= 0
+                   else f"[red]{float(upnl):+.2f}[/red]")),
             f"{p.get('leverage', '?')}x",
             _money(p.get("stop_loss")),
         )
@@ -239,8 +242,9 @@ def radar_table(rows: list[dict], limit: int = 20) -> Table:
         t.add_row(
             str(shown),
             f"[bold]{r.get('symbol')}[/bold]",
-            f"[{'green' if r.get('direction') == 'LONG' else 'red'}]"
-            f"{r.get('direction')}[/]",
+            (f"[green]{r.get('direction')}[/green]"
+             if r.get('direction') == 'LONG'
+             else f"[red]{r.get('direction')}[/red]"),
             f"[bold green]{r.get('quality')}[/bold green]",
             _money(r.get("entry")),
             f"[red]{_money(r.get('stop_loss'))}[/red]",
@@ -307,8 +311,9 @@ def signals_table(rows: list[dict]) -> Table:
     for r in rows:
         t.add_row(
             f"[bold]{r.get('symbol')}[/bold]",
-            f"[{'green' if r.get('direction') == 'LONG' else 'red'}]"
-            f"{r.get('direction')}[/]",
+            (f"[green]{r.get('direction')}[/green]"
+             if r.get('direction') == 'LONG'
+             else f"[red]{r.get('direction')}[/red]"),
             f"[bold green]{r.get('quality')}[/bold green]",
             _money(r.get("entry")),
             f"{r.get('age_min', '?')}m",
@@ -332,7 +337,8 @@ def events_table(events: list[dict]) -> Table:
         t.add_row(
             str(e.get("time", "-")),
             f"[bold]{e.get('symbol', '-')}[/bold]",
-            f"[{colors.get(state, '')}]{state}[/]",
+            (f"[{colors.get(state, '')}]{state}[/{colors.get(state, '')}]"
+             if colors.get(state, '') else state),
             "" if q is None else f"{q}",
             escape(str(e.get("reason", ""))[:60]),
         )
