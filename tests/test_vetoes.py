@@ -295,7 +295,22 @@ def test_btc_dump_rejects_signal_end_to_end():
 def test_strict_pass_regression_with_vetoes():
     # A signal that passed before ROADMAP ITEM 2 still passes when no veto
     # fires: vetoes add rejections, never approvals.
-    signal, note = evaluate_symbol("BTCUSDT", FakeMarket(bullish=True))
+    # NOTE: the 4h history is lifted so its highest high sits well above the
+    # entry — otherwise the new sr_zone veto (correctly) flags this synthetic
+    # ramp as "long into resistance". S/R behavior itself is covered by the
+    # dedicated sr_zone tests below.
+    m = FakeMarket(bullish=True)
+    # Benign 4h history: gentle ramp (bullish for MTF) with a single distant
+    # spike high as resistance, far above any entry -> sr_zone stays quiet.
+    kl4 = []
+    for i in range(500):
+        c = 180.0 + i * (12.0 / 500)
+        kl4.append({"high": c + 1.0, "low": c - 1.0, "close": c,
+                    "open": c - 0.5, "volume": 1000.0})
+    kl4[5] = {"high": 250.0, "low": 178.0, "close": 182.0,
+              "open": 180.0, "volume": 1000.0}
+    m.klines["4h"] = kl4
+    signal, note = evaluate_symbol("BTCUSDT", m)
     assert signal is not None, note
     assert signal["direction"] == "LONG"
     assert signal["quality"] >= config.MIN_QUALITY_SCORE
@@ -322,3 +337,79 @@ def test_btc_pump_no_veto_for_longs():
     vetoes.reset_caches()
     assert "btc_breaker" not in blocks_by_code(
         run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+
+
+# ------------------------------------------------- V16: S/R location
+def _sr_market_4h(n=500, lo=99.0, hi=101.0, support=90.0, resistance=110.0):
+    """FakeMarket whose 4h history has known swing extremes (~2 ATR range)."""
+    m = FakeMarket()
+    kl = [{"high": hi, "low": lo, "close": 100.0} for _ in range(n)]
+    kl[10] = {"high": 96.0, "low": support, "close": 94.0}
+    kl[20] = {"high": resistance, "low": 104.0, "close": 106.0}
+    orig = m.get_klines
+
+    def klines(symbol, interval, limit=220):
+        if interval == "4h":
+            return kl[:limit]
+        return orig(symbol, interval, limit)
+
+    m.get_klines = klines
+    return m
+
+
+def test_sr_zone_vetoes_short_into_support():
+    # support=90, ATR(4h)~2 -> zone ~5: entry 92 is inside (90, 95].
+    m = _sr_market_4h()
+    by = blocks_by_code(run_vetoes("ETHUSDT", "BEARISH", m, BENIGN_SNAP,
+                                   entry_px=92.0))
+    kind, reason = by["sr_zone"]
+    assert kind == "veto"
+    assert "SHORT into 4h support" in reason
+
+
+def test_sr_zone_allows_short_below_support():
+    # Breakdown already below support is legitimate — not vetoed.
+    m = _sr_market_4h()
+    assert "sr_zone" not in blocks_by_code(
+        run_vetoes("ETHUSDT", "BEARISH", m, BENIGN_SNAP, entry_px=89.0))
+
+
+def test_sr_zone_vetoes_long_into_resistance():
+    # resistance=110, zone ~5: entry 107 is inside [105, 110).
+    m = _sr_market_4h()
+    by = blocks_by_code(run_vetoes("ETHUSDT", "BULLISH", m, BENIGN_SNAP,
+                                   entry_px=107.0))
+    kind, reason = by["sr_zone"]
+    assert kind == "veto"
+    assert "LONG into 4h resistance" in reason
+
+
+def test_sr_zone_allows_long_above_resistance():
+    # Breakout above resistance is legitimate — not vetoed.
+    m = _sr_market_4h()
+    assert "sr_zone" not in blocks_by_code(
+        run_vetoes("ETHUSDT", "BULLISH", m, BENIGN_SNAP, entry_px=112.0))
+
+
+def test_sr_zone_disabled_skips():
+    m = _sr_market_4h()
+    assert "sr_zone" not in blocks_by_code(
+        run_vetoes("ETHUSDT", "BEARISH", m, BENIGN_SNAP, entry_px=92.0,
+                   disabled={"sr_zone"}))
+
+
+def test_sr_zone_skipped_without_entry_px():
+    # Without an entry price the veto is not applicable (skipped, not held).
+    m = _sr_market_4h()
+    assert "sr_zone" not in blocks_by_code(
+        run_vetoes("ETHUSDT", "BEARISH", m, BENIGN_SNAP))
+
+
+def test_sr_zone_pol_case():
+    # Live 2026-10-15: POL short @ 0.09342 into 4h support ~0.086-0.089.
+    # Must be vetoed (this is the trade the user flagged).
+    m = _sr_market_4h(n=300, lo=0.0920, hi=0.0940,
+                      support=0.08613, resistance=0.12536)
+    by = blocks_by_code(run_vetoes("POLUSDT", "BEARISH", m, BENIGN_SNAP,
+                                   entry_px=0.09342))
+    assert by["sr_zone"][0] == "veto"
