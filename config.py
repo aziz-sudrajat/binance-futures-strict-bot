@@ -414,6 +414,10 @@ DASHBOARD_DEFAULTS = {
     # kill switch: stop new entries if daily loss exceeds this % of the
     # day-start balance. 100 = effectively off (explicit operator choice).
     "daily_loss_cap_pct": 3.0,
+    # trading-hours gate (LIVE entries only 05:00-18:00 WIB). False = off.
+    # NOTE: must stay in DASHBOARD_DEFAULTS — load_settings() drops any
+    # settings key without a default, which silently deadens the knob.
+    "trading_hours_enabled": True,
     # signal
     "signal_mode": "ketat",  # ketat | sedang | biasa (preset bundle)
     "min_quality_score": 70,
