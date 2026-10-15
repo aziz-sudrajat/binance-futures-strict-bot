@@ -90,8 +90,11 @@ class FakeExchange:
                  "unrealized_pnl": 0.0, "leverage": 3}
                 for s, q in self._pos.items() if q > 0]
 
-    def get_user_trades(self, symbol, limit=20):
-        return [t for t in self.user_trades if t.get("symbol") == symbol][:limit]
+    def get_user_trades(self, symbol, limit=20, start_time=None):
+        trades = [t for t in self.user_trades if t.get("symbol") == symbol]
+        if start_time:
+            trades = [t for t in trades if t.get("time", 0) >= start_time]
+        return trades[:limit]
 
     def get_order(self, symbol, order_id=None, orig_client_order_id=None):
         for o in self.orders.values():
@@ -1175,7 +1178,7 @@ def test_vanished_close_trades_unavailable_fails_closed(short_rig):
                "errors": []}
     pos_id, pos = _vanished_short_pos(executor, exchange, summary)
 
-    def boom(symbol, limit=20):
+    def boom(symbol, limit=20, start_time=None):
         raise RuntimeError("timeout")
 
     exchange.get_user_trades = boom
@@ -1184,3 +1187,201 @@ def test_vanished_close_trades_unavailable_fails_closed(short_rig):
                              reason="position gone from exchange")
     assert pos["closed_reason"] == "sl_hit (trades unavailable)"
     assert pos["realized"] == 0.0
+
+
+# --------------------------------------- reconcile terminal attribution (2026-10-15)
+
+def _bracketed_pos(sid="s1", qty=1.0):
+    return {
+        "symbol": "BTCUSDT", "signal_id": sid, "direction": "LONG",
+        "qty": qty, "entry_price": 100.0, "stop_loss": 95.0,
+        "tp": {"tp1": {"price": 105.0, "qty": 0.4, "order_id": None,
+                       "filled": False},
+               "tp2": {"price": 110.0, "qty": 0.3, "order_id": None,
+                       "filled": False},
+               "tp3": {"price": 115.0, "qty": 0.3, "order_id": None,
+                       "filled": False}},
+        "sl_order_id": None, "breakeven_moved": False,
+        "brackets_placed": True, "opened_at": 1_000,
+        "realized": 0.0,
+    }
+
+
+def test_reconcile_reports_newly_closed_only(workdir):
+    state = StateStore(os.path.join(workdir, "state.json"))
+    state.get("positions", {})["p1"] = _bracketed_pos()
+    state.save()
+    rec1 = state.reconcile([])
+    assert rec1["closed"] == ["p1"]
+    # Second startup: already-closed positions are not re-reported, so no
+    # duplicate terminal attribution can happen.
+    rec2 = state.reconcile([])
+    assert rec2["closed"] == []
+
+
+def test_reconcile_close_bracketed_logs_terminal_sl(rig):
+    executor, market, exchange, state, lifecycle, risk = rig
+    state.get("positions", {})["p1"] = _bracketed_pos(sid="s1")
+    state.save()
+    # Vanished from the exchange while the bot was down; userTrades shows
+    # the stop filled.
+    exchange.user_trades = [{
+        "symbol": "BTCUSDT", "side": "SELL", "qty": 1.0, "price": 95.0,
+        "realizedPnl": -5.0, "commission": 0.05, "time": 2_000,
+    }]
+    rec = state.reconcile([])
+    assert rec["closed"] == ["p1"]
+    executor._close_reconciled_positions(rec["closed"])
+    events = [e for e in lifecycle.read_all()
+              if e.get("signal_id") == "s1"]
+    terminal = [e for e in events if e.get("terminal")]
+    assert len(terminal) == 1
+    assert terminal[0]["state"] == "sl_hit"
+    assert terminal[0]["realized"] == pytest.approx(-5.05)
+
+
+def test_reconcile_close_unbracketed_cancels_entry(rig):
+    executor, market, exchange, state, lifecycle, risk = rig
+    pos = _bracketed_pos(sid="s2")
+    pos["brackets_placed"] = False
+    pos["entry_order_id"] = 4242
+    exchange.orders[4242] = {"orderId": 4242, "symbol": "BTCUSDT",
+                             "status": "NEW", "clientOrderId": "en1"}
+    state.get("positions", {})["p2"] = pos
+    state.save()
+    rec = state.reconcile([])
+    assert rec["closed"] == ["p2"]
+    executor._close_reconciled_positions(rec["closed"])
+    assert exchange.orders[4242]["status"] == "CANCELED"  # no naked fill
+    events = [e for e in lifecycle.read_all()
+              if e.get("signal_id") == "s2" and e.get("terminal")]
+    assert len(events) == 1 and events[0]["state"] == "cancelled"
+    assert state.get("positions")["p2"]["closed"] is True
+
+
+def test_reconcile_close_uses_report_outcome(rig):
+    # End-to-end into report.py: the attributed close shows up with PnL.
+    import datetime
+    from report import daily_report
+    executor, market, exchange, state, lifecycle, risk = rig
+    state.get("positions", {})["p1"] = _bracketed_pos(sid="s9")
+    state.save()
+    exchange.user_trades = [{
+        "symbol": "BTCUSDT", "side": "SELL", "qty": 1.0, "price": 95.0,
+        "realizedPnl": -5.0, "commission": 0.05, "time": 2_000,
+    }]
+    rec = state.reconcile([])
+    executor._close_reconciled_positions(rec["closed"])
+    day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    out = daily_report(day, lifecycle.path,
+                       os.path.join(os.path.dirname(state.path),
+                                    "state.json"))
+    assert "closed trades: 1 | wins: 0 | realized PnL: -5.05 USDT" in out
+
+
+# --------------------------- reviewer findings, cycle 4 (2026-10-15)
+
+def test_reconcile_close_entry_filled_no_brackets_classifies(rig):
+    # Reviewer finding #3: entry filled while the bot was down, crash
+    # before brackets -> must be classified via userTrades, not CANCELLED.
+    executor, market, exchange, state, lifecycle, risk = rig
+    pos = _bracketed_pos(sid="s3")
+    pos["brackets_placed"] = False
+    pos["entry_order_id"] = 555
+    exchange.orders[555] = {"orderId": 555, "symbol": "BTCUSDT",
+                            "status": "FILLED", "executedQty": 1.0,
+                            "avgPrice": 100.0, "clientOrderId": "en2"}
+    exchange.user_trades = [{
+        "symbol": "BTCUSDT", "side": "SELL", "qty": 1.0, "price": 95.0,
+        "realizedPnl": -5.0, "commission": 0.05, "time": 2_000,
+    }]
+    state.get("positions", {})["p3"] = pos
+    state.save()
+    rec = state.reconcile([])
+    executor._close_reconciled_positions(rec["closed"])
+    events = [e for e in lifecycle.read_all()
+              if e.get("signal_id") == "s3" and e.get("terminal")]
+    assert len(events) == 1 and events[0]["state"] == "sl_hit"
+    assert events[0]["realized"] == pytest.approx(-5.05)
+
+
+def test_reconcile_close_failure_retries_next_startup(rig):
+    # Reviewer finding #2: a failed attribution clears the closed flag so
+    # the next startup retries instead of losing the trade forever.
+    executor, market, exchange, state, lifecycle, risk = rig
+    state.get("positions", {})["p4"] = _bracketed_pos(sid="s4")
+    state.save()
+    rec = state.reconcile([])
+    assert rec["closed"] == ["p4"]
+    orig_save = state.save
+    orig_close = executor._close_position
+    def fail_close(*a, **k):
+        raise RuntimeError("close failed")
+    executor._close_position = fail_close
+    try:
+        executor._close_reconciled_positions(rec["closed"])
+    finally:
+        executor._close_position = orig_close
+        state.save = orig_save
+    pos = state.get("positions")["p4"]
+    assert pos.get("closed") is None  # cleared -> reconcile re-lists it
+    rec2 = state.reconcile([])
+    assert rec2["closed"] == ["p4"]
+
+
+def test_classify_uses_start_time_window(rig):
+    # Reviewer finding #1: close fills must not be pushed out of the
+    # userTrades window by later trades on the same symbol.
+    executor, market, exchange, state, lifecycle, risk = rig
+    seen = {}
+    orig = exchange.get_user_trades
+    def spy(symbol, limit=20, start_time=None):
+        seen["start_time"] = start_time
+        seen["limit"] = limit
+        return orig(symbol, limit=limit, start_time=start_time)
+    exchange.get_user_trades = spy
+    pos = _bracketed_pos(sid="s5")
+    pos["opened_at"] = 5_000
+    # an old close fill from a previous position + the real close fill
+    exchange.user_trades = [
+        {"symbol": "BTCUSDT", "side": "SELL", "qty": 1.0, "price": 90.0,
+         "realizedPnl": -10.0, "commission": 0.05, "time": 1_000},
+        {"symbol": "BTCUSDT", "side": "SELL", "qty": 1.0, "price": 95.0,
+         "realizedPnl": -5.0, "commission": 0.05, "time": 6_000},
+    ]
+    event, why, net, avg_px = executor._classify_vanished_close(
+        "BTCUSDT", pos, "s5", "p5")
+    assert seen["start_time"] == 5_000
+    assert event == "sl_hit" and net == pytest.approx(-5.05)
+    assert avg_px == pytest.approx(95.0)  # old fill excluded by the window
+
+
+def test_reconcile_close_skips_already_attributed_sid(rig):
+    # Review 2026-10-16 (F1): a crash between lifecycle.log and the later
+    # state.save leaves the terminal event logged but the position
+    # un-closed. The retry must NOT attribute it again — no second terminal
+    # event, no second PnL recording.
+    executor, market, exchange, state, lifecycle, risk = rig
+    pos = _bracketed_pos(sid="s9")
+    state.get("positions", {})["p9"] = pos
+    state.save()
+    # First attempt already logged the terminal outcome.
+    lifecycle.log("s9", "BTCUSDT", "sl_hit", reason="x", realized=-5.05,
+                  terminal=True)
+    rec = state.reconcile([])
+    assert rec["closed"] == ["p9"]
+    executor._close_reconciled_positions(rec["closed"])
+    terminal = [e for e in lifecycle.read_all()
+                if e.get("signal_id") == "s9" and e.get("terminal")]
+    assert len(terminal) == 1  # no double terminal event
+    assert pos["realized"] == 0.0  # no double PnL
+
+
+def test_has_terminal_event(rig):
+    executor, market, exchange, state, lifecycle, risk = rig
+    assert not lifecycle.has_terminal_event("nope")
+    assert not lifecycle.has_terminal_event("")
+    lifecycle.log("sA", "BTCUSDT", "tp1_hit", realized=0.0)  # leg, no marker
+    assert not lifecycle.has_terminal_event("sA")
+    lifecycle.log("sA", "BTCUSDT", "tp1_hit", realized=1.25, terminal=True)
+    assert lifecycle.has_terminal_event("sA")
