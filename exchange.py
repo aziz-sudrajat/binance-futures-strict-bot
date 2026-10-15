@@ -196,11 +196,16 @@ class ExchangeClient:
         return None
 
     def get_positions(self) -> list[dict]:
-        """Open positions (positionAmt != 0), normalized to a small dict."""
-        try:
-            acct = self._request("GET", "/fapi/v2/account")
-        except ExchangeError:
-            return []
+        """Open positions (positionAmt != 0), normalized to a small dict.
+
+        FAIL-CLOSED: raises ExchangeError when the account snapshot cannot
+        be fetched. Callers must NOT treat a failure as "no positions" —
+        doing so makes the bot misclassify live positions as closed
+        (false "position gone from exchange", state corruption). Seen live
+        2026-10-15: transient post-sleep network failure returned a phantom
+        empty list and orphaned real positions.
+        """
+        acct = self._request("GET", "/fapi/v2/account")
         out = []
         for p in acct.get("positions", []):
             try:
