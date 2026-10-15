@@ -433,9 +433,10 @@ def mtf_cascade_check(klines_4h: list, klines_1d: list, a30: dict,
 
 
 # ------------------------------------------------- mode-based signal layers
-# User spec 2026-10-15:
-#   biasa : 15m indicators only (MACD, MA/EMA, RSI). The 15m setup IS the signal.
-#   sedang: biasa + MTF alignment (4h, 1h, 30m, 15m all same direction)
+# User spec 2026-10-15 (+ aturan MTF 2026-10-15: SEMUA mode cek MTF 4h/1h/30m/15m):
+#   biasa : 15m indicators + MTF alignment (4h, 1h, 30m, 15m all same
+#           direction). Bidirectional, no BTC/veto/derivatives.
+#   sedang: biasa + BTC direction must match.
 #           + BTC 15m direction must match.
 #   ketat : sedang + pattern review + news review + liquidation review
 #           + whale review + full veto/derivatives/quality machinery.
@@ -705,10 +706,9 @@ def _freshness_check(symbol: str, market, direction: str,
 def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
     """Mode-dispatched signal pipeline (user spec 2026-10-15).
 
-    - biasa : 15m indicators only (MACD, MA/EMA, RSI). The 15m setup IS
-      the signal. Mechanical safety (volume, freshness) still applies.
-    - sedang: biasa + MTF alignment (4h, 1h, 30m, 15m all same direction)
-      + BTC 15m direction must match.
+    - biasa : 15m indicators (MACD, MA/EMA, RSI) + MTF alignment
+      4h/1h/30m/15m. Bidirectional.
+    - sedang: biasa + BTC 15m direction must match.
     - ketat : sedang + pattern review + news review + liquidation review
       + whale review + derivatives coverage + deterministic vetoes +
       quality gate (>=70).
@@ -756,17 +756,9 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
 
     reviews = [f"15m {sig15.lower()} (strength {a15['strength']}/5)"]
 
-    # ================= biasa: 15m indicators only =================
-    if mode == "biasa":
-        quality = _layered_quality(a15["strength"], mode)
-        if quality < config.MIN_QUALITY_SCORE:
-            return None, (f"quality {quality}/100 below biasa minimum "
-                           f"{config.MIN_QUALITY_SCORE}")
-        return _build_signal(symbol, direction, a15, live, quality, mode,
-                             reviews)
-
     # ---- Stage 2: MTF alignment — 4h, 1h, 30m, 15m same direction
-    # (sedang, ketat). Fail-closed.
+    # (SEMUA mode — aturan user 2026-10-15: setiap signal cek MTF
+    # 4h-1h-30m-15m). Fail-closed.
     try:
         a30 = analyze_candles(symbol, "30m", market.get_klines(symbol, "30m"))
     except Exception as e:  # noqa: BLE001
@@ -775,6 +767,15 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
     if not ok:
         return None, note
     reviews.append(note)
+
+    # ================= biasa: 15m + MTF 4h/1h/30m/15m =================
+    if mode == "biasa":
+        quality = _layered_quality(a15["strength"], mode)
+        if quality < config.MIN_QUALITY_SCORE:
+            return None, (f"quality {quality}/100 below biasa minimum "
+                           f"{config.MIN_QUALITY_SCORE}")
+        return _build_signal(symbol, direction, a15, live, quality, mode,
+                             reviews)
 
     # ---- Stage 3: BTC direction must match (sedang, ketat).
     if config.BTC_ALIGN_REQUIRED:

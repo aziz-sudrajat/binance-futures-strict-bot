@@ -278,9 +278,10 @@ DASH_VETO_CODES = ("leverage_risk", "funding", "squeeze", "whale",
 # The user can still fine-tune knobs afterwards — the mode is a preset,
 # not a lock.
 SIGNAL_MODES = ("ketat", "sedang", "biasa")
-# Signal mode semantics (user spec 2026-10-15):
-#   biasa : 15m indicators only (MACD, MA/EMA, RSI). No MTF, no vetoes,
-#           no derivatives gate — the 15m setup IS the signal.
+# Signal mode semantics (user spec 2026-10-15; aturan MTF 2026-10-15:
+# SEMUA mode cek MTF 4h/1h/30m/15m):
+#   biasa : 15m indicators (MACD, MA/EMA, RSI) + MTF 4h/1h/30m/15m.
+#           No BTC, no vetoes, no derivatives gate.
 #   sedang: biasa + MTF alignment (4h, 1h, 30m, 15m all same direction)
 #           + BTC direction must match.
 #   ketat : sedang + pattern review + news review + liquidation review
@@ -330,7 +331,7 @@ SIGNAL_MODE_PRESETS = {
         "min_quality_score": 50,
         "mtf_30m_mode": "LEAN",
         "mtf_require_1d": False,
-        "mtf_require_1h": False,
+        "mtf_require_1h": True,   # aturan user 2026-10-15: semua mode cek MTF 4h/1h/30m/15m
         "btc_align_required": False,
         "pattern_required": False,
         "news_check": False,
@@ -368,7 +369,7 @@ DASHBOARD_DEFAULTS = {
     "bullish_only": True,
     "mtf_30m_mode": "STRICT",
     "mtf_require_1d": True,     # 1d trend alignment: hard gate (ketat)
-    "mtf_require_1h": True,     # 1h trend alignment: hard gate (sedang/ketat)
+    "mtf_require_1h": True,     # 1h trend alignment: hard gate (semua mode)
     "btc_align_required": True,  # BTC 15m direction must match (sedang/ketat)
     "pattern_required": True,   # candlestick pattern review (ketat)
     "news_check": True,         # coin news sentiment review (ketat)
