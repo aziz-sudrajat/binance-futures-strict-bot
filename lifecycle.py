@@ -27,6 +27,7 @@ TP1_HIT = "tp1_hit"
 TP2_HIT = "tp2_hit"
 TP3_HIT = "tp3_hit"
 SL_HIT = "sl_hit"
+MANUAL_CLOSE = "manual_close"
 EXPIRED = "expired"
 CANCELLED = "cancelled"
 
