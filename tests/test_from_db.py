@@ -14,6 +14,14 @@ from lifecycle import LifecycleLogger  # noqa: E402
 from risk import RiskManager  # noqa: E402
 from signals_db import SignalDB  # noqa: E402
 from state import StateStore  # noqa: E402
+import config  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _trading_hours_open(monkeypatch):
+    # These tests exercise the from-db execution flow, not the hours gate
+    # (covered in test_trading_hours.py): force entries allowed.
+    monkeypatch.setattr(config, "within_trading_hours", lambda now=None: True)
 
 
 @pytest.fixture
