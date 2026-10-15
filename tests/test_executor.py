@@ -43,6 +43,7 @@ class FakeExchange:
                         "minQty": 0.001, "maxQty": 100000.0, "minNotional": 5.0}
         self.margin_calls = []
         self.leverage_calls = []
+        self.user_trades = []  # ground-truth fills for _classify_vanished_close
 
     def get_balance(self, asset="USDT"):
         return self._balance
@@ -88,6 +89,9 @@ class FakeExchange:
         return [{"symbol": s, "side": "LONG", "qty": q, "entry_price": 0.0,
                  "unrealized_pnl": 0.0, "leverage": 3}
                 for s, q in self._pos.items() if q > 0]
+
+    def get_user_trades(self, symbol, limit=20):
+        return [t for t in self.user_trades if t.get("symbol") == symbol][:limit]
 
     def get_order(self, symbol, order_id=None, orig_client_order_id=None):
         for o in self.orders.values():
@@ -803,20 +807,24 @@ def test_short_sl_fill_pnl_sign(short_rig):
     entry_px = pos["entry_price"]
     qty = pos["qty"]
     # SL fills above the entry -> loss for a short (mirrored PnL sign).
-    sl_id = pos["sl_order_id"]
-    exchange.orders[sl_id]["status"] = "FILLED"
-    exchange.orders[sl_id]["avgPrice"] = entry_px + 2.0
+    # Ground truth now comes from userTrades (close classified via exchange).
+    sl_px = pos["stop_loss"]
+    exchange.user_trades = [{
+        "symbol": "BTCUSDT", "side": "BUY", "qty": qty, "price": sl_px,
+        "realizedPnl": -(sl_px - entry_px) * qty, "commission": 0.001,
+        "time": 9_999_999_999_999,
+    }]
     executor._close_position(pos_id, pos, pos["signal_id"], summary)
+    assert pos["closed_reason"] == "sl_hit"
     assert pos["realized"] < 0, pos["realized"]
-    # gross loss ~= -2.0 * qty; allow fee slippage in the bound
-    assert pos["realized"] > -(2.0 * qty) * 1.1
+    # gross loss ~= -(sl-entry) * qty; allow fee slippage in the bound
+    assert pos["realized"] > -((sl_px - entry_px) * qty) * 1.1
 
 
 def test_algo_sl_vanished_records_trigger_estimate(rig):
     """Regression: a triggered algo STOP_MARKET vanishes from the algo-order
-    endpoint, so the old code recorded the SL loss as 0.0 (seen live with
-    GRASSUSDT and WALUSDT). The executor must estimate the fill at the
-    trigger price instead of dropping a real loss."""
+    endpoint. Classification now uses userTrades ground truth: the SL fill
+    is found there and recorded with its real PnL (not 0.0, not estimated)."""
     executor, market, exchange, state, lifecycle, risk = rig
     summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
                "errors": []}
@@ -827,13 +835,20 @@ def test_algo_sl_vanished_records_trigger_estimate(rig):
     qty = pos["qty"]
     trigger = pos["stop_loss"]
     # Simulate Binance: triggered algo order is gone (-2011), position closed.
+    # The real SL fill lives in userTrades.
     del exchange.orders[pos["sl_order_id"]]
     exchange.get_positions = lambda: []
+    exchange.user_trades = [{
+        "symbol": "BTCUSDT", "side": "SELL", "qty": qty, "price": trigger,
+        "realizedPnl": (trigger - entry_px) * qty, "commission": 0.001,
+        "time": 9_999_999_999_999,
+    }]
     executor._close_position(pos_id, pos, pos["signal_id"], summary,
                              reason="position gone from exchange")
     assert pos["closed"] is True
-    # LONG SL below entry -> estimated loss, not 0.0.
-    expected = (trigger - entry_px) * qty - trigger * qty * 0.0005
+    assert pos["closed_reason"] == "sl_hit"
+    # LONG SL below entry -> real loss from the exchange fill, not 0.0.
+    expected = (trigger - entry_px) * qty - 0.001
     assert pos["realized"] == pytest.approx(expected, abs=1e-6)
     assert pos["realized"] < 0, pos["realized"]
 
@@ -1082,3 +1097,90 @@ def test_prefilter_fail_open_on_none():
     executor.exchange = ex
     uni = ["BTCUSDT", "PEPEUSDT"]
     assert executor._apply_tradability_prefilter(uni) == uni
+
+
+# ------------------------------------------- _classify_vanished_close
+def _vanished_short_pos(executor, exchange, summary, symbol="BTCUSDT"):
+    executor._scan_symbol(symbol, 10_000.0, summary)
+    pos_id, pos = next(iter(executor._open_positions().items()))
+    return pos_id, pos
+
+
+def test_manual_profitable_close_never_labeled_sl(short_rig):
+    """Live 2026-10-15: user force-closed LIT (+$0.079) and BOME (+$0.074)
+    shorts in profit; the old code labeled both sl_hit with realized $0.00.
+    A profitable close must never be called an SL."""
+    executor, market, exchange, state, lifecycle, risk = short_rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    pos_id, pos = _vanished_short_pos(executor, exchange, summary)
+    entry_px, qty = pos["entry_price"], pos["qty"]
+    close_px = entry_px * 0.991  # profitable for a short, near no bracket
+    exchange.user_trades = [{
+        "symbol": "BTCUSDT", "side": "BUY", "qty": qty, "price": close_px,
+        "realizedPnl": (entry_px - close_px) * qty, "commission": 0.002,
+        "time": 9_999_999_999_999,
+    }]
+    exchange.get_positions = lambda: []
+    executor._close_position(pos_id, pos, pos["signal_id"], summary,
+                             reason="position gone from exchange")
+    assert pos["closed_reason"] == "manual_close (profit)"
+    assert pos["realized"] == pytest.approx((entry_px - close_px) * qty - 0.002)
+    assert pos["close_price"] == pytest.approx(close_px)
+
+
+def test_manual_loss_close_labeled_honestly(short_rig):
+    executor, market, exchange, state, lifecycle, risk = short_rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    pos_id, pos = _vanished_short_pos(executor, exchange, summary)
+    entry_px, qty = pos["entry_price"], pos["qty"]
+    close_px = entry_px * 1.004  # small loss, far from the SL trigger
+    exchange.user_trades = [{
+        "symbol": "BTCUSDT", "side": "BUY", "qty": qty, "price": close_px,
+        "realizedPnl": (entry_px - close_px) * qty, "commission": 0.002,
+        "time": 9_999_999_999_999,
+    }]
+    exchange.get_positions = lambda: []
+    executor._close_position(pos_id, pos, pos["signal_id"], summary,
+                             reason="position gone from exchange")
+    assert pos["closed_reason"] == "manual_close (loss)"
+    assert pos["realized"] < 0
+
+
+def test_vanished_close_near_tp1_classified_tp(short_rig):
+    executor, market, exchange, state, lifecycle, risk = short_rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    pos_id, pos = _vanished_short_pos(executor, exchange, summary)
+    entry_px, qty = pos["entry_price"], pos["qty"]
+    tp1_px = pos["tp"]["tp1"]["price"]
+    exchange.user_trades = [{
+        "symbol": "BTCUSDT", "side": "BUY", "qty": qty, "price": tp1_px,
+        "realizedPnl": (entry_px - tp1_px) * qty, "commission": 0.002,
+        "time": 9_999_999_999_999,
+    }]
+    exchange.get_positions = lambda: []
+    executor._close_position(pos_id, pos, pos["signal_id"], summary,
+                             reason="position gone from exchange")
+    assert pos["closed_reason"] == "tp1_hit (remainder)"
+    assert pos["realized"] > 0
+
+
+def test_vanished_close_trades_unavailable_fails_closed(short_rig):
+    """If userTrades can't be fetched, fail-closed: sl_hit with no PnL
+    rather than a fabricated classification."""
+    executor, market, exchange, state, lifecycle, risk = short_rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    pos_id, pos = _vanished_short_pos(executor, exchange, summary)
+
+    def boom(symbol, limit=20):
+        raise RuntimeError("timeout")
+
+    exchange.get_user_trades = boom
+    exchange.get_positions = lambda: []
+    executor._close_position(pos_id, pos, pos["signal_id"], summary,
+                             reason="position gone from exchange")
+    assert pos["closed_reason"] == "sl_hit (trades unavailable)"
+    assert pos["realized"] == 0.0
