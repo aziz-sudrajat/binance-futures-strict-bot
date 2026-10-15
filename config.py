@@ -159,6 +159,10 @@ EXEC_SIGNAL_ID_TTL_HOURS = 72             # processed signal IDs are kept this l
 EXEC_RECV_WINDOW_MS = 10000
 EXEC_STATE_FILE = "state.json"
 EXEC_LIFECYCLE_FILE = "lifecycle.jsonl"
+# Paper mode uses SEPARATE state files so paper trades can never
+# contaminate (or be mistaken for) testnet position history.
+EXEC_PAPER_STATE_FILE = "state-paper.json"
+EXEC_PAPER_LIFECYCLE_FILE = "lifecycle-paper.jsonl"
 # Dashboard settings (written by dashboard.py, honored by the executor).
 # Missing file -> built-in defaults (current behavior, auto-trade ON).
 DASHBOARD_SETTINGS_FILE = "dashboard_settings.json"

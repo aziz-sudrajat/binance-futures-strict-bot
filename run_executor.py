@@ -120,12 +120,18 @@ def build(args, env: dict | None = None):
     if is_live:
         _refuse_live_test_params(args)
 
-    # Live mode keeps its own state files so testnet/paper records can never
-    # contaminate (or be mistaken for) real-money position history.
-    state = StateStore(config.EXEC_LIVE_STATE_FILE if is_live
-                       else config.EXEC_STATE_FILE)
-    lifecycle = LifecycleLogger(config.EXEC_LIVE_LIFECYCLE_FILE if is_live
-                                else config.EXEC_LIFECYCLE_FILE)
+    # Live and paper modes keep their own state files so testnet/paper/live
+    # records can never contaminate (or be mistaken for) each other.
+    if is_live:
+        state_path, life_path = (config.EXEC_LIVE_STATE_FILE,
+                                 config.EXEC_LIVE_LIFECYCLE_FILE)
+    elif args.paper:
+        state_path, life_path = (config.EXEC_PAPER_STATE_FILE,
+                                 config.EXEC_PAPER_LIFECYCLE_FILE)
+    else:
+        state_path, life_path = config.EXEC_STATE_FILE, config.EXEC_LIFECYCLE_FILE
+    state = StateStore(state_path)
+    lifecycle = LifecycleLogger(life_path)
     default_base = (config.BINANCE_FUTURES_MAINNET_URL if is_live
                     else config.BINANCE_FUTURES_BASE_URL)
     base_url = env.get("BINANCE_FUTURES_BASE_URL") or default_base

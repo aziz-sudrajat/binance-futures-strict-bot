@@ -241,6 +241,8 @@ def mode_files(mode: str) -> tuple[str, str]:
     """(state_path, lifecycle_path) for a mode."""
     if mode == "live":
         return config.EXEC_LIVE_STATE_FILE, config.EXEC_LIVE_LIFECYCLE_FILE
+    if mode == "paper":
+        return config.EXEC_PAPER_STATE_FILE, config.EXEC_PAPER_LIFECYCLE_FILE
     return config.EXEC_STATE_FILE, config.EXEC_LIFECYCLE_FILE
 
 

@@ -294,3 +294,17 @@ def test_error_print_escapes_brackets():
     console.print(f"[red]error:[/red] {escape(str(e))}")  # must not raise
     out = console.export_text()
     assert "liq_wall" in out
+
+
+def test_mode_files_separates_paper_testnet_live():
+    # Regression: paper mode wrote to testnet's state.json, so the testnet
+    # loop would try to manage paper positions as real ones.
+    from dashboard import mode_files
+    import config
+    assert mode_files("paper") == (config.EXEC_PAPER_STATE_FILE,
+                                   config.EXEC_PAPER_LIFECYCLE_FILE)
+    assert mode_files("testnet") == (config.EXEC_STATE_FILE,
+                                     config.EXEC_LIFECYCLE_FILE)
+    assert mode_files("live") == (config.EXEC_LIVE_STATE_FILE,
+                                  config.EXEC_LIVE_LIFECYCLE_FILE)
+    assert len({mode_files(m)[0] for m in ("paper", "testnet", "live")}) == 3
