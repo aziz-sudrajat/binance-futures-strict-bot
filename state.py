@@ -101,13 +101,17 @@ class StateStore:
         Returns {"adopted": [...], "closed": [...]}:
           adopted - on the exchange but unknown to state: marked unmanaged
                     (no SL/TP plan known; NEVER auto-trade them, flag loudly).
-          closed  - in state but gone from the exchange: marked closed.
+          closed  - in state but gone from the exchange AND not already
+                    marked closed: newly discovered closes only, so the
+                    caller can attribute each exactly once.
         """
         adopted, closed = [], []
         by_symbol = {p["symbol"]: p for p in exchange_positions}
         for pos_id, pos in list(self._data["positions"].items()):
             sym = pos.get("symbol")
-            if sym not in by_symbol:
+            # Only report newly-closed positions: without the guard every
+            # restart would re-list (and re-attribute) already-closed ones.
+            if sym not in by_symbol and not pos.get("closed"):
                 pos["closed"] = True
                 pos["closed_reason"] = "gone from exchange at startup"
                 closed.append(pos_id)
