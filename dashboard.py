@@ -87,6 +87,7 @@ def validate_settings(data: dict) -> dict:
     _bool("liq_review")
     _bool("whale_review")
     _bool("breakeven_after_tp1")
+    _bool("trading_hours_enabled")
     for code in config.DASH_VETO_CODES:
         _bool(f"veto_{code}")
 
