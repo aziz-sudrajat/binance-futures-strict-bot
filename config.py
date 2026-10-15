@@ -400,6 +400,8 @@ DASHBOARD_DEFAULTS = {
     "leverage": 3,               # 1-125, used when leverage_mode=fixed
     "entry_mode": "risk",        # risk (RISK_PCT_PER_TRADE sizing) | fixed_usdt
     "fixed_usdt": 10.0,          # USDT margin per position when fixed_usdt
+    # risk: max position notional as % of balance (default 20 = safe)
+    "max_exposure_pct_per_symbol": 20.0,
 }
 
 _ORIGINALS: dict = {}
