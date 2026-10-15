@@ -19,6 +19,7 @@ import shlex
 from dataclasses import dataclass, field
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -333,7 +334,7 @@ def events_table(events: list[dict]) -> Table:
             f"[bold]{e.get('symbol', '-')}[/bold]",
             f"[{colors.get(state, '')}]{state}[/]",
             "" if q is None else f"{q}",
-            str(e.get("reason", ""))[:60],
+            escape(str(e.get("reason", ""))[:60]),
         )
     return t
 

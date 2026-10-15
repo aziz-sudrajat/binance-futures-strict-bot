@@ -308,3 +308,31 @@ def test_mode_files_separates_paper_testnet_live():
     assert mode_files("live") == (config.EXEC_LIVE_STATE_FILE,
                                   config.EXEC_LIVE_LIFECYCLE_FILE)
     assert len({mode_files(m)[0] for m in ("paper", "testnet", "live")}) == 3
+
+
+def test_autotrade_view_survives_bracket_in_error():
+    # Regression: scan raised an error containing "[/]" (e.g. from an
+    # exchange message); _autotrade_view rendered summary["error"] with
+    # Rich markup -> MarkupError "closing tag '[/]' has nothing to close".
+    from rich.markup import escape
+    from rich.console import Console
+    import shell_ui
+    err = "order [/fapi/v1/order] not found"
+    summary = {"error": escape(err[:120])}  # as built in cmd_autotrade
+    console = Console(record=True, width=100)
+    # simulate the summary panel rendering from _autotrade_view
+    s = {k: v for k, v in summary.items() if k != "errors"}
+    console.print("  ".join(f"{k}=[bold]{v}[/bold]" for k, v in s.items()))
+    out = console.export_text()
+    assert "/fapi/v1/order" in out
+
+
+def test_events_table_escapes_reason():
+    # Reason text with brackets must not break Rich markup.
+    from shell_ui import events_table
+    from rich.console import Console
+    ev = [{"time": "07:00", "symbol": "STXUSDT", "state": "rejected",
+           "quality": 90, "reason": "order [/fapi/v1/order] gone"}]
+    console = Console(record=True, width=100)
+    console.print(events_table(ev))  # must not raise
+    assert "/fapi/v1/order" in console.export_text()

@@ -152,7 +152,8 @@ class BinanceShell:
             self.console.print("\n[yellow]scan dibatalkan[/yellow]")
             return
         if "error" in result:
-            self.console.print(f"[red]scan gagal:[/red] {result['error']}")
+            self.console.print(
+                f"[red]scan gagal:[/red] {escape(str(result['error']))}")
             return
         rows = result.get("rows") or []
         self.console.print(radar_table(rows, limit=top))
@@ -584,7 +585,9 @@ class BinanceShell:
                         summary = (executor.scan_from_db("signals.db")
                                    if from_db else executor.scan_once())
                     except Exception as e:  # noqa: BLE001
-                        summary = {"error": str(e)[:120]}
+                        # Escape: the text is rendered with Rich markup in
+                        # _autotrade_view; a [...] in the message crashed it.
+                        summary = {"error": escape(str(e)[:120])}
                 self.console.print(self._autotrade_view(executor, summary,
                                                         cycle, from_db))
                 self._sleep_countdown(
