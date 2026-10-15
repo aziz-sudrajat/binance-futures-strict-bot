@@ -428,3 +428,113 @@ def test_apply_mtf_require_1d_override(dash_env):
     e.settings_mode = "live"
     config.apply_dashboard_overrides(e._dash_settings())
     assert config.MTF_REQUIRE_1D is False
+
+
+# ------------------------------------------- knob coverage audit (2026-10-15)
+# Invariants so a knob can never again be half-wired: validated but dropped
+# on load (trading_hours_enabled, found 2026-10-15), or applied but with no
+# UI anywhere (max_exposure_pct_per_symbol, daily_loss_cap_pct web input).
+def test_all_overrides_have_defaults():
+    """Every engine override key must be in DASHBOARD_DEFAULTS.
+
+    load_settings() only keeps keys present in DEFAULTS, so an override key
+    without a default is silently dropped — the knob exists in code but can
+    never take effect (the trading_hours_enabled dead-knob bug).
+    """
+    missing = [k for k in
+               list(config.DASH_NUMERIC_OVERRIDES) + list(config.DASH_BOOL_OVERRIDES)
+               if k not in config.DASHBOARD_DEFAULTS]
+    assert missing == [], f"override keys without defaults (dead knobs): {missing}"
+
+
+def test_defaults_have_ui_fields():
+    """Every dashboard default must be tunable via SETTING_FIELDS.
+
+    Review-tier gates are deliberately preset-only (bundled in signal_mode
+    presets) and are the only documented exceptions.
+    """
+    PRESET_BUNDLED = {"mtf_require_1h", "btc_align_required", "pattern_required",
+                      "news_check", "liq_review", "whale_review"}
+    # The allowlist must stay honest: every bundled key really is bundled.
+    for k in PRESET_BUNDLED:
+        assert any(k in bundle for bundle in
+                   config.SIGNAL_MODE_PRESETS.values()), \
+            f"preset-bundled key {k} not in any signal-mode preset"
+    ui_keys = {k for k, _label, _kind in dashboard.SETTING_FIELDS}
+    missing = [k for k in config.DASHBOARD_DEFAULTS
+               if k not in ui_keys and k not in PRESET_BUNDLED]
+    assert missing == [], f"defaults with no UI field: {missing}"
+
+
+def test_trading_hours_knob_roundtrip(dash_env):
+    """trading_hours_enabled=false must survive save->load->apply."""
+    assert validate_settings({})["trading_hours_enabled"] is True
+    out = save_settings({"trading_hours_enabled": False}, dash_env)
+    assert out["trading_hours_enabled"] is False
+    loaded = load_settings(dash_env)
+    assert loaded["trading_hours_enabled"] is False  # was dropped pre-fix
+    import executor as exmod
+    e = object.__new__(exmod.Executor)
+    e.settings_mode = "live"
+    config.apply_dashboard_overrides(e._dash_settings())
+    assert config.TRADING_HOURS_ENABLED is False
+    # gate off => within_trading_hours always True (entries never blocked)
+    assert config.within_trading_hours() is True
+
+
+def test_max_exposure_override(dash_env):
+    save_settings({"max_exposure_pct_per_symbol": 50}, dash_env)
+    import executor as exmod
+    e = object.__new__(exmod.Executor)
+    e.settings_mode = "live"
+    config.apply_dashboard_overrides(e._dash_settings())
+    assert config.EXEC_MAX_EXPOSURE_PCT_PER_SYMBOL == 50
+
+
+def test_max_exposure_clamped(dash_env):
+    with open(dash_env, "w", encoding="utf-8") as f:
+        json.dump({"max_exposure_pct_per_symbol": 9999}, f)
+    import executor as exmod
+    e = object.__new__(exmod.Executor)
+    e.settings_mode = "live"
+    config.apply_dashboard_overrides(e._dash_settings())
+    assert config.EXEC_MAX_EXPOSURE_PCT_PER_SYMBOL == 500
+
+
+def test_web_ui_wires_new_knobs():
+    """The hardcoded web UI must expose the previously invisible knobs.
+
+    Asserts the specific wiring lines (a bare `key in src` is too weak —
+    the key already appears in the override tables before any wiring).
+    """
+    with open(dashboard.__file__, encoding="utf-8") as f:
+        src = f.read()
+    for fid, key in (("s-dlcap", "daily_loss_cap_pct"),
+                     ("s-maxexp", "max_exposure_pct_per_symbol"),
+                     ("s-th", "trading_hours_enabled")):
+        assert f'id="{fid}"' in src, f"missing web input {fid}"
+    # load wiring
+    assert "$('s-dlcap').value = st.daily_loss_cap_pct" in src
+    assert "$('s-maxexp').value = st.max_exposure_pct_per_symbol" in src
+    assert "$('s-th').checked = st.trading_hours_enabled" in src
+    # save-payload wiring
+    for frag in ("daily_loss_cap_pct:parseFloat($('s-dlcap').value)",
+                 "max_exposure_pct_per_symbol:parseFloat($('s-maxexp').value)",
+                 "trading_hours_enabled:$('s-th').checked"):
+        assert frag in src, f"missing save-payload wiring: {frag}"
+
+
+def test_executor_dash_settings_delegates_to_dashboard(dash_env):
+    """No-drift guard: executor._dash_settings() must BE dashboard
+    load_settings(mode=...), never a reimplementation (2026-10-15: the two
+    were byte-identical duplicates — the next divergence would have been
+    silent)."""
+    save_settings({"auto_trade": False}, dash_env, mode="live")
+    save_settings({"auto_trade": True}, dash_env, mode="testnet")
+    import executor as exmod
+    for mode, want in (("live", False), ("testnet", True), ("paper", True)):
+        e = object.__new__(exmod.Executor)
+        e.settings_mode = mode
+        got = e._dash_settings()
+        assert got == dashboard.load_settings(dash_env, mode=mode)
+        assert got["auto_trade"] is want
