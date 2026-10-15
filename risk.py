@@ -138,10 +138,14 @@ class RiskManager:
         balance = self.get_balance()
         if balance is None or balance <= 0:
             return False, "balance unavailable - holding (fail-closed)"
-        cap = balance * self.per_symbol_cap_pct / 100
+        # Read the cap live from config so dashboard overrides apply;
+        # constructor value is the fallback when config is unavailable.
+        cap_pct = getattr(config, "EXEC_MAX_EXPOSURE_PCT_PER_SYMBOL",
+                          self.per_symbol_cap_pct)
+        cap = balance * cap_pct / 100
         if notional > cap:
             return False, (f"notional ${notional:,.2f} exceeds per-symbol cap "
-                           f"${cap:,.2f} ({self.per_symbol_cap_pct}% of balance)")
+                           f"${cap:,.2f} ({cap_pct}% of balance)")
         return True, "ok"
 
     def record_realized(self, pnl: float) -> None:

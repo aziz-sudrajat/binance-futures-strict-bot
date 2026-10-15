@@ -243,6 +243,9 @@ DASH_NUMERIC_OVERRIDES = {
     "tp3_rr": ("TP3_RR", 1.5, 12.0),
     "stop_atr_min": ("STOP_ATR_MIN", 0.5, 3.0),
     "stop_atr_max": ("STOP_ATR_MAX", 1.0, 5.0),
+    # risk: max position notional as % of balance (operator-widened only
+    # on explicit instruction; default 20 keeps concentration in check)
+    "max_exposure_pct_per_symbol": ("EXEC_MAX_EXPOSURE_PCT_PER_SYMBOL", 5, 500),
 }
 # Boolean engine knobs: setting name -> config attribute.
 DASH_BOOL_OVERRIDES = {
