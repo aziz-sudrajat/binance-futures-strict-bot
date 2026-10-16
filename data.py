@@ -27,17 +27,25 @@ In-memory TTL caches mirror the GAS klinesTtlSec_ / DERIVATIVES_CACHE_SECONDS.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+import logging
 import math
 import re
 import time
 
+log = logging.getLogger("data")
+
 import requests
 
+import httputil
+import sentiment
 from config import (
     ADV_DERIV_CACHE_SEC,
+    DATA_CACHE_MAX_ENTRIES,
     DERIVATIVES_CACHE_SEC,
     DERIVATIVES_PERIOD,
     HTTP_TIMEOUT_SEC,
+    KLINES_FALLBACK_ENABLED,
     KLINES_LIMIT,
     KLINES_TTL_SEC,
     MIN_CANDLES,
@@ -55,6 +63,22 @@ _INTERVAL_MS = {
 }  # GAS: intervalToMs_ (L682)
 
 _OKX_BASE = "https://www.okx.com"
+
+# Gate.io futures klines (item 3.1: opt-in failover for _klines_with_fallback).
+# Intervals Gate.io does NOT support (e.g. 3m) keep the fail-closed path.
+_GATEIO_BASE = "https://api.gateio.ws"
+_GATEIO_INTERVAL = {
+    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1d",
+}
+
+
+def gateio_contract_id(symbol: str) -> str:
+    """Binance-style 'BTCUSDT' -> Gate.io futures 'BTC_USDT'."""
+    m = re.fullmatch(r"([A-Z0-9]+)(USDT|USDC)", normalize_symbol(symbol))
+    if not m:
+        raise ValueError(f"no Gate.io contract mapping for {symbol}")
+    return f"{m.group(1)}_{m.group(2)}"
 
 # News review (ketat mode): public CoinTelegraph RSS, no API key.
 _NEWS_RSS_URL = "https://cointelegraph.com/rss"
@@ -80,24 +104,17 @@ _COIN_NAMES = {
     "OP": ["optimism", "op"],
 }
 
-# Keyword sentiment for the ketat news review. Strong words count double.
-_NEWS_NEG_STRONG = ("hack", "exploit", "lawsuit", "fraud", "scam", "bankrupt",
-                    "arrest", "stolen", "theft", "breach", "collapse")
-_NEWS_NEG_MILD = ("crash", "dump", "plunge", "tumble", "slump", "fine",
-                  "penalty", "vulnerab", "attack", "warning", "probe",
-                  "investigat", "sec", "sued")
-_NEWS_POS = ("etf", "approv", "partnership", "adopt", "upgrade", "launch",
-             "all-time high", "record high", "surge", "rally", "bullish",
-             "invest", "backing", "integrat")
+# Keyword lists moved to sentiment.KeywordSentimentProvider (item 3.4);
+# data.py keeps only a thin backward-compatible wrapper below.
 
 
 def _news_sentiment(title: str) -> int:
-    """Crude keyword sentiment: positive minus negative hits."""
-    t = title.lower()
-    score = sum(2 for w in _NEWS_NEG_STRONG if w in t)
-    score += sum(1 for w in _NEWS_NEG_MILD if w in t)
-    score -= sum(1 for w in _NEWS_POS if w in t)
-    return -score  # negative = bearish news, positive = bullish news
+    """Backward-compatible wrapper: delegates to the active sentiment
+    provider (default: keyword heuristic). Sign convention unchanged:
+    positive = bullish, negative = bearish (signal_engine thresholds
+    depend on it). Use sentiment.set_provider() to plug an AI model.
+    """
+    return sentiment.get_provider().score(title)
 
 
 def _parse_rss_date(pub: str) -> float:
@@ -137,13 +154,48 @@ def ratio_to_long_pct(ratio: float) -> float:
     return r / (1 + r) * 100 if r > 0 else 50.0
 
 
+class _BoundedTTLCache:
+    """In-memory cache with a hard max size and LRU eviction.
+
+    Stores (timestamp, value) tuples — the same shape the old plain-dict
+    caches used — so the per-interval TTL checks at the call sites are
+    unchanged. A read hit marks the key most-recently-used; on write the
+    least-recently-used entries are evicted until len <= max_entries.
+    """
+
+    def __init__(self, max_entries: int):
+        self._d: "OrderedDict[str, tuple[float, object]]" = OrderedDict()
+        self.max_entries = max(1, int(max_entries))
+
+    def get(self, key: str) -> "tuple[float, object] | None":
+        hit = self._d.get(key)
+        if hit is not None:
+            self._d.move_to_end(key)  # LRU: hit = most recently used
+        return hit
+
+    def put(self, key: str, value: object) -> None:
+        self._d[key] = (time.time(), value)
+        self._d.move_to_end(key)
+        while len(self._d) > self.max_entries:
+            self._d.popitem(last=False)  # evict least recently used
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._d
+
+    def clear(self) -> None:
+        self._d.clear()
+
+
 class MarketData:
     def __init__(self, session: requests.Session | None = None):
-        self.session = session or requests.Session()
+        self.session = session or httputil.ThrottledSession()
         self.session.headers.update({"User-Agent": "binance-futures-bot/phase1"})
-        self._klines_cache: dict[str, tuple[float, list]] = {}
-        self._deriv_cache: dict[str, tuple[float, dict]] = {}
-        self._quanto_cache: dict[str, float] = {}  # OKX ctVal per instId
+        self._klines_cache = _BoundedTTLCache(DATA_CACHE_MAX_ENTRIES)
+        self._deriv_cache = _BoundedTTLCache(DATA_CACHE_MAX_ENTRIES)
+        self._quanto_cache = _BoundedTTLCache(DATA_CACHE_MAX_ENTRIES)  # OKX ctVal per instId
         self._news_cache: tuple[float, list] | None = None  # (ts, headlines)
         self._news_ok: bool = False  # True if last RSS fetch succeeded
 
@@ -152,11 +204,14 @@ class MarketData:
         return KLINES_TTL_SEC.get(interval, 600)
 
     def get_klines(self, symbol: str, interval: str, limit: int = KLINES_LIMIT) -> list[dict]:
-        """Closed candles, oldest-first — OKX perpetual ONLY.
+        """Closed candles, oldest-first — OKX perpetual primary.
 
-        Signal data comes from OKX; Binance is execution-only. No fallback
-        provider: if OKX is unreachable the caller gets a RuntimeError and
-        must fail closed (no signal), never trade on another venue's tape.
+        Signal data comes from OKX; Binance is execution-only. If OKX is
+        unreachable the caller gets a RuntimeError and must fail closed
+        (no signal) — UNLESS the opt-in KLINES_FALLBACK_ENABLED knob is
+        set, in which case Gate.io USDT futures klines are used (candles
+        tagged "source": "gateio"). Both down -> RuntimeError, always
+        fail-closed, never a partial/empty tape.
         """
         symbol = normalize_symbol(symbol)
         limit = max(1, min(1000, int(limit or KLINES_LIMIT)))
@@ -164,13 +219,75 @@ class MarketData:
         hit = self._klines_cache.get(key)
         if hit and time.time() - hit[0] < self._klines_ttl(interval):
             return hit[1]
-        candles = self._okx_klines(symbol, interval, limit)
+        candles = self._klines_with_fallback(symbol, interval, limit)
         if len(candles) < min(MIN_CANDLES, limit):
             raise RuntimeError(
-                f"OKX klines: only {len(candles)} candles for "
+                f"klines: only {len(candles)} candles for "
                 f"{symbol} {interval}")
-        self._klines_cache[key] = (time.time(), candles)
+        self._klines_cache.put(key, candles)
         return candles
+
+    def _klines_with_fallback(self, symbol: str, interval: str,
+                              limit: int) -> list[dict]:
+        """OKX first; Gate.io futures only if the opt-in knob allows it.
+
+        Default (KLINES_FALLBACK_ENABLED=False) = historical fail-closed
+        behavior: OKX down -> RuntimeError, never another venue's tape.
+        Opt-in fallback exists for data continuity; fallback candles are
+        tagged with "source": "gateio" so callers can tell venues apart.
+        Both down -> RuntimeError (still fail-closed).
+        """
+        try:
+            return self._okx_klines(symbol, interval, limit)
+        except Exception as exc:
+            if not KLINES_FALLBACK_ENABLED:
+                raise
+            log.warning("OKX klines failed for %s %s (%r); "
+                        "trying Gate.io fallback", symbol, interval, exc)
+            try:
+                return self._gateio_klines(symbol, interval, limit)
+            except Exception as gexc:
+                raise RuntimeError(
+                    f"klines unavailable for {symbol} {interval}: "
+                    f"OKX failed ({exc!r}), Gate.io failed ({gexc!r})"
+                ) from gexc
+
+    def _gateio_klines(self, symbol: str, interval: str,
+                       limit: int) -> list[dict]:
+        """Gate.io USDT-margined futures klines, normalized to the same
+        candle dicts as _okx_klines, plus a "source" tag."""
+        bar = _GATEIO_INTERVAL.get(interval)
+        if not bar:
+            raise ValueError(f"Gate.io mapping unavailable for {interval}")
+        contract = gateio_contract_id(symbol)
+        req_limit = min(max(limit + 2, 80), 300)
+        url = f"{_GATEIO_BASE}/api/v4/futures/usdt/candlesticks"
+        r = self.session.get(
+            url, params={"contract": contract, "interval": bar,
+                         "limit": req_limit},
+            timeout=HTTP_TIMEOUT_SEC)
+        r.raise_for_status()
+        body = r.json()
+        if not isinstance(body, list):
+            raise ValueError("Gate.io invalid response")
+        dur = _INTERVAL_MS[interval]
+        now_ms = int(time.time() * 1000)
+        out = []
+        for k in body:
+            try:
+                t = int(float(k["t"]) * 1000)  # Gate.io: seconds
+                if t + dur > now_ms:
+                    continue  # in-progress candle, skip (OKX: k[8]=='1')
+                out.append({
+                    "open_time": t, "open": float(k["o"]),
+                    "high": float(k["h"]), "low": float(k["l"]),
+                    "close": float(k["c"]), "volume": float(k["v"]),
+                    "close_time": t + dur - 1, "source": "gateio",
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        out.sort(key=lambda c: c["open_time"])
+        return out[-limit:]
 
     def _okx_klines(self, symbol: str, interval: str, limit: int) -> list[dict]:
         bar = _OKX_INTERVAL.get(interval)
@@ -272,7 +389,7 @@ class MarketData:
             "aggregate_oi_change": src.get("oi_change_pct"),
             "taker_buy_sell_ratio": src.get("taker_ratio"),
         }
-        self._deriv_cache[key] = (time.time(), snap)
+        self._deriv_cache.put(key, snap)
         return snap
 
     def _okx_get(self, path: str, params: dict) -> list:
@@ -487,7 +604,7 @@ class MarketData:
                                         "oi_usd", "taker_long")) \
                 and not (long_liq_usd or short_liq_usd):
             raise RuntimeError(f"OKX advanced derivatives empty for {symbol}")
-        self._deriv_cache[key] = (time.time(), adv)
+        self._deriv_cache.put(key, adv)
         return adv
 
     def list_okx_swap_symbols(self) -> list[str]:
@@ -544,14 +661,16 @@ class MarketData:
         Cached — instrument specs are static. Raises instead of guessing:
         a wrong multiplier corrupts liquidation/book notional math.
         """
-        if inst_id not in self._quanto_cache:
+        hit = self._quanto_cache.get(inst_id)
+        if hit is None:
             rows = self._okx_get("/api/v5/public/instruments",
                                  {"instType": "SWAP", "instId": inst_id})
             ct = self._num((rows[0] if rows else {}).get("ctVal"))
             if not ct or ct <= 0:
                 raise ValueError(f"OKX ctVal missing for {inst_id}")
-            self._quanto_cache[inst_id] = ct
-        return self._quanto_cache[inst_id]
+            self._quanto_cache.put(inst_id, ct)
+            return ct
+        return hit[1]
 
     # ---------------------------------------------------------- order book
     @staticmethod
