@@ -1506,3 +1506,50 @@ def test_profit_take_off_by_default(rig):
     pos = state.get("positions")["p1"]
     assert pos.get("closed") is not True
     assert "profit_take" not in [e["state"] for e in lifecycle.read_all()]
+
+
+# ------------------------------------------------- stale entry limit orders
+def _stale_entry_pos(entry_order_id, age_min):
+    import time as _t
+    return {
+        "symbol": "BTCUSDT", "signal_id": "BTCUSDT:9:LONG", "direction": "LONG",
+        "qty": 1.0, "entry_price": 99.0, "margin_usdt": 1.0,
+        "leverage": 10, "brackets_placed": False, "realized": 0.0,
+        "entry_order_id": entry_order_id, "entry_type": "LIMIT",
+        "opened_at": int(_t.time() * 1000) - int(age_min * 60_000),
+    }
+
+
+def test_stale_entry_cancelled_after_30min(rig):
+    # User 2026-10-16: limit entry unfilled after 30 min -> cancel.
+    import executor as ex_mod
+    assert ex_mod._ENTRY_TIMEOUT_MINUTES == 30
+    executor, market, exchange, state, lifecycle, risk = rig
+    o = exchange.place_order("BTCUSDT", "BUY", "LIMIT", quantity=1.0,
+                             price=99.0)
+    oid = o["orderId"]
+    pos = _stale_entry_pos(oid, age_min=31)
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos["closed"] is True
+    assert "30m" in pos["closed_reason"]
+    assert exchange.get_order("BTCUSDT", order_id=oid)["status"] == "CANCELED"
+    evts = [e for e in lifecycle.read_all() if e["state"] == "expired"]
+    assert len(evts) == 1 and evts[0]["terminal"] is True
+
+
+def test_fresh_entry_kept_within_30min(rig):
+    executor, market, exchange, state, lifecycle, risk = rig
+    o = exchange.place_order("BTCUSDT", "BUY", "LIMIT", quantity=1.0,
+                             price=99.0)
+    oid = o["orderId"]
+    pos = _stale_entry_pos(oid, age_min=10)
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True
+    assert exchange.get_order("BTCUSDT", order_id=oid)["status"] == "NEW"
+    assert "expired" not in [e["state"] for e in lifecycle.read_all()]
