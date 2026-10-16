@@ -141,3 +141,39 @@ def test_scanner_run_pass_writes_approved(tmp_path, monkeypatch):
     fresh = db.get_fresh_signals()
     assert len(fresh) == 1 and fresh[0]["symbol"] == "AAAUSDT"
     db.close()
+
+
+def _db_signal_sym(symbol, **kw):
+    s = dict(_signal(symbol))
+    s.update(kw)
+    return s
+
+
+def test_scan_from_db_row_crash_does_not_kill_batch(workdir, monkeypatch):
+    # M5: one crashing row must not abort the batch, and the poison row is
+    # marked consumed (fail-closed) so it cannot block every cycle.
+    # (Two symbols: SignalDB keeps one active signal per symbol.)
+    executor, exchange, state = _rig(workdir)
+    exchange.market_price["ETHUSDT"] = 100.0
+    db_path = os.path.join(workdir, "signals.db")
+    db = SignalDB(db_path)
+    db.upsert_signal(_db_signal_sym("BTCUSDT"), "SID-BAD", expiry_min=30)
+    db.upsert_signal(_db_signal_sym("ETHUSDT"), "SID-GOOD", expiry_min=30)
+    db.close()
+
+    real_try_open = executor._try_open
+
+    def flaky(symbol, signal, sid, balance):
+        if sid == "SID-BAD":
+            raise RuntimeError("boom")
+        return real_try_open(symbol, signal, sid, balance)
+
+    monkeypatch.setattr(executor, "_try_open", flaky)
+    summary = executor.scan_from_db(db_path)
+    assert summary["opened"] == 1
+    assert summary["rejected"] == 1
+    assert len(summary["errors"]) == 1
+
+    db = SignalDB(db_path)
+    assert db.stats()["consumed"] == 2
+    db.close()
