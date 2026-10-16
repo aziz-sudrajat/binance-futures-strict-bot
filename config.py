@@ -544,6 +544,14 @@ DASHBOARD_DEFAULTS = {
     # freshness re-check; REST stays as automatic fallback.
     "ws_price_feed_enabled": True,
     "ws_stale_sec": 30.0,
+    # User features v2 (2026-10-17): risk guards & execution knobs.
+    "max_drawdown_cap_pct": 10.0,
+    "max_consecutive_losses": 3,
+    "consecutive_loss_cooldown_hours": 4.0,
+    "market_data_fallback_binance": True,
+    "exec_post_only_entry": False,
+    "cancel_orphan_orders_on_startup": True,
+    "adaptive_volatility_targets": False,
     "live_signal_expiry_hours": 24.0,
     "bullish_only": True,
     "mtf_30m_mode": "STRICT",
