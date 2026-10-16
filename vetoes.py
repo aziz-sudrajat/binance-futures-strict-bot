@@ -317,6 +317,28 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
             _block("sr_zone", "hold",
                    f"4h S/R zone unevaluable ({e}) — holding (fail-closed)")
 
+    # V17 — CVD / Taker aggressor imbalance veto (Phase 4).
+    # Rejects when aggressive market orders strongly oppose the signal direction.
+    taker = snap.get("taker_buy_sell_ratio")  # H3: was "taker_ratio" (dead key)
+    if _finite(taker):
+        taker = float(taker)
+        if direction == "BULLISH" and taker < 0.70:
+            _block("cvd_imbalance", "veto",
+                   f"taker buy/sell ratio {taker:.2f} < 0.70 — heavy seller aggression opposes LONG")
+        elif direction == "BEARISH" and taker > 1.43:
+            _block("cvd_imbalance", "veto",
+                   f"taker buy/sell ratio {taker:.2f} > 1.43 — heavy buyer aggression opposes SHORT")
+
+    # V18 — Open Interest Flush / Liquidation cascade veto (Phase 4).
+    # Rejects if a rapid OI dump happens concurrently with a liquidation spike.
+    if adv is not None:
+        oi_chg = adv.get("oi_change")
+        spike = adv.get("spike")
+        if _finite(oi_chg) and _finite(spike):
+            if float(oi_chg) <= -5.0 and float(spike) >= 2.5:
+                _block("oi_flush", "veto",
+                       f"OI flush cascade (OI {float(oi_chg):+.1f}% with {float(spike):.1f}x liq spike) — high slippage & cascade risk")
+
     return blocks
 
 
