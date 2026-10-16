@@ -713,6 +713,16 @@ class Executor:
         if not ok:
             return self._reject(symbol, sid, f"risk: {reason}")
 
+        # 4b. One position per coin (user 2026-10-16 — the WCTUSDT double
+        # entry stacked $2 margin on one coin and the 2nd SL algo order was
+        # rejected by Binance -4509). Never open a second entry on a symbol
+        # that already has an open position, regardless of direction.
+        for pid, p in self._open_positions().items():
+            if p.get("symbol") == symbol:
+                return self._reject(
+                    symbol, sid,
+                    f"already positioned in {symbol} ({pid})")
+
         # 5. TP split must be placeable.
         tp_qty, note = split_tp_qty(
             qty, filters.get("stepSize", 0) or 0.0,
