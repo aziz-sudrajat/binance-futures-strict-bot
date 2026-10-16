@@ -162,7 +162,9 @@ def build(args, env: dict | None = None):
                              price_fn=market.get_live_price)
         exchange = broker
         mode = "PAPER"
-    risk = RiskManager(state, exchange.get_balance)
+    risk = RiskManager(state, exchange.get_balance,
+                       get_wallet_balance=exchange.get_wallet_balance,
+                       get_equity=exchange.get_margin_balance)
     tiers = _parse_leverage_tiers(args.leverage_tiers)
     settings_mode = "live" if is_live else ("testnet" if args.testnet
                                             else "paper")
