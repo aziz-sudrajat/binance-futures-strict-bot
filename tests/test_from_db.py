@@ -130,10 +130,57 @@ def test_scanner_run_pass_writes_approved(tmp_path, monkeypatch):
 
     db_path = str(tmp_path / "signals.db")
     db = SignalDB(db_path)
-    stats = scanner_mod.run_pass(FakeMarket2(), db, expiry_min=30)
+    # Legacy single pass pinned explicitly; the two-stage path is covered
+    # by test_scanner_run_pass_two_stage below.
+    stats = scanner_mod.run_pass(FakeMarket2(), db, expiry_min=30,
+                                 two_stage=False)
     db.close()
 
     assert stats["symbols"] == 2
+    assert stats["approved"] == 1
+    assert stats["rejected"] == 1
+    db = SignalDB(db_path)
+    fresh = db.get_fresh_signals()
+    assert len(fresh) == 1 and fresh[0]["symbol"] == "AAAUSDT"
+    db.close()
+
+
+def test_scanner_run_pass_two_stage(tmp_path, monkeypatch):
+    """Two-stage run_pass: prefilter screens, full engine runs on candidates
+    only, approvals land in the DB, stats report the funnel."""
+    import scanner as scanner_mod
+
+    class FakeMarket4:
+        def list_okx_swap_symbols(self):
+            return ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+
+    def fake_prefilter(symbol, market, tickers=None):
+        return (symbol != "BBBUSDT",
+                "BULLISH" if symbol != "BBBUSDT" else "lowvol")
+
+    def fake_eval(symbol, market):
+        if symbol == "AAAUSDT":
+            return dict(_signal(symbol)), "stub"
+        return None, "rejected-late"
+
+    monkeypatch.setattr(scanner_mod, "prefilter_symbol", fake_prefilter)
+    monkeypatch.setattr(scanner_mod, "evaluate_symbol", fake_eval)
+    monkeypatch.setattr(scanner_mod, "signal_candle_close_ms",
+                        lambda m, s: 1_700_000_000_000)
+    monkeypatch.setattr(scanner_mod, "make_signal_id",
+                        lambda s, c, d: f"SID-{s}")
+    monkeypatch.setattr(scanner_mod, "THROTTLE_SEC", 0)
+
+    db_path = str(tmp_path / "signals.db")
+    db = SignalDB(db_path)
+    stats = scanner_mod.run_pass(FakeMarket4(), db, expiry_min=30,
+                                 two_stage=True)
+    db.close()
+
+    assert stats["two_stage"] is True
+    assert stats["symbols"] == 3
+    assert stats["candidates"] == 2
+    assert stats["prefilter_rejected"] == 1
     assert stats["approved"] == 1
     assert stats["rejected"] == 1
     db = SignalDB(db_path)
