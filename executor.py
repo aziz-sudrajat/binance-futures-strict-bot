@@ -1134,6 +1134,18 @@ class Executor:
         # (CANCELLED) in the same cycle — never log a second terminal event.
         if pos.get("closed"):
             return
+        # R2 (review 2026-10-17): a pending close owns this position. A
+        # never-bracketed position with an armed pending_close holds a live
+        # dust residual on the exchange (_flat_position partial fill or a
+        # failed close), whose retry runs through _check_entry_fill ->
+        # _adopt_filled_entry -> _flat_position. Expiring it here on a
+        # transient get_order failure (o=None twice in one cycle, entry
+        # older than the timeout) would strand the residual as "entry
+        # unfilled" — a phantom expiry. Skip and let the retry resume next
+        # cycle; pending_close is only armed when qty > 0.
+        if (isinstance(pos.get("pending_close"), dict)
+                and (pos.get("qty") or 0.0) > 0):
+            return
         age_min = (time.time() * 1000 - pos["opened_at"]) / 60_000
         if age_min < _ENTRY_TIMEOUT_MINUTES:
             return
