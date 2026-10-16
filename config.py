@@ -164,6 +164,32 @@ TRAIL_DISTANCE_PCT = 0.0       # trailing stop: market-close when price pulls
 TIME_STOP_HOURS = 0.0          # time stop: market-close a position open longer
                                # than this many hours. 0 = off.
                                # Dashboard knob: time_stop_hours.
+MAX_DRAWDOWN_CAP_PCT = 10.0    # kill switch: stop trading if account equity
+                               # drops this % from its peak (high-watermark).
+                               # 0 = off. User feature 2026-10-16.
+MAX_CONSECUTIVE_LOSSES = 3     # entry cooldown: pause new entries after this
+                               # many losing trades in a row. 0 = off.
+                               # User feature 2026-10-16.
+CONSECUTIVE_LOSS_COOLDOWN_HOURS = 4.0  # cooldown duration (hours) after the
+                               # consecutive-loss trigger above. 0 = off.
+                               # User feature 2026-10-16.
+MARKET_DATA_FALLBACK_BINANCE = True  # market data: when OKX klines/price are
+                               # unavailable, fall back to Binance Futures
+                               # public API (klines + ticker price).
+                               # False = fail-closed on OKX outage.
+                               # User feature 2026-10-16.
+EXEC_POST_ONLY_ENTRY = False   # entries: use post-only (GTX) limit orders so
+                               # entries never cross the spread (maker only).
+                               # Falls back to regular limit if unsupported.
+                               # User feature 2026-10-16.
+CANCEL_ORPHAN_ORDERS_ON_STARTUP = True  # on startup, cancel NEW exchange
+                               # orders that have no matching tracked
+                               # position (orphans from a crashed run).
+                               # User feature 2026-10-16.
+ADAPTIVE_VOLATILITY_TARGETS = False  # signal engine: scale TP/SL distances
+                               # by recent ATR/volatility regime instead of
+                               # fixed multiples. Experimental; default off.
+                               # User feature 2026-10-16.
 
 # ------------------------------------------------------- backtest defaults
 # ROADMAP ITEM 4 (honest backtester). Costs are applied per side; every
