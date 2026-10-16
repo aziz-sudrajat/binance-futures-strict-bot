@@ -1,3 +1,10 @@
+# Copyright (c) 2026 aziz-sudrajat <azizsudrajat.stb4@gmail.com>
+# https://github.com/aziz-sudrajat
+#
+# All rights reserved. This file is part of the binance-futures-strict-bot project.
+# Unauthorized copying, modification, distribution, or false claim of
+# authorship is prohibited.
+
 """Tests for backtest.py — ROADMAP ITEM 4 (honest backtester).
 
 T8:  backtest trade simulation on a synthetic fixture with a hand-computed
