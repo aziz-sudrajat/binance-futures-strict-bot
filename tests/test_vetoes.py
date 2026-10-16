@@ -24,7 +24,7 @@ import pytest
 import config
 import vetoes
 from signal_engine import evaluate_symbol
-from tests.test_engine import FakeMarket
+from tests.test_engine import FakeMarket, _benign_4h_for_sr
 from tests.test_indicators import candles_from_closes
 from vetoes import (
     btc_1h_change_pct,
@@ -448,3 +448,52 @@ def test_h3_v17_taker_veto_fires_on_hostile_ratio():
     blocks = run_vetoes("BTCUSDT", "BULLISH", None, snap, entry_px=100.0)
     codes = blocks_by_code(blocks)
     assert "cvd_imbalance" not in codes
+
+
+# ------------------------------------------------- M1 regression (2026-10-17)
+def test_oi_flush_inputs_incomplete_holds():
+    # open_interest is a REQUIRED derivatives component: V18 must hold
+    # (fail-closed) when the adv feed has no oi_change, not silently skip.
+    m = FakeMarket()
+    m.adv["oi_change"] = None
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    assert by["oi_flush"][0] == "hold"
+    assert "fail-closed" in by["oi_flush"][1]
+
+
+def test_oi_flush_fires_on_cascade():
+    m = FakeMarket()
+    m.adv.update({"oi_change": -6.5, "spike": 3.0})
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    assert by["oi_flush"][0] == "veto"
+
+
+def test_cvd_imbalance_missing_taker_is_best_effort():
+    # taker_volume is OPTIONAL (engine Stage 8 flags it as deriv_missing and
+    # lets the signal through): V17 must not hold on a missing taker feed.
+    snap = {"aggregate_funding": 0.0001}  # no taker_buy_sell_ratio key
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", FakeMarket(), snap))
+    assert "cvd_imbalance" not in by
+
+
+def test_cvd_imbalance_fires_when_present():
+    snap = {"aggregate_funding": 0.0001, "taker_buy_sell_ratio": 0.5}
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", FakeMarket(), snap))
+    assert by["cvd_imbalance"][0] == "veto"
+
+
+def test_stage10_adv_failure_holds_cleanly(monkeypatch):
+    # M6: Stage 10 re-fetches the adv feed with no guard. It is reachable
+    # when the operator disabled every earlier adv consumer (Stage 6/7
+    # reviews + the adv-served vetoes): the feed raising must then hold the
+    # signal cleanly (fail-closed), not crash with a raw exception.
+    monkeypatch.setattr(config, "LIQ_REVIEW", False)
+    monkeypatch.setattr(config, "WHALE_REVIEW", False)
+    monkeypatch.setattr(config, "DISABLED_VETOES",
+                        frozenset({"leverage_risk", "squeeze", "whale"}))
+    m = _benign_4h_for_sr(FakeMarket(bullish=True))
+    m.raise_adv = True
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert "derivatives feed unavailable" in reason
+    assert "holding" in reason
