@@ -36,10 +36,13 @@ import argparse
 import json
 import logging
 import os
+import signal
 import sys
+import threading
 import time
 
 import config
+import logutil
 from data import MarketData
 from exchange import ExchangeClient
 from executor import Executor
@@ -173,6 +176,39 @@ def build(args, env: dict | None = None):
     return executor, mode
 
 
+def _install_shutdown_handlers(executor) -> threading.Event:
+    """Install SIGINT/SIGTERM handlers for graceful loop shutdown (1.3).
+
+    The handlers only SET executor.shutdown_event (never raise), so an
+    in-flight scan cycle — including any in-progress HTTP order request —
+    is never interrupted mid-flight: Python signal handlers that don't
+    raise can't tear down a socket call. Executor.run_loop checks the event
+    at safe points (between cycles), finishes the current cycle, flushes
+    state, and exits cleanly.
+
+    Factored out for testability. Returns the event (also assigned to
+    executor.shutdown_event).
+    """
+    event = threading.Event()
+    executor.shutdown_event = event
+
+    def _on_signal(signum, _frame):
+        name = getattr(signal.Signals(signum), "name", str(signum))
+        log.warning("shutdown requested (%s): finishing current cycle, "
+                    "then exiting cleanly", name)
+        event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _on_signal)
+        except (OSError, ValueError, RuntimeError) as e:
+            # ValueError: not running in the main thread (some test
+            # harnesses). The loop still honors the event if something else
+            # sets it.
+            log.warning("could not install %s handler: %s", sig, e)
+    return event
+
+
 def _parse_leverage_tiers(spec: str | None) -> dict | None:
     """Parse 'BTCUSDT=20,ETHUSDT=20' into a dict. None -> config default."""
     if not spec:
@@ -237,6 +273,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--balance", action="store_true",
                     help="print the futures USDT balance and exit "
                          "(needs --live or --testnet keys)")
+    ap.add_argument("--log-json", action="store_true", default=None,
+                    help="emit structured JSON log lines (one object per "
+                         "line, via logutil.JsonFormatter) instead of the "
+                         "readable default. Overrides BOT_LOG_JSON.")
     args = ap.parse_args(argv)
     # BOT_MODE env (set by `source switch.sh live|demo`) selects the mode
     # when no explicit flag is given.
@@ -259,8 +299,9 @@ def main(argv: list[str] | None = None) -> int:
                     "deviates from the 1%%/3x defaults; testnet only",
                     args.fixed_margin_usdt, args.leverage)
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    log_json = (args.log_json
+                if args.log_json is not None else config.LOG_JSON)
+    logutil.setup_logging(level=logging.INFO, json_format=log_json)
     executor, mode = build(args)
     log.warning("starting executor in %s mode", mode)
     if args.balance:
@@ -285,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         log.info("once summary: %s", summary)
         _write_last_run(mode, executor.lifecycle, cycle_start_ms, summary)
     else:
+        _install_shutdown_handlers(executor)
         executor.run_loop(from_db=args.from_db, db_path=args.db)
     return 0
 
