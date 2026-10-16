@@ -31,6 +31,8 @@ MANUAL_CLOSE = "manual_close"
 EXPIRED = "expired"
 CANCELLED = "cancelled"
 PROFIT_TAKE = "profit_take"   # auto TP: unrealized hit +PROFIT_TAKE_PCT% of margin
+TRAIL_STOP = "trail_stop"     # trailing stop: -TRAIL_DISTANCE_PCT% pullback from peak
+TIME_STOP = "time_stop"       # time stop: position open longer than TIME_STOP_HOURS
 
 
 class LifecycleLogger:
