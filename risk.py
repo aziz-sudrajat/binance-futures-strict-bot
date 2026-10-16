@@ -71,9 +71,17 @@ class RiskManager:
     def __init__(self, state, get_balance,
                  max_positions: int = config.MAX_CONCURRENT_POSITIONS,
                  daily_loss_cap_pct: float = config.DAILY_LOSS_CAP_PCT,
-                 per_symbol_cap_pct: float = config.EXEC_MAX_EXPOSURE_PCT_PER_SYMBOL):
+                 per_symbol_cap_pct: float = config.EXEC_MAX_EXPOSURE_PCT_PER_SYMBOL,
+                 get_wallet_balance=None, get_equity=None):
         self.state = state
-        self.get_balance = get_balance  # () -> float | None
+        self.get_balance = get_balance  # () -> float | None (available)
+        # H1: loss metrics must NEVER use availableBalance — locked initial
+        # margin moves it without any real loss. Wallet = realized value
+        # only; equity = wallet + unrealized PnL. Default to get_balance
+        # when the caller provides no dedicated getters (tests, simple
+        # setups).
+        self.get_wallet_balance = get_wallet_balance or get_balance
+        self.get_equity = get_equity or get_balance
         self.max_positions = max_positions
         self.daily_loss_cap_pct = daily_loss_cap_pct
         self.per_symbol_cap_pct = per_symbol_cap_pct
@@ -84,7 +92,14 @@ class RiskManager:
         today = utc_today()
         daily = self.state.get("daily", {})
         if daily.get("date") != today:
-            balance = self.get_balance() or 0.0
+            balance = self.get_wallet_balance()
+            if balance is None:
+                # M3: never roll the bookkeeping on a failed read. Keeping
+                # yesterday's record means the loss guard keeps working off
+                # the last known start balance instead of going blind.
+                log.warning("day rollover: wallet balance unavailable - "
+                            "keeping previous day record")
+                return today
             self.state.set("daily", {
                 "date": today,
                 "start_balance": balance,
@@ -118,8 +133,12 @@ class RiskManager:
         daily = self.state.get("daily", {})
         start = daily.get("start_balance") or 0.0
         if start <= 0:
-            return True, "no start-of-day balance recorded yet"
-        balance = self.get_balance()
+            # M3 fail-closed: without a start-of-day anchor we cannot prove
+            # we are within the loss cap, so block new entries.
+            return False, ("no start-of-day balance recorded yet - "
+                           "holding (fail-closed)")
+        # H1: wallet balance, not availableBalance (locked margin is not a loss).
+        balance = self.get_wallet_balance()
         if balance is None:
             # Fail-closed: without a balance we cannot prove we are safe.
             return False, "balance unavailable - holding (fail-closed)"
@@ -148,7 +167,8 @@ class RiskManager:
             return True, "drawdown guard disabled"
         metrics = self.state.get("risk_metrics", {})
         hwm = float(metrics.get("high_watermark") or 0.0)
-        balance = self.get_balance()
+        # H1: drawdown is measured on equity, not availableBalance.
+        balance = self.get_equity()
         if balance is None:
             return False, "balance unavailable - holding (fail-closed)"
         if balance > hwm:
@@ -189,6 +209,10 @@ class RiskManager:
     # ------------------------------------------------------------ new entry
     def check_can_open(self, symbol: str, notional: float,
                        open_count: int) -> tuple[bool, str]:
+        # Ensure day bookkeeping is current on every entry path (scan_once,
+        # scan_from_db, manual_entry). Idempotent; required for the
+        # fail-closed start_balance semantics in check_daily_loss.
+        self.ensure_day()
         if self.kill_switch_active():
             return False, "kill switch active - no new entries today"
         ok, reason = self.check_daily_loss()
@@ -276,6 +300,31 @@ class PaperBroker:
     # ------------------------------------------------- ExchangeClient iface
     def get_balance(self, asset: str = "USDT") -> float | None:
         return self.balance
+
+    def get_wallet_balance(self, asset: str = "USDT") -> float | None:
+        """Realized wallet balance (excludes unrealized PnL).
+
+        Paper mirror of ExchangeClient.get_wallet_balance: self.balance only
+        moves on realized PnL (fills, fees), never on unrealized moves — the
+        exact semantics the H1 risk fix requires for loss metrics. Without
+        this method run_executor.py crashes at paper-mode startup
+        (AttributeError wiring get_wallet_balance into RiskManager).
+        """
+        return self.balance
+
+    def get_margin_balance(self) -> float | None:
+        """Account equity: wallet balance + open unrealized PnL."""
+        eq = self.balance
+        for symbol, p in self.positions.items():
+            qty = p["qty"]
+            if not qty:
+                continue
+            live = self._price_fn(symbol)
+            if not live:
+                continue
+            sign = 1.0 if qty > 0 else -1.0
+            eq += sign * (live - p["avg_price"]) * abs(qty)
+        return eq
 
     def get_positions(self) -> list[dict]:
         out = []
