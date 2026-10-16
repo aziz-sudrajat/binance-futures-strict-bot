@@ -443,6 +443,33 @@ def test_paper_market_fills_immediately():
     assert broker.positions["BTCUSDT"]["qty"] == 2.0
 
 
+def test_paper_broker_wallet_and_equity_split():
+    """PaperBroker must expose the H1 balance split: wallet = realized only,
+    equity = wallet + unrealized. run_executor wires both into RiskManager,
+    so their absence used to crash paper mode at startup (AttributeError)."""
+    prices = {"BTCUSDT": 100.0}
+    broker = PaperBroker(10_000.0, price_fn=lambda s: prices[s])
+    assert broker.get_wallet_balance() == 10_000.0
+    assert broker.get_margin_balance() == 10_000.0
+    broker.place_order("BTCUSDT", "BUY", "MARKET", quantity=2.0)
+    fee = 100.0 * 2.0 * broker.fee_pct / 100
+    # wallet moved only by the entry fee (realized); unrealized is flat.
+    assert broker.get_wallet_balance() == pytest.approx(10_000.0 - fee)
+    assert broker.get_margin_balance() == pytest.approx(10_000.0 - fee)
+    # price runs +10%: equity picks up the unrealized gain, wallet doesn't.
+    prices["BTCUSDT"] = 110.0
+    assert broker.get_wallet_balance() == pytest.approx(10_000.0 - fee)
+    assert broker.get_margin_balance() == pytest.approx(10_000.0 - fee + 20.0)
+    # short side mirrors.
+    broker2 = PaperBroker(10_000.0, price_fn=lambda s: prices[s])
+    broker2.place_order("BTCUSDT", "SELL", "MARKET", quantity=1.0)
+    fee2 = 110.0 * 1.0 * broker2.fee_pct / 100
+    assert broker2.get_margin_balance() == pytest.approx(10_000.0 - fee2)
+    prices["BTCUSDT"] = 100.0  # short gains 10
+    assert broker2.get_margin_balance() == pytest.approx(
+        10_000.0 - fee2 + 10.0)
+
+
 # ------------------------------------------------------------------- CLI
 
 def test_testnet_without_keys_refuses():
@@ -2045,3 +2072,209 @@ def test_pending_close_retry_partial_then_trigger_completes(rig, monkeypatch):
     terminals = [e for e in lifecycle.read_all()
                  if e.get("terminal") is True]
     assert len(terminals) == 1 and terminals[0]["state"] == "profit_take"
+
+
+# ---------------------------------------------------------------- H2 regression
+def test_h2_sl_resized_after_tp_fill(short_rig, monkeypatch):
+    """H2: after a TP fill, the live SL must be resized to the remainder.
+
+    An oversized reduce-only stop can be rejected at trigger time, leaving
+    the tail unprotected. (Breakeven disabled here to isolate the resize.)
+    """
+    import config as config_mod
+    monkeypatch.setattr(config_mod, "EXEC_BREAKEVEN_AFTER_TP1", False)
+    executor, market, exchange, state, lifecycle, risk = short_rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    pos_id, pos = next(iter(executor._open_positions().items()))
+    entry_px = pos["entry_price"]
+    full_qty = pos["qty"]
+    old_sl_id = pos["sl_order_id"]
+    assert pos["sl_qty"] == full_qty
+    # Fill TP1 -> remaining shrinks.
+    exchange.fill(pos["tp"]["tp1"]["order_id"], entry_px - 3.0)
+    executor._manage_one(pos_id, pos, 10_000.0, summary)
+    pos = executor._open_positions()[pos_id]
+    remaining = pos["qty"]
+    assert 0 < remaining < full_qty
+    assert pos["sl_order_id"] != old_sl_id, "SL was not replaced after TP fill"
+    new_sl = exchange.get_algo_order("BTCUSDT", pos["sl_order_id"])
+    assert new_sl is not None and new_sl["status"] == "NEW"
+    assert abs(new_sl["origQty"] - remaining) < 1e-9, (
+        f"SL qty {new_sl['origQty']} != remaining {remaining}")
+    assert pos["sl_qty"] == remaining
+    old_sl = exchange.get_algo_order("BTCUSDT", old_sl_id)
+    assert old_sl["status"] == "CANCELED"
+
+
+def test_h2_dead_sl_emergency_replaced(short_rig):
+    """H2: a dead SL leg (CANCELED) must be re-placed, not left naked."""
+    executor, market, exchange, state, lifecycle, risk = short_rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    pos_id, pos = next(iter(executor._open_positions().items()))
+    old_sl_id = pos["sl_order_id"]
+    # Simulate the SL dying on the exchange (rejected/cancelled externally).
+    exchange.cancel_algo_order("BTCUSDT", old_sl_id)
+    executor._manage_one(pos_id, pos, 10_000.0, summary)
+    pos = executor._open_positions().get(pos_id)
+    assert pos is not None and not pos.get("closed"), \
+        "position should stay managed with a fresh SL"
+    assert pos["sl_order_id"] != old_sl_id, "dead SL was not replaced"
+    new_sl = exchange.get_algo_order("BTCUSDT", pos["sl_order_id"])
+    assert new_sl is not None and new_sl["status"] == "NEW"
+    assert abs(new_sl["origQty"] - pos["qty"]) < 1e-9
+    assert any(e.get("state") == "sl_replaced"
+               for e in lifecycle.read_all()), "no sl_replaced lifecycle event"
+
+
+# ---------------------------------------------------------------- H4 regression
+def test_h4_flat_position_terminal_carries_realized(rig, monkeypatch):
+    """H4: _flat_position's terminal event must carry realized PnL.
+
+    metrics/report/notify read e["realized"]; logging only pnl= left them
+    at 0 for profit-take / trail / time-stop closes.
+    """
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "PROFIT_TAKE_PCT", 20.0)
+    pos = _profit_take_pos()
+    # Give the test position a stop_loss so H2 helpers don't skip it.
+    pos["stop_loss"] = 99.0
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 120.0                      # +$20 unrealized on $1 margin
+    exchange.market_price["BTCUSDT"] = 120.0
+    exchange._pos["BTCUSDT"] = 1.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    terminals = [e for e in lifecycle.read_all()
+                 if e.get("terminal") is True]
+    assert len(terminals) == 1, f"expected 1 terminal event, got {terminals}"
+    ev = terminals[0]
+    assert "realized" in ev, f"terminal event lacks realized: {ev}"
+    assert ev["realized"] > 0, f"expected positive realized, got {ev}"
+    # realized must equal the position's total (prior fills + this close).
+    stored = state.get("positions")["p1"]
+    assert abs(ev["realized"] - round(stored["realized"], 4)) < 1e-9
+
+
+# ---------------------------------------------------------------- H5 regression
+def test_h5_tp_dust_closes_position_and_frees_slot(rig):
+    """H5: sub-minQty residual after all TP legs fill must close, not block
+    the one-position-per-coin slot forever."""
+    executor, market, exchange, state, lifecycle, risk = rig
+    pos = _profit_take_pos()
+    pos["stop_loss"] = 99.0
+    for leg in ("tp1", "tp2", "tp3"):
+        pos["tp"][leg]["filled"] = True
+    pos["qty"] = 0.0005  # dust < minQty (0.001)
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    # Keep the exchange-side position so the gone-check doesn't mask the
+    # dust logic.
+    exchange._pos["BTCUSDT"] = 0.0005
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos["closed"] is True, "dust position was not closed"
+    assert executor._open_positions() == {}, "symbol slot still blocked"
+    assert any(e.get("state") == "dust_closed" for e in lifecycle.read_all())
+
+
+# ---------------------------------------------------------------- H6 regression
+def test_h6_orphan_cleanup_keeps_adopted_position_orders(rig):
+    """H6: cleanup_orphan_orders must NOT cancel live orders belonging to an
+    adopted (unmanaged) position's symbol — reconcile() can't know their
+    order IDs, so they'd all look like orphans."""
+    executor, market, exchange, state, lifecycle, risk = rig
+    # An adopted position: unmanaged, no known order IDs (as reconcile()
+    # stores it).
+    state._data["positions"] = {
+        "adopted_1": {"symbol": "BTCUSDT", "qty": 1.0, "unmanaged": True,
+                      "tp": {}, "sl_order_id": None, "closed": False},
+    }
+    state.save()
+    # A live order on that symbol (e.g. the manual trader's stop) + a real
+    # orphan on another symbol.
+    exchange.orders[9001] = {"orderId": 9001, "symbol": "BTCUSDT",
+                             "side": "SELL", "price": 95.0, "status": "NEW"}
+    exchange.orders[9002] = {"orderId": 9002, "symbol": "ETHUSDT",
+                             "side": "SELL", "price": 3000.0, "status": "NEW"}
+    cancelled = executor.cleanup_orphan_orders()
+    assert exchange.orders[9001]["status"] == "NEW", \
+        "adopted position's order was cancelled!"
+    assert "BTCUSDT:9001" not in cancelled
+    assert exchange.orders[9002]["status"] == "CANCELED", \
+        "genuine orphan was not cancelled"
+    assert "ETHUSDT:9002" in cancelled
+
+
+# ---------------------------------------------------------------- H7 regression
+def test_h7_entry_client_id_deterministic_from_sid():
+    """H7: the entry clientOrderId must derive from the signal id so a retry
+    collides instead of double-submitting."""
+    from executor import Executor
+    sid = "BTCUSDT:1234567890000:LONG"
+    cid1 = Executor._entry_client_id(sid)
+    cid2 = Executor._entry_client_id(sid)
+    assert cid1 == cid2, "entry clientOrderId not deterministic"
+    assert len(cid1) <= 36
+    assert all(c.isalnum() or c in "-_" for c in cid1)
+    other = Executor._entry_client_id("ETHUSDT:1234567890000:LONG")
+    assert other != cid1, "different signals must not share a clientOrderId"
+
+
+def test_h7_signal_marked_before_place_order(short_rig, monkeypatch):
+    """H7: if place_order blows up, the signal must already be marked so the
+    next cycle does not open a second position (at-most-once)."""
+    executor, market, exchange, state, lifecycle, risk = short_rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated crash between mark and fill")
+
+    monkeypatch.setattr(exchange, "place_order", boom)
+    import pytest
+    with pytest.raises(RuntimeError):
+        executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    # The signal id for this candle/direction must be marked despite the crash.
+    assert len(state._data.get("signal_ids", {})) == 1, \
+        "signal was not marked before place_order"
+    assert executor._open_positions() == {}
+
+
+# ---------------------------------------------------------------- H8 regression
+def test_h8_partial_fill_at_timeout_is_adopted_not_stranded(rig, monkeypatch):
+    """H8: if the entry partially fills around the timeout cancel, the filled
+    portion must be adopted (resized + bracketed), never marked closed as a
+    naked position."""
+    import time as time_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    # Build a position whose entry is stale (past timeout) and partially
+    # filled on the exchange.
+    pos = _profit_take_pos()
+    pos.update({
+        "qty": 1.0, "entry_price": 100.0, "brackets_placed": False,
+        "opened_at": int(time_mod.time() * 1000) - 31 * 60_000,
+        "entry_order_id": 7777, "closed": False, "stop_loss": 99.0,
+    })
+    for leg in ("tp1", "tp2", "tp3"):
+        pos["tp"][leg]["order_id"] = None
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    # Exchange: entry order partially filled (0.4 of 1.0), still NEW.
+    exchange.orders[7777] = {"orderId": 7777, "symbol": "BTCUSDT",
+                             "status": "PARTIALLY_FILLED",
+                             "executedQty": 0.4, "avgPrice": 100.1,
+                             "origQty": 1.0}
+    # Force the timeout path: make _check_entry_fill see it as not-fillable
+    # by having get_order report the partial state (it returns False for
+    # PARTIALLY_FILLED), then _expire_stale_entry runs.
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True, \
+        "partially filled entry was stranded as closed!"
+    assert abs(pos["qty"] - 0.4) < 1e-9, f"qty not resized to fill: {pos['qty']}"
+    assert pos.get("brackets_placed") is True, "brackets not placed for adopted fill"
+    assert pos.get("sl_order_id") is not None, "no SL for adopted fill"
