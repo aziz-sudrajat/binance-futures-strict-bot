@@ -78,10 +78,18 @@ class ExchangeClient:
         return params
 
     def _request(self, method: str, path: str, params: dict | None = None,
-                 signed: bool = True) -> dict:
+                 signed: bool = True, key_only: bool = False) -> dict:
+        """key_only: send X-MBX-APIKEY header WITHOUT an HMAC signature.
+
+        Binance listenKey endpoints require the API key but reject signed
+        payloads -- they must not use signed=False (which omits the key
+        entirely) nor signed=True (which attaches a signature).
+        """
         params = dict(params or {})
         if signed:
             params = self._sign(params)
+            headers = {"X-MBX-APIKEY": self._key}
+        elif key_only:
             headers = {"X-MBX-APIKEY": self._key}
         else:
             headers = {}
@@ -449,7 +457,7 @@ class ExchangeClient:
     def create_listen_key(self) -> str | None:
         """Create a user data stream listenKey (valid for 60m)."""
         try:
-            res = self._request("POST", "/fapi/v1/listenKey", signed=False)
+            res = self._request("POST", "/fapi/v1/listenKey", signed=False, key_only=True)
             return res.get("listenKey") if isinstance(res, dict) else None
         except ExchangeError as e:
             log.warning("create_listen_key failed: %s", e)
@@ -458,7 +466,7 @@ class ExchangeClient:
     def keepalive_listen_key(self) -> bool:
         """Ping user data stream listenKey to prevent expiry."""
         try:
-            self._request("PUT", "/fapi/v1/listenKey", signed=False)
+            self._request("PUT", "/fapi/v1/listenKey", signed=False, key_only=True)
             return True
         except ExchangeError as e:
             log.warning("keepalive_listen_key failed: %s", e)
@@ -467,7 +475,7 @@ class ExchangeClient:
     def close_listen_key(self) -> bool:
         """Close user data stream listenKey."""
         try:
-            self._request("DELETE", "/fapi/v1/listenKey", signed=False)
+            self._request("DELETE", "/fapi/v1/listenKey", signed=False, key_only=True)
             return True
         except ExchangeError as e:
             log.warning("close_listen_key failed: %s", e)
