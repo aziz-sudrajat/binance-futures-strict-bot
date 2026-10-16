@@ -34,7 +34,8 @@ from risk import floor_to_step, quantize_price
 log = logging.getLogger("executor")
 
 _FEE_PCT = 0.05  # fee estimate per fill for PnL accounting (matches backtest)
-_ENTRY_TIMEOUT_HOURS = 6  # cancel an unfilled entry order after this long
+_ENTRY_TIMEOUT_MINUTES = 30  # cancel an unfilled entry limit order after
+                            # this long (user 2026-10-16; was 6h)
 
 
 def signal_candle_close_ms(market, symbol: str) -> int:
@@ -905,13 +906,13 @@ class Executor:
         # (CANCELLED) in the same cycle — never log a second terminal event.
         if pos.get("closed"):
             return
-        age_h = (time.time() * 1000 - pos["opened_at"]) / 3_600_000
-        if age_h < _ENTRY_TIMEOUT_HOURS:
+        age_min = (time.time() * 1000 - pos["opened_at"]) / 60_000
+        if age_min < _ENTRY_TIMEOUT_MINUTES:
             return
         symbol = pos["symbol"]
         self.exchange.cancel_order(symbol, order_id=pos.get("entry_order_id"))
         pos["closed"] = True
-        pos["closed_reason"] = f"entry unfilled after {_ENTRY_TIMEOUT_HOURS}h"
+        pos["closed_reason"] = f"entry unfilled after {_ENTRY_TIMEOUT_MINUTES}m"
         self.lifecycle.log(sid, symbol, EXPIRED,
                            reason=pos["closed_reason"], terminal=True)
         log.info("%s expired: %s", pos_id, pos["closed_reason"])
