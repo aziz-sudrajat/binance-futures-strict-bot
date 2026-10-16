@@ -713,6 +713,84 @@ def _freshness_check(symbol: str, market, direction: str,
     return live, None
 
 
+def prefilter_symbol(symbol: str, market, tickers: dict | None = None
+                    ) -> tuple[bool, str]:
+    """Two-stage scan, stage 1: cheap necessary conditions.
+
+    Mirrors engine stages 0-2 of evaluate_symbol() EXACTLY (same predicates,
+    same helper functions, same config reads):
+      stage 0: 24h quote volume >= MIN_24H_VOLUME_USD (fail-closed)
+      stage 1: 15m indicator setup — directional signal, trade plan,
+               strength >= MIN_STRENGTH (bullish-only respected)
+      stage 2: MTF alignment 4h/1h/30m/15m/5m (fail-closed)
+
+    The freshness gate (stage 1b) is deliberately NOT here: it needs a fresh
+    live price, which stage 2 (full evaluate_symbol) fetches per symbol.
+
+    `tickers` is an optional {symbol: {"vol_usd_24h": ...}} bulk map (one
+    HTTP call for the whole universe via MarketData.get_swap_tickers()).
+    When None or the symbol is missing, falls back to the per-symbol
+    market.get_24h_quote_volume_usd() — identical fail-closed semantics.
+
+    Correctness: any symbol approved by evaluate_symbol() must pass stages
+    0-2, hence must pass this prefilter. The candidate set is therefore a
+    superset of the approved set; running the unchanged evaluate_symbol()
+    on candidates yields identical approvals with far fewer HTTP calls.
+
+    Returns (True, direction) or (False, reason). Data errors in the
+    guarded paths above are reported as (False, reason); any unexpected
+    exception propagates to the caller, which must treat it as a
+    fail-closed rejection (see scanner._select_candidates).
+    """
+    symbol = symbol.upper()
+
+    # ---- Stage 0: liquidity filter — FAIL-CLOSED (all modes).
+    vol = None
+    if tickers is not None:
+        row = tickers.get(symbol) or {}
+        vol = row.get("vol_usd_24h")
+    if vol is None:
+        vol = market.get_24h_quote_volume_usd(symbol)
+    try:
+        vol_ok = vol is not None and _finite(vol)
+    except (TypeError, ValueError):  # non-numeric garbage -> fail closed
+        vol_ok = False
+    if not vol_ok:
+        return False, "24h volume unavailable — holding (fail-closed)"
+    if vol < config.MIN_24H_VOLUME_USD:
+        return False, f"24h volume ${vol:,.0f} below ${config.MIN_24H_VOLUME_USD:,}"
+
+    # ---- Stage 1: 15m indicator setup — MACD, MA/EMA, RSI (all modes).
+    try:
+        k15 = market.get_klines(symbol, "15m")
+        a15 = analyze_candles(symbol, "15m", k15)
+    except Exception as e:  # noqa: BLE001
+        return False, f"15m data error: {e}"
+    sig15 = str(a15["signal"])
+    is_bull = sig15.startswith("BULL")
+    is_bear = sig15.startswith("BEAR")
+    if config.BULLISH_ONLY and not is_bull:
+        return False, f"bullish-only: 15m signal {sig15}"
+    if not is_bull and not is_bear:
+        return False, f"15m: no directional setup ({sig15})"
+    direction = "BULLISH" if is_bull else "BEARISH"
+    if not a15["trade_plan"]:
+        return False, "15m: no trade plan"
+    if a15["strength"] < config.MIN_STRENGTH:
+        return False, f"15m strength {a15['strength']}/5 below {config.MIN_STRENGTH}"
+
+    # ---- Stage 2: MTF alignment — 4h, 1h, 30m, 15m, 5m same direction
+    # (SEMUA mode). Fail-closed.
+    try:
+        a30 = analyze_candles(symbol, "30m", market.get_klines(symbol, "30m"))
+    except Exception as e:  # noqa: BLE001
+        return False, f"30m data error: {e} — holding (fail-closed)"
+    ok, note = mtf_alignment_check(symbol, market, direction, a15, a30)
+    if not ok:
+        return False, note
+    return True, direction
+
+
 def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
     """Mode-dispatched signal pipeline (user spec 2026-10-15).
 
