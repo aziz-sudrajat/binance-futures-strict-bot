@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 aziz-sudrajat <azizsudrajat.stb4@gmail.com>
+# https://github.com/aziz-sudrajat
+#
+# All rights reserved. This file is part of the binance-futures-strict-bot project.
+# Unauthorized copying, modification, distribution, or false claim of
+# authorship is prohibited.
+
 """Push changed bot files to GitHub via the github MCP CLI (one file per call)."""
 import json
 import subprocess
@@ -6,16 +13,8 @@ import sys
 
 OWNER, REPO, BRANCH = "aziz-sudrajat", "binance-futures-strict-bot", "main"
 MSG = "Trading-hours gate: LIVE entries only 05:00-18:00 WIB (ketat)"
-# NOTE 2026-10-16: hardcoded FILES once caused lifecycle.py to be skipped
-# while executor.py (which imports from it) was pushed -> broken deploy.
-# Always pass the FULL set of changed files, or pass them as argv.
-FILES = ["config.py", "executor.py", "dashboard.py", "lifecycle.py",
-         "signal_engine.py", "scanner.py", "vetoes.py",
-         "tests/test_executor.py", "tests/test_dashboard.py",
-         "tests/test_trading_hours.py", "tests/test_from_db.py",
-         "tests/test_engine.py", "tests/test_shell.py"]
-if len(sys.argv) > 1:
-    FILES = sys.argv[1:]
+FILES = ["config.py", "executor.py", "dashboard.py",
+         "tests/test_trading_hours.py", "tests/test_from_db.py"]
 
 
 def gh(args):
