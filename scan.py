@@ -26,53 +26,60 @@ import time
 import config
 from data import MarketData, normalize_symbol
 from signal_engine import evaluate_symbol
-from scanner import evaluate_symbols_ordered
-
-
-def _print_scan_result(symbol: str, signal: dict | None, note: str,
-                       dt: float, passed: list[dict]) -> None:
-    if signal:
-        passed.append(signal)
-        print(f"  {symbol:12s} ✅ {note}  ({dt:.1f}s)")
-        print(f"               entry {signal['entry']:.6g} "
-              f"[{signal['entry_low']:.6g} - {signal['entry_high']:.6g}]  "
-              f"SL {signal['stop_loss']:.6g}")
-        print(f"               TP1 {signal['tp1']:.6g} / TP2 {signal['tp2']:.6g} / "
-              f"TP3 {signal['tp3']:.6g}   RSI {signal['rsi']}  "
-              f"{signal['regime']}  deriv {signal['deriv_score']} "
-              f"({signal['deriv_provider']})")
-    else:
-        print(f"  {symbol:12s} -- {note}  ({dt:.1f}s)", flush=True)
 
 
 def scan(symbols: list[str], log_path: str, market: MarketData,
-         max_workers: int | None = None) -> list[dict]:
-    normed = [s for s in (normalize_symbol(r) for r in symbols) if s]
-    workers = config.SCAN_MAX_WORKERS if max_workers is None else max_workers
-    passed = []
-    if max(1, int(workers)) == 1:
-        # Legacy sequential path — behavior identical to before.
-        for symbol in normed:
-            t0 = time.time()
-            try:
-                signal, note = evaluate_symbol(symbol, market)
-            except Exception as e:  # noqa: BLE001 - one bad symbol must not kill the scan
-                print(f"  {symbol:12s} ERROR {e}", flush=True)
-                continue
-            _print_scan_result(symbol, signal, note, time.time() - t0, passed)
-    else:
-        # Parallel path: evaluation in worker threads (each with its own
-        # MarketData; one shared throttled session), prints stay in the
-        # main thread in symbol order.
+         max_workers: int = 1) -> list[dict]:
+    """Scan symbols with the STRICT engine; approved signals -> paper log.
+
+    max_workers=1 (default) evaluates sequentially — exactly the legacy
+    behavior. max_workers>1 evaluates symbols in a ThreadPoolExecutor and
+    reports/logs results in input order, so approvals are provably identical
+    to the sequential path (each symbol is evaluated independently).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    normed: list[str] = []
+    for raw in symbols:
+        symbol = normalize_symbol(raw)
+        if symbol:
+            normed.append(symbol)
+
+    def _evaluate(indexed):
+        i, symbol = indexed
         t0 = time.time()
-        for res in evaluate_symbols_ordered(normed, market, workers):
-            dt = time.time() - t0
-            if res["error"] is not None:
-                print(f"  {res['symbol']:12s} ERROR {res['error']}",
-                      flush=True)
-                continue
-            _print_scan_result(res["symbol"], res["signal"], res["note"],
-                               dt, passed)
+        try:
+            signal, note = evaluate_symbol(symbol, market)
+        except Exception as e:  # noqa: BLE001 - one bad symbol must not kill the scan
+            return i, symbol, None, f"ERROR {e}", 0.0
+        return i, symbol, signal, note, time.time() - t0
+
+    workers = max(1, int(max_workers or 1))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            evaluated = list(pool.map(_evaluate, enumerate(normed)))
+    else:
+        evaluated = [_evaluate((i, s)) for i, s in enumerate(normed)]
+    # pool.map already preserves order; sort defensively so reporting and
+    # the paper log are always in input order on every path.
+    evaluated.sort(key=lambda r: r[0])
+
+    passed = []
+    for _i, symbol, signal, note, dt in evaluated:
+        if signal:
+            passed.append(signal)
+            print(f"  {symbol:12s} ✅ {note}  ({dt:.1f}s)")
+            print(f"               entry {signal['entry']:.6g} "
+                  f"[{signal['entry_low']:.6g} - {signal['entry_high']:.6g}]  "
+                  f"SL {signal['stop_loss']:.6g}")
+            print(f"               TP1 {signal['tp1']:.6g} / TP2 {signal['tp2']:.6g} / "
+                  f"TP3 {signal['tp3']:.6g}   RSI {signal['rsi']}  "
+                  f"{signal['regime']}  deriv {signal['deriv_score']} "
+                  f"({signal['deriv_provider']})")
+        elif note.startswith("ERROR "):
+            print(f"  {symbol:12s} {note}", flush=True)
+        else:
+            print(f"  {symbol:12s} -- {note}  ({dt:.1f}s)", flush=True)
     if passed:
         with open(log_path, "a", encoding="utf-8") as f:
             for s in passed:
@@ -89,9 +96,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="comma-separated symbols, e.g. BTCUSDT,ETHUSDT")
     ap.add_argument("--log", default="paper_trades.jsonl",
                     help="paper-trade log path")
-    ap.add_argument("--workers", type=int, default=None,
-                    help="scan thread-pool size (default config.SCAN_MAX_WORKERS; "
-                         "1 = legacy sequential scan)")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel evaluation workers (>1 = ThreadPoolExecutor)")
     args = ap.parse_args(argv)
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     print(f"Scanning {len(symbols)} symbol(s) — STRICT (quality >= "
