@@ -1,10 +1,10 @@
 # Runtime state — never commit (contains positions, balances, signal ids)
 state.json
-state-paper.json
 lifecycle.jsonl
 lifecycle-live.jsonl
 last_run.json
 paper_trades.jsonl
+state-paper.json
 
 # Secrets — never commit
 .env
