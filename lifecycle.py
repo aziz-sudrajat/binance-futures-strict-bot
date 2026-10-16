@@ -30,6 +30,7 @@ SL_HIT = "sl_hit"
 MANUAL_CLOSE = "manual_close"
 EXPIRED = "expired"
 CANCELLED = "cancelled"
+PROFIT_TAKE = "profit_take"   # auto TP: unrealized hit +PROFIT_TAKE_PCT% of margin
 
 
 class LifecycleLogger:
