@@ -420,3 +420,31 @@ def test_sr_zone_pol_case():
     by = blocks_by_code(run_vetoes("POLUSDT", "BEARISH", m, BENIGN_SNAP,
                                    entry_px=0.09342))
     assert by["sr_zone"][0] == "veto"
+
+
+# ---------------------------------------------------------------- H3 regression
+def test_h3_v17_taker_veto_fires_on_hostile_ratio():
+    """H3: V17 must fire when the taker buy/sell ratio opposes the signal.
+
+    The snapshot key is "taker_buy_sell_ratio" (data.py); the old code read
+    the non-existent "taker_ratio" so V17 never evaluated at all.
+    """
+    # BULLISH signal, heavy seller aggression (ratio < 0.70) -> veto.
+    snap = dict(BENIGN_SNAP)
+    snap["taker_buy_sell_ratio"] = 0.50
+    blocks = run_vetoes("BTCUSDT", "BULLISH", None, snap, entry_px=100.0)
+    codes = blocks_by_code(blocks)
+    assert "cvd_imbalance" in codes, f"V17 did not fire: {codes}"
+    assert codes["cvd_imbalance"][0] == "veto"
+
+    # BEARISH signal, heavy buyer aggression (ratio > 1.43) -> veto.
+    snap["taker_buy_sell_ratio"] = 1.60
+    blocks = run_vetoes("BTCUSDT", "BEARISH", None, snap, entry_px=100.0)
+    codes = blocks_by_code(blocks)
+    assert "cvd_imbalance" in codes, f"V17 did not fire: {codes}"
+
+    # Neutral ratio -> no V17 veto.
+    snap["taker_buy_sell_ratio"] = 1.00
+    blocks = run_vetoes("BTCUSDT", "BULLISH", None, snap, entry_px=100.0)
+    codes = blocks_by_code(blocks)
+    assert "cvd_imbalance" not in codes
