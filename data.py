@@ -48,6 +48,7 @@ from config import (
     KLINES_FALLBACK_ENABLED,
     KLINES_LIMIT,
     KLINES_TTL_SEC,
+    MARKET_DATA_FALLBACK_BINANCE,
     MIN_CANDLES,
     ORDER_BOOK_DEPTH_LIMIT,
 )
@@ -69,6 +70,15 @@ _OKX_BASE = "https://www.okx.com"
 _GATEIO_BASE = "https://api.gateio.ws"
 _GATEIO_INTERVAL = {
     "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1d",
+}
+
+# Binance Futures klines (user feature 2026-10-16: MARKET_DATA_FALLBACK_BINANCE).
+# Used when OKX is unreachable and the knob is enabled. Binance supports all
+# our intervals natively.
+_BINANCE_BASE = "https://fapi.binance.com"
+_BINANCE_INTERVAL = {
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
     "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1d",
 }
 
@@ -229,28 +239,42 @@ class MarketData:
 
     def _klines_with_fallback(self, symbol: str, interval: str,
                               limit: int) -> list[dict]:
-        """OKX first; Gate.io futures only if the opt-in knob allows it.
+        """OKX first; Gate.io / Binance futures only if the opt-in knobs allow.
 
-        Default (KLINES_FALLBACK_ENABLED=False) = historical fail-closed
+        Default (KLINES_FALLBACK_ENABLED=False,
+        MARKET_DATA_FALLBACK_BINANCE=False) = historical fail-closed
         behavior: OKX down -> RuntimeError, never another venue's tape.
-        Opt-in fallback exists for data continuity; fallback candles are
-        tagged with "source": "gateio" so callers can tell venues apart.
-        Both down -> RuntimeError (still fail-closed).
+        Opt-in fallbacks exist for data continuity; fallback candles are
+        tagged with "source": "gateio" / "binance" so callers can tell
+        venues apart. All down -> RuntimeError (still fail-closed).
         """
+        okx_err = None
         try:
             return self._okx_klines(symbol, interval, limit)
         except Exception as exc:
-            if not KLINES_FALLBACK_ENABLED:
+            okx_err = exc
+            if not KLINES_FALLBACK_ENABLED and not MARKET_DATA_FALLBACK_BINANCE:
                 raise
-            log.warning("OKX klines failed for %s %s (%r); "
-                        "trying Gate.io fallback", symbol, interval, exc)
+            log.warning("OKX klines failed for %s %s (%r); trying fallbacks",
+                        symbol, interval, exc)
+        # Gate.io fallback (PDF hardening, opt-in)
+        if KLINES_FALLBACK_ENABLED:
             try:
                 return self._gateio_klines(symbol, interval, limit)
             except Exception as gexc:
-                raise RuntimeError(
-                    f"klines unavailable for {symbol} {interval}: "
-                    f"OKX failed ({exc!r}), Gate.io failed ({gexc!r})"
-                ) from gexc
+                log.debug("Gate.io klines fallback failed for %s: %r", symbol, gexc)
+        # Binance fallback (user feature 2026-10-16, opt-in)
+        if MARKET_DATA_FALLBACK_BINANCE:
+            try:
+                candles = self._binance_klines(symbol, interval, limit)
+                log.info("OKX klines unavailable for %s (%s); fell back to Binance",
+                         symbol, okx_err)
+                return candles
+            except Exception as bexc:
+                log.debug("Binance klines fallback failed for %s: %r", symbol, bexc)
+        raise RuntimeError(
+            f"klines unavailable for {symbol} {interval}: OKX failed ({okx_err!r})"
+        )
 
     def _gateio_klines(self, symbol: str, interval: str,
                        limit: int) -> list[dict]:
@@ -285,6 +309,37 @@ class MarketData:
                     "close_time": t + dur - 1, "source": "gateio",
                 })
             except (KeyError, TypeError, ValueError):
+                continue
+        out.sort(key=lambda c: c["open_time"])
+        return out[-limit:]
+
+    def _binance_klines(self, symbol: str, interval: str, limit: int) -> list[dict]:
+        """Binance USDT-M futures klines, normalized to the same candle dicts
+        as _okx_klines, plus a "source" tag. (User feature 2026-10-16.)"""
+        bar = _BINANCE_INTERVAL.get(interval, interval)
+        sym = normalize_symbol(symbol)
+        req_limit = min(max(limit + 2, 80), 500)
+        url = f"{_BINANCE_BASE}/fapi/v1/klines"
+        r = self.session.get(url, params={"symbol": sym, "interval": bar, "limit": req_limit},
+                             timeout=HTTP_TIMEOUT_SEC)
+        r.raise_for_status()
+        rows = r.json()
+        if not isinstance(rows, list):
+            raise ValueError(f"Binance invalid klines response for {sym}")
+        now_ms = int(time.time() * 1000)
+        dur = _INTERVAL_MS[interval]
+        out = []
+        for k in rows:
+            try:
+                t = int(k[0])
+                if t + dur > now_ms:
+                    continue  # in-progress candle, skip
+                out.append({
+                    "open_time": t, "open": float(k[1]), "high": float(k[2]),
+                    "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
+                    "close_time": t + dur - 1, "source": "binance",
+                })
+            except (IndexError, TypeError, ValueError):
                 continue
         out.sort(key=lambda c: c["open_time"])
         return out[-limit:]
@@ -341,7 +396,10 @@ class MarketData:
     # ---------------------------------------------------------- live price
     def get_live_price(self, symbol: str) -> float | None:
         """Live last price for the freshness gate (GAS: freshnessCheck_ L5075)
-        from the OKX perpetual ticker — OKX is the only signal venue.
+        from the OKX perpetual ticker — OKX is the primary signal venue.
+
+        When MARKET_DATA_FALLBACK_BINANCE is enabled and OKX fails, falls
+        back to the Binance Futures ticker price (user feature 2026-10-16).
 
         Returns None on ANY failure — the caller must fail closed, never
         treat a missing price as "fine" (audit C2: GAS returned ok:true on
@@ -359,8 +417,21 @@ class MarketData:
                 price = float(data[0].get("last") or 0)
                 if price > 0:
                     return price
-        except Exception:  # noqa: BLE001 - fail closed, return None
+        except Exception:  # noqa: BLE001 - try Binance fallback below
             pass
+
+        if MARKET_DATA_FALLBACK_BINANCE:
+            try:
+                r2 = self.session.get(
+                    f"{_BINANCE_BASE}/fapi/v1/ticker/price",
+                    params={"symbol": symbol},
+                    timeout=HTTP_TIMEOUT_SEC)
+                if r2.status_code == 200:
+                    px = float(r2.json().get("price") or 0)
+                    if px > 0:
+                        return px
+            except Exception:  # noqa: BLE001
+                pass
         return None
 
     # ---------------------------------------------------------- derivatives
