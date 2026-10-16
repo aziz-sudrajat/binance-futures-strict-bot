@@ -209,6 +209,102 @@ def _install_shutdown_handlers(executor) -> threading.Event:
     return event
 
 
+def _health_report(executor: "Executor") -> dict:
+    """Collect a minimal health snapshot for monitoring / systemd watchdog.
+
+    Returns a dict with position count, kill-switch state, balance, mode,
+    and process uptime. Used by --health flag and external monitors.
+    (User feature 2026-10-16.)
+    """
+    state = executor.state
+    risk = executor.risk
+    exchange = executor.exchange
+    positions = 0
+    if state and hasattr(state, "get"):
+        positions = len([p for p in state.get("positions", {}).values()
+                         if not p.get("closed")])
+    ks_active = False
+    if risk and hasattr(risk, "kill_switch_active"):
+        ks_active = risk.kill_switch_active()
+    bal = 0.0
+    if exchange and hasattr(exchange, "get_balance"):
+        try:
+            b = exchange.get_balance()
+            if b is not None:
+                bal = float(b)
+        except Exception:
+            pass
+    uptime = 0
+    try:
+        with open("/proc/self/stat", "r", errors="replace") as f:
+            parts = f.read().split()
+        clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        start_ticks = int(parts[21])
+        uptime = max(0, int(time.time() - start_ticks / clk_tck))
+    except Exception:
+        pass
+    return {
+        "status": "ok",
+        "mode": executor.mode if hasattr(executor, "mode") else "?",
+        "uptime_s": uptime,
+        "positions_active": positions,
+        "kill_switch_active": ks_active,
+        "balance_usdt": bal,
+    }
+
+
+def _recent_notable_events(lifecycle: LifecycleLogger,
+                           cycle_start_ms: int) -> list[dict]:
+    """Read only the tail of the lifecycle log, never the whole file.
+
+    The lifecycle file is append-only and events are written in
+    non-decreasing timestamp order, so all events with ts >= cycle_start_ms
+    are contiguous near the end. Walking back from the file end is O(fixed)
+    no matter how many events the bot has logged (the old implementation
+    called read_all() every cycle, i.e. O(n) per cycle / O(n^2) total).
+    (User feature 2026-10-16.)
+    """
+    notable: list[dict] = []
+    try:
+        with open(lifecycle.path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            if size == 0:
+                return notable
+            buffer = 1024 * 1024  # 1MB tail window
+            f.seek(max(0, size - buffer))
+            data = f.read().decode("utf-8", errors="replace")
+            lines = data.splitlines()
+            for line in reversed(lines):
+                if not line.strip():
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = ev.get("ts")
+                if not isinstance(ts, (int, float)):
+                    continue
+                if ts >= cycle_start_ms and ev.get("state") in _NOTABLE_STATES:
+                    notable.append({
+                        "ts": ev.get("ts"),
+                        "symbol": ev.get("symbol"),
+                        "state": ev.get("state"),
+                        "qty": ev.get("qty"),
+                        "entry": ev.get("entry"),
+                        "price": ev.get("price"),
+                        "pnl": ev.get("pnl"),
+                    })
+                # events are append-ordered; the first ts < cutoff ends the
+                # window (all earlier events are behind us)
+                elif ts < cycle_start_ms:
+                    break
+    except OSError as e:
+        log.warning("last_run: could not read lifecycle (%s)", e)
+    notable.sort(key=lambda e: e.get("ts", 0))
+    return notable
+
+
 def _parse_leverage_tiers(spec: str | None) -> dict | None:
     """Parse 'BTCUSDT=20,ETHUSDT=20' into a dict. None -> config default."""
     if not spec:
@@ -345,22 +441,7 @@ def _write_last_run(mode: str, lifecycle: LifecycleLogger,
     instead of parsing the whole lifecycle log (keeps the worker fast and
     prevents duplicate "new event" reports when its watermark lags).
     """
-    notable = []
-    try:
-        for ev in lifecycle.read_all():
-            if ev.get("ts", 0) >= cycle_start_ms \
-                    and ev.get("state") in _NOTABLE_STATES:
-                notable.append({
-                    "ts": ev.get("ts"),
-                    "symbol": ev.get("symbol"),
-                    "state": ev.get("state"),
-                    "qty": ev.get("qty"),
-                    "entry": ev.get("entry"),
-                    "price": ev.get("price"),
-                    "pnl": ev.get("pnl"),
-                })
-    except OSError as e:
-        log.warning("last_run: could not read lifecycle (%s)", e)
+    notable = _recent_notable_events(lifecycle, cycle_start_ms)
     payload = {
         "mode": mode,
         "run_ts_ms": int(time.time() * 1000),
