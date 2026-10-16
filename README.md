@@ -1,10 +1,22 @@
-# Binance Futures Bot — STRICT Signal Engine + Testnet Executor
+# Binance Futures Bot — Auto Trading (Signal Engine + Executor)
 
-> Phase 1: STRICT signal engine (paper mode). Phase 2: testnet executor
-> (`executor.py`, `risk.py`, `state.py`, `exchange.py`, `run_executor.py`).
-> Phase 3: live mainnet mode (`--live`) — real orders on Binance Futures
-> mainnet, requires `BINANCE_LIVE_KEY`/`BINANCE_LIVE_SECRET`, and refuses all
-> TEST ONLY flags. Run it only from a non-geo-blocked host.
+> Bot auto-trading Binance Futures: signal engine STRICT/mode ganda +
+> executor live (uang asli) / paper / testnet. Data sinyal dari OKX,
+> eksekusi via Binance Futures API. Dijalankan dari host yang tidak
+> kena geo-block Binance (laptop user / VPS region aman).
+
+## Fitur utama
+
+| Fitur | Keterangan |
+|---|---|
+| **Mode sinyal** | `ketat` / `sedang` / `biasa` — preset berlapis, knob bisa di-fine-tune manual |
+| **MTF cascade** | 4h → 1h → 30m → 15m → 5m harus selaras (fail-closed) |
+| **Veto** | 6 hard veto derivatif + zona support/resistance (4h, 2.5× ATR) |
+| **Satu posisi per coin** | Bot tidak pernah buka 2 posisi di coin yang sama |
+| **Profit-take otomatis** | Market-close seluruh posisi saat unrealized profit tembus +20% margin |
+| **Bracket** | SL + TP1/TP2/TP3 + breakeven move otomatis |
+| **Risk** | Max 3 posisi, exposure cap, kill switch daily-loss |
+| **Signal watch** | Scanner VM kirim signal terbaik saat host live offline |
 
 ## Terminal interaktif: `binance`
 
@@ -48,12 +60,13 @@ auto-trade jalan. TUI curses lama (`tui.py`) tetap ada sebagai alternatif.
 | | ketat | sedang | biasa |
 |---|---|---|---|
 | **15m indikator** (MACD, MA/EMA, RSI) | ✅ | ✅ | ✅ |
-| **MTF 4h/1h/30m/15m selaras** | ✅ | ✅ | — |
+| **MTF 4h/1h/30m/15m/5m selaras** | ✅ | ✅ | — |
 | **Arah BTC selaras** | ✅ | ✅ | — |
 | **Pattern** (engulfing/hammer/star) | ✅ | — | — |
 | **News** (sentimen CoinTelegraph) | ✅ | — | — |
 | **Likuidasi** (spike review) | ✅ | — | — |
 | **Whale** (top-trader review) | ✅ | — | — |
+| **Veto S/R** (zona support/resistance 4h) | ✅ | ✅ | — |
 | **Veto + derivatif + quality gate** | ✅ (≥70) | — | — |
 | Min quality | 70 | 60 | 50 |
 | Bullish only | ya | ya | tidak (LONG+SHORT) |
@@ -61,8 +74,19 @@ auto-trade jalan. TUI curses lama (`tui.py`) tetap ada sebagai alternatif.
 | Freshness drift | 0.4% | 0.6% | 1.0% |
 
 - `biasa`: sinyal = setup 15m saja (MACD, MA/EMA, RSI). Bidirectional.
-- `sedang`: biasa + semua TF (4h, 1h, 30m, 15m) harus satu arah + arah BTC 15m harus sama.
-- `ketat`: sedang + review pattern, news, likuidasi, whale, + veto/derivatif/quality gate penuh.
+- `sedang`: biasa + semua TF (4h, 1h, 30m, 15m, 5m) harus satu arah + arah BTC 15m harus sama.
+- `ketat`: sedang + review pattern, news, likuidasi, whale, + veto/derivatif/quality gate penuh + veto S/R.
+
+### Proteksi posisi
+
+- **Satu posisi per coin**: executor menolak entry baru jika coin tersebut
+  sudah punya posisi terbuka (arah apa pun). Mencegah double-entry seperti
+  insiden WCTUSDT 2026-10-16.
+- **Profit-take otomatis** (`profit_take_pct`, default 20): begitu unrealized
+  profit tembus +20% dari margin (misal margin $1 → profit $0.2), seluruh
+  posisi di-market-close. Tercatat sebagai event `profit_take` di lifecycle.
+- **Veto S/R** (`sr_zone`): menolak SHORT ke area support dan LONG ke area
+  resistance (histori 4h ~2–3 bulan, zona 2.5× ATR). Aktif di mode ketat/sedang.
 
 Mode adalah preset, bukan kunci — knob individual tetap bisa di-fine-tune
 manual setelahnya (`set` / editor `setting`). Berlaku tanpa restart.
@@ -123,10 +147,8 @@ chart-pattern vetoes remain out (audit: keep out until calibrated).
       ▼
 Liquidity    → 24h volume ≥ $2M? (fail-closed: unavailable volume REJECTS)
       ▼
-MTF cascade  → 4h trend BULLISH? → 1d trend BULLISH? → 30m BULLISH WATCH?
-      │  (mtfTrendDirection_: price > EMA21 > EMA50, EMA21 rising;
-      │   30m leg per MTF_30M_MODE, default STRICT — stricter than GAS LEAN;
-      │   any MTF fetch exception REJECTS)
+MTF cascade  → 4h → 1h → 30m → 15m → 5m selaras?
+      │  (semua timeframe harus satu arah; fail-closed)
       ▼
 Derivatives  → funding + open-interest REQUIRED (missing → HOLD, never
                neutral); long/short + taker optional but flagged →
@@ -523,52 +545,15 @@ Dependencies: `requests` only (`pytest` for tests). `python-binance` is the
 planned Phase 2 dependency for signed order placement — deliberately not
 included yet so Phase 1 *cannot* place orders.
 
-## Test report (2026-10-14)
+## Test report (2026-10-16)
 
-- `tests/test_indicators.py` — 6 tests: hand-computed EMA values, RSI extremes,
-  MACD histogram sign on accelerating/decelerating series, Wilder ATR seeding +
-  smoothing, ADX on trend vs flat, short-input guards. **Pass.**
-- `tests/test_engine.py` — 27 tests: bullish/bearish/neutral detection on
-  synthetic candles, exact trade-plan math (entry/SL/TP1-3/RR), ATR guard,
-  hand-computed `smartCryptoScore_` (110 → quality rank 80), derivatives-score
-  components, quality gate with explicit named components (replaces the old
-  synthetic deriv blend), MTF trend
-  direction, STRICT 30m confirm, LEAN 30m confirm (GAS-parity branch),
-  cascade pass/fail stages incl. neutral-lean 30m rejection (T5), full
-  `evaluate_symbol` pass + rejection paths (bearish, low volume, volume
-  unavailable (T12), weak strength, stale live-price entry (T1), ticker
-  failure (T1), derivatives total failure (T2), optional derivatives gap
-  flagged, MTF 1d exception (T13)). **Pass.**
-- `tests/test_vetoes.py` — 27 tests (roadmap item 2): hand-computed
-  leverage-risk / squeeze-risk formulas (GAS L1016-1034), BTC 1h change math,
-  each veto firing on synthetic data (T4), BTC −3%/1h vetoing all symbols /
-  −2% not vetoing / data failure holding (T3), fail-closed holds for
-  derivatives/book/BTC outages, veto + hold end-to-end rejections, and the
-  regression that a pre-veto passing signal still passes. **Pass.**
-- `tests/test_quality_deltas.py` — 19 tests (roadmap item 3): every
-  warn-tier component hand-computed against the GAS source (mtf 30m/4h tiers,
-  1h trend +8/−10, BTC −2% −15, leverage −10, funding +5, squeeze −8,
-  whale −12, smart-money score 73 hand-computed + ±6 tiers, liquidation-event
-  −15, liq-wall warn −8 incl. the NaN-bug regression guard), delta clamp
-  ±40, and T7 quality boundaries 66/69/70/76/86 → reject/reject/accept/
-  accept/accept, plus the proof that real negative deltas can now pull a
-  strength-4 signal below 70. **Pass.**
-- `tests/test_integration.py` — 4 tests against real public endpoints
-  (BTCUSDT): klines structure/order/closed-candle, cache hit, 24h volume,
-  derivatives snapshot shape. **Pass** (derivatives served via Gate.io fallback;
-  Binance mainnet returns HTTP 451 geo-block from this network).
+Full suite: **381 passed, 0 failed** (`pytest tests/ -q`).
 
-**83 passed, 0 failed.**
-
-- `tests/test_backtest.py` — 10 tests (roadmap item 4): T8 hand-computed
-  trade simulation (entry → TP1 → TP2 → breakeven stop, exact pnl/fees/
-  funding/R), T12 same-candle SL+TP → conservative SL-first, NO_ENTRY on
-  untouched/expired signals, MAX_HOLD market close, BacktestMarket
-  no-look-ahead + insufficient-data fail-closed, degraded-mode pipeline
-  wiring, hand-checked metrics math (win rate, expectancy, PF, max DD,
-  consecutive wins/losses). **Pass.**
-
-**93 passed, 0 failed.**
+Mencakup: indikator (EMA/RSI/MACD/ATR/ADX), engine (bullish/bearish/neutral,
+trade-plan math, MTF cascade 5 timeframe, quality gate), vetoes (6 hard veto
++ S/R), quality deltas, integration (real public endpoints), backtest
+(hand-computed), executor (bracket placement, breakeven, profit-take,
+one-position-per-coin, reconcile attribution), report & lifecycle.
 
 ## Threshold decision (roadmap item 3, 2026-10-14)
 
