@@ -809,13 +809,18 @@ class Executor:
         entry_type = "MARKET" if in_zone else "LIMIT"
         tick = filters.get("tickSize", 0) or 0
         entry_px = quantize_price(entry, tick)
+        # Post-only (GTX) entries: maker-only, never cross the spread.
+        # Opt-in via EXEC_POST_ONLY_ENTRY (user feature 2026-10-16).
+        tif = "GTX" if (entry_type == "LIMIT"
+                        and getattr(config, "EXEC_POST_ONLY_ENTRY", False)) else "GTC"
         order = self.exchange.place_order(
             symbol, entry_side, entry_type,
             quantity=qty,
             price=None if entry_type == "MARKET" else entry_px,
+            time_in_force=tif,
             client_order_id=self._leg_id(pos_id, "EN"))
         if not order:
-            return self._reject(symbol, sid, "entry order placement failed")
+            return self._reject(symbol, sid, f"entry order placement failed (type={entry_type}, tif={tif})")
 
         self.state.get("positions", {})[pos_id] = {
             "symbol": symbol, "signal_id": sid, "direction": direction,
@@ -1530,6 +1535,7 @@ class Executor:
             self._close_reconciled_positions(rec["closed"])
         except Exception:  # noqa: BLE001 - paper broker always succeeds
             log.exception("startup reconcile failed")
+        self.cleanup_orphan_orders()
         n = 0
         while not self.shutdown_event.is_set():
             log.info("--- scan cycle %d ---", n + 1)
@@ -1558,3 +1564,49 @@ class Executor:
         except Exception:  # noqa: BLE001 - best-effort flush on exit
             log.exception("shutdown: state.save failed")
         log.warning("executor loop exited cleanly after %d cycle(s)", n)
+
+    def cleanup_orphan_orders(self) -> list[str]:
+        """Cancel open exchange orders that don't belong to any active managed position.
+
+        Orphans happen when a run crashes after placing orders but before
+        tracking them in state. Opt-in via CANCEL_ORPHAN_ORDERS_ON_STARTUP
+        (user feature 2026-10-16). Returns list of "SYMBOL:orderId" cancelled.
+        """
+        if not getattr(config, "CANCEL_ORPHAN_ORDERS_ON_STARTUP", True):
+            return []
+        cancelled = []
+        try:
+            get_open = getattr(self.exchange, "get_open_orders", None)
+            if not callable(get_open):
+                return []
+            open_orders = get_open()
+            if not open_orders:
+                return []
+            known_order_ids = set()
+            for pos in self.state.get("positions", {}).values():
+                if pos.get("closed"):
+                    continue
+                if pos.get("entry_order_id"):
+                    known_order_ids.add(str(pos["entry_order_id"]))
+                if pos.get("sl_order_id"):
+                    known_order_ids.add(str(pos["sl_order_id"]))
+                for leg in ("tp1", "tp2", "tp3"):
+                    tp_data = pos.get("tp", {}).get(leg, {})
+                    if tp_data.get("order_id"):
+                        known_order_ids.add(str(tp_data["order_id"]))
+
+            for o in open_orders:
+                oid = str(o.get("orderId", ""))
+                sym = o.get("symbol", "")
+                if oid and oid not in known_order_ids:
+                    log.warning("Cancelling orphan order %s (%s %s @ %s) not tracked in state",
+                                oid, sym, o.get("side"), o.get("price"))
+                    try:
+                        ok = self.exchange.cancel_order(sym, order_id=int(oid))
+                        if ok:
+                            cancelled.append(f"{sym}:{oid}")
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            log.exception("cleanup_orphan_orders failed")
+        return cancelled
