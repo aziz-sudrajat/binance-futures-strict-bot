@@ -22,15 +22,38 @@ Safety properties (see ~/workspace/skills/quant-trading/SKILL.md):
   - fail-closed on any missing data, failed exchange call, or risk breach
   - kill switch, max positions, per-symbol exposure cap (risk.py)
   - testnet ONLY: base URL defaults to the Binance Futures testnet
+
+Module map (item 3.5 code-smell note — deliberately NOT split: this is
+the live-money core and a mechanical split risks regressions for zero
+behavioral gain; the sections below are the documented boundaries):
+  - Executor.__init__ / _dash_settings / _effective_* / _resolve_leverage
+      (~270-383): construction + per-cycle effective risk resolution
+  - scan_once / scan_from_db / _apply_tradability_prefilter / _scan_symbol
+      (~384-578): signal intake (DB + direct), prefilter, per-symbol eval
+  - manual_entry / preview_manual_entry (~579-683): operator-initiated entry
+  - _try_open / _reject (~684-827): the ONE order-placement path
+      (freshness re-check, risk gates, idempotency key)
+  - _manage_positions / _manage_one (~828-963): per-cycle position upkeep
+  - _check_entry_fill / _expire_stale_entry (~964-1014): entry lifecycle
+  - _place_brackets / _sl_cancel / _sl_status / _move_sl_to_breakeven
+      (~1015-1120): bracket orders (SL + TP1-3)
+  - _classify_vanished_close / _close_position / _mark_pending_close /
+    _flat_position / _take_profit / _trail_check /
+    _close_reconciled_positions (~1121-1481): exits, TP/SL/trailing,
+      orphan reconciliation
+  - _entry_filled / run_loop (~1482-end): main loop, graceful shutdown,
+      heartbeat, state flush
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 
 import config
+import wsfeed
 from lifecycle import LifecycleLogger
 from lifecycle import (
     GENERATED, APPROVED, REJECTED, ENTRY_TRIGGERED, POSITION_OPENED,
@@ -43,6 +66,24 @@ log = logging.getLogger("executor")
 _FEE_PCT = 0.05  # fee estimate per fill for PnL accounting (matches backtest)
 _ENTRY_TIMEOUT_MINUTES = 30  # cancel an unfilled entry limit order after
                             # this long (user 2026-10-16; was 6h)
+_CLOSE_DUST_QTY = 1e-9  # residual below this after a market close counts as
+                       # fully closed (float noise, not a real position)
+
+
+def _signal_age_hours(row: dict) -> float:
+    """Age of a signals.db row in hours, from its created_at (ms).
+
+    Missing/unparseable created_at -> +inf (fail-closed: treated as stale,
+    never executed). Per quant discipline: unverifiable data = no decision.
+    """
+    try:
+        created_ms = float(row.get("created_at") or 0)
+    except (TypeError, ValueError):
+        created_ms = 0.0
+    if created_ms <= 0:
+        return float("inf")
+    age_h = (time.time() * 1000.0 - created_ms) / 3_600_000.0
+    return max(0.0, age_h)  # clock skew (created_at in the future) -> 0
 
 
 def signal_candle_close_ms(market, symbol: str) -> int:
@@ -274,6 +315,12 @@ class Executor:
         self.poll_interval_min = poll_interval_min
         # Which dashboard settings section applies ("live"/"testnet"/"paper").
         self.settings_mode = settings_mode or "live"
+        # Graceful shutdown (1.3): run_executor installs SIGINT/SIGTERM
+        # handlers that SET this event (never raise), so an in-flight scan
+        # cycle — including any HTTP order request — is never interrupted
+        # mid-flight. run_loop checks it only at safe points (between
+        # cycles), finishes the current cycle, flushes state, exits cleanly.
+        self.shutdown_event = threading.Event()
         # TEST MODE overrides (never for live): fixed margin per position and
         # explicit leverage, bypassing the RISK_PCT_PER_TRADE/MAX_LEVERAGE
         # defaults. Risk gates (kill switch, caps) still apply downstream.
@@ -436,6 +483,20 @@ class Executor:
             for row in rows:
                 sid = row["signal_id"]
                 symbol = row["symbol"]
+                # Live signal expiry (1.4): absolute age gate on created_at,
+                # independent of the scanner-set expires_at. After an executor
+                # crash/restart a row can linger past its usefulness; stale =
+                # fail-closed (marked consumed, logged, never entered).
+                age_h = _signal_age_hours(row)
+                if age_h > config.LIVE_SIGNAL_EXPIRY_HOURS:
+                    self.lifecycle.log(
+                        sid, symbol, REJECTED,
+                        reason=(f"stale db signal: age {age_h:.1f}h > "
+                                f"LIVE_SIGNAL_EXPIRY_HOURS="
+                                f"{config.LIVE_SIGNAL_EXPIRY_HOURS}h"))
+                    db.mark_consumed(row["id"])
+                    summary["rejected"] += 1
+                    continue
                 if self.state.seen_signal(sid):
                     self.lifecycle.log(sid, symbol, REJECTED,
                                        reason="duplicate signal id (db)")
@@ -658,8 +719,11 @@ class Executor:
         # 1. Freshness re-check with a LIVE price, right before ordering.
         # Mirrors the engine gate: LONG rejects price ran above the zone,
         # SHORT rejects price ran below the zone.
+        # Item 2.5: price comes from the OKX WS ticker cache when fresh;
+        # wsfeed.get_live_price() falls back to REST automatically, so
+        # this stays fail-closed exactly as before.
         try:
-            live = self.market.get_live_price(symbol)
+            live = wsfeed.get_live_price(symbol, self.market.get_live_price)
         except Exception:  # noqa: BLE001
             live = None
         if live is None or live <= 0:
@@ -845,6 +909,29 @@ class Executor:
         if pos["qty"] <= 0:
             self._close_position(pos_id, pos, sid, summary)
             return
+        # Pending-close retry: a previous _flat_position attempt cancelled
+        # the brackets and then partially filled (or filled nothing, or the
+        # order failed). The residual has NO exchange-side protection, so
+        # the close is retried UNCONDITIONALLY until done — never gated on
+        # the original trigger firing again (a retreated price must not
+        # strand an unprotected residual). Fail-closed: no live price ->
+        # skip this cycle, never close blind.
+        # If the retry did not finish the job, FALL THROUGH (no return):
+        # a still-hot trigger may retry immediately below, and the
+        # end-of-cycle cross-check handles a residual that vanished
+        # externally (manual close / liquidation) via _close_position —
+        # without this, a vanished residual would retry forever.
+        pc = pos.get("pending_close")
+        if isinstance(pc, dict) and pos["qty"] > 0:
+            mark = self.market.get_live_price(symbol)
+            if mark:
+                self._flat_position(
+                    pos_id, pos, sid, summary, mark,
+                    pc.get("closed_reason") or "pending_close",
+                    pc.get("lifecycle_state") or PROFIT_TAKE,
+                    reason=pc.get("reason") or "pending close retry")
+                if pos.get("closed"):
+                    return
         # Profit-take: market-close the whole position once unrealized PnL
         # reaches +PROFIT_TAKE_PCT% of margin (user 2026-10-16: "+20%
         # langsung TP", live). Fail-closed: no live price -> skip this
@@ -1165,6 +1252,7 @@ class Executor:
                 self.exchange.cancel_order(symbol, order_id=oid)
         if pos.get("sl_order_id"):
             self._sl_cancel(symbol, pos)
+        pos.pop("pending_close", None)  # any armed retry is moot once closed
         pos["closed"] = True
         pos["closed_reason"] = why
         pos["closed_at"] = int(time.time() * 1000)
@@ -1184,6 +1272,18 @@ class Executor:
         summary["managed"] += 1
         self.state.save()
 
+    def _mark_pending_close(self, pos: dict, closed_reason: str,
+                            lifecycle_state: str, reason: str) -> None:
+        """Arm the unconditional close retry for a residual left open by a
+        failed/partial/zero market close. The brackets are already
+        cancelled at this point, so the residual must never wait on the
+        original trigger — _manage_one retries _flat_position until done.
+        Persisted in state so the retry survives a restart."""
+        pos["pending_close"] = {"closed_reason": closed_reason,
+                                "lifecycle_state": lifecycle_state,
+                                "reason": reason}
+        self.state.save()
+
     def _flat_position(self, pos_id: str, pos: dict, sid: str,
                        summary: dict, mark_px: float, closed_reason: str,
                        lifecycle_state: str, reason: str = "") -> None:
@@ -1191,8 +1291,13 @@ class Executor:
 
         Shared by profit_take / trail_stop / time_stop. Realized PnL is
         computed from the actual fill (fees deducted). A terminal lifecycle
-        event is logged. Callers decide when to invoke; this never triggers
-        on its own.
+        event is logged once the position is fully closed. A partial market
+        fill does NOT mark the position closed: only the filled qty is
+        accounted (non-terminal event), the residual stays under management
+        and the close is retried UNCONDITIONALLY via pos["pending_close"]
+        (never gated on the original trigger — the residual has no
+        exchange-side protection left). Never a phantom flat.
+        Callers decide when to invoke; this never triggers on its own.
         """
         symbol = pos["symbol"]
         direction = pos.get("direction", "LONG")
@@ -1214,26 +1319,64 @@ class Executor:
         if not order:
             log.warning("%s %s market close failed, retry next cycle",
                         pos_id, closed_reason)
+            self._mark_pending_close(pos, closed_reason, lifecycle_state,
+                                     reason)
+            return
+        # Partial-fill guard: a MARKET close can partially fill (fast market,
+        # reduce-only clamp). Never mark a phantom flat — account only what
+        # actually filled and keep the residual under management; the close
+        # is retried next cycle by the pending_close path above, NOT gated
+        # on the original trigger. Mirrors the executedQty handling of the
+        # TP-leg fill path.
+        status = str(order.get("status") or "").upper()
+        exec_raw = order.get("executedQty")
+        if exec_raw is None:
+            # Wrapper omitted fill info (e.g. test fakes): trust FILLED as a
+            # full fill, anything else as no fill — never invent a quantity.
+            closed_qty = qty if status == "FILLED" else 0.0
+        else:
+            try:
+                closed_qty = min(qty, max(0.0, float(exec_raw)))
+            except (TypeError, ValueError):
+                log.warning("%s non-numeric executedQty %r — treating as "
+                            "no fill info", pos_id, exec_raw)
+                closed_qty = qty if status == "FILLED" else 0.0
+        if closed_qty <= 0:
+            log.warning("%s %s market close filled nothing (%s), "
+                        "retry next cycle", pos_id, closed_reason, status)
+            self._mark_pending_close(pos, closed_reason, lifecycle_state,
+                                     reason)
             return
         fill_px = float(order.get("avgPrice") or mark_px)
         sign = 1.0 if direction == "LONG" else -1.0
-        pnl = sign * (fill_px - pos["entry_price"]) * qty
-        fee = fill_px * qty * _FEE_PCT / 100
+        pnl = sign * (fill_px - pos["entry_price"]) * closed_qty
+        fee = fill_px * closed_qty * _FEE_PCT / 100
         net = pnl - fee
         pos["realized"] = pos.get("realized", 0.0) + net
         self.risk.record_realized(net)
-        pos["qty"] = 0.0
-        pos["closed"] = True
-        pos["closed_reason"] = closed_reason
-        pos["closed_at"] = int(time.time() * 1000)
-        pos["close_price"] = fill_px
+        remaining = qty - closed_qty
+        done = remaining <= _CLOSE_DUST_QTY
+        pos["qty"] = 0.0 if done else remaining
+        if done:
+            pos.pop("pending_close", None)
+            pos["closed"] = True
+            pos["closed_reason"] = closed_reason
+            pos["closed_at"] = int(time.time() * 1000)
+            pos["close_price"] = fill_px
+        else:
+            # Residual left open with brackets already cancelled: arm the
+            # unconditional retry so it can never strand unprotected.
+            self._mark_pending_close(pos, closed_reason, lifecycle_state,
+                                     reason)
         self.lifecycle.log(sid, symbol, lifecycle_state, price=fill_px,
-                           qty=qty, pnl=round(net, 4), terminal=True,
-                           reason=reason)
+                           qty=closed_qty, pnl=round(net, 4), terminal=done,
+                           reason=(reason if done else
+                                   f"{reason} (partial fill, "
+                                   f"{remaining:g} remaining)"))
         summary["managed"] += 1
         self.state.save()
-        log.info("%s %s closed @ %s (pnl %+0.2f)", pos_id, closed_reason,
-                 fill_px, net)
+        log.info("%s %s closed @ %s (pnl %+0.2f)%s", pos_id, closed_reason,
+                 fill_px, net, "" if done else f" — {remaining:g} remaining")
 
     def _take_profit(self, pos_id: str, pos: dict, sid: str,
                      summary: dict, mark_px: float) -> None:
@@ -1370,6 +1513,13 @@ class Executor:
 
         from_db=True takes signals from the scanner's signals.db instead of
         scanning the market directly (two-stage pipeline).
+
+        Graceful shutdown (1.3): a SIGINT/SIGTERM handler installed by
+        run_executor sets self.shutdown_event. The event is checked only at
+        safe points (between cycles) — an in-flight cycle, including any
+        order placement, always runs to completion; then state is flushed
+        and the loop exits. The pause between cycles is event.wait() so a
+        shutdown received during the pause wakes the loop immediately.
         """
         # Startup reconcile: adopt/close vs the real exchange state.
         try:
@@ -1381,7 +1531,7 @@ class Executor:
         except Exception:  # noqa: BLE001 - paper broker always succeeds
             log.exception("startup reconcile failed")
         n = 0
-        while True:
+        while not self.shutdown_event.is_set():
             log.info("--- scan cycle %d ---", n + 1)
             try:
                 summary = (self.scan_from_db(db_path) if from_db
@@ -1390,6 +1540,21 @@ class Executor:
             except Exception:  # noqa: BLE001 - the loop must survive
                 log.exception("scan cycle failed")
             n += 1
+            # Heartbeat for the dashboard /api/health check (read by the
+            # dashboard only; never fatal to the trading loop).
+            try:
+                self.state.set("last_cycle_ts", int(time.time() * 1000))
+                self.state.save()
+            except OSError:
+                log.warning("heartbeat: state.save failed")
             if stop_after is not None and n >= stop_after:
                 break
-            time.sleep(self.poll_interval_min * 60)
+            # wait() returns True (and we break) when the shutdown event is
+            # set; otherwise it sleeps the full interval like time.sleep did.
+            if self.shutdown_event.wait(self.poll_interval_min * 60):
+                break
+        try:
+            self.state.save()
+        except Exception:  # noqa: BLE001 - best-effort flush on exit
+            log.exception("shutdown: state.save failed")
+        log.warning("executor loop exited cleanly after %d cycle(s)", n)
