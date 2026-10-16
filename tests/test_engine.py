@@ -1,3 +1,10 @@
+# Copyright (c) 2026 aziz-sudrajat <azizsudrajat.stb4@gmail.com>
+# https://github.com/aziz-sudrajat
+#
+# All rights reserved. This file is part of the binance-futures-strict-bot project.
+# Unauthorized copying, modification, distribution, or false claim of
+# authorship is prohibited.
+
 """Unit tests for signal_engine.py with synthetic candles.
 
 Verifies the STRICT decision pipeline against the GAS logic:
@@ -227,7 +234,7 @@ class FakeMarket:
 
     def __init__(self, bullish=True):
         gen = bull_candles if bullish else bear_candles
-        self.klines = {tf: gen() for tf in ("15m", "30m", "4h", "1d", "1h")}
+        self.klines = {tf: gen() for tf in ("5m", "15m", "30m", "4h", "1d", "1h")}
         # Inject a supporting candlestick pattern into the last 15m candle
         # so the ketat pattern review passes on synthetic data.
         _inject_pattern(self.klines["15m"], bullish)
@@ -568,8 +575,8 @@ def test_mtf_1d_delta_soft_scoring():
 
 
 def test_biasa_preset_relaxes_1d_leg():
-    # User spec 2026-10-15: MTF is 4h/1h/30m/15m — no 1d leg in any mode.
-    # Aturan 2026-10-15: SEMUA mode (termasuk biasa) cek MTF 4h/1h/30m/15m.
+    # User spec 2026-10-15, cascade 2026-10-16: MTF is 4h/1h/30m/15m/5m — no 1d leg in any mode.
+    # Aturan 2026-10-15/16: SEMUA mode (termasuk biasa) cek MTF 4h/1h/30m/15m/5m.
     assert config.SIGNAL_MODE_PRESETS["ketat"]["mtf_require_1d"] is True
     assert config.SIGNAL_MODE_PRESETS["sedang"]["mtf_require_1d"] is False
     assert config.SIGNAL_MODE_PRESETS["biasa"]["mtf_require_1d"] is False
@@ -603,7 +610,7 @@ def _mode(monkeypatch):
 
 def test_biasa_mode_requires_mtf(_mode):
     # Aturan user 2026-10-15: SEMUA signal (termasuk biasa) cek MTF
-    # 4h/1h/30m/15m — MTF tak selaras = reject, bukan sekadar penalti.
+    # 4h/1h/30m/15m/5m — MTF tak selaras = reject, bukan sekadar penalti.
     _mode("biasa")
     m = FakeMarket(bullish=True)  # semua TF bullish -> MTF selaras
     signal, note = evaluate_symbol("ETHUSDT", m)
@@ -748,9 +755,19 @@ def test_mtf_alignment_check_unit():
     m = FakeMarket(bullish=True)
     ok, note = mtf_alignment_check("ETHUSDT", m, "BULLISH")
     assert ok, note
+    assert "4h/1h/30m/15m/5m" in note
     m.klines["1h"] = candles_from_closes([100.0] * 220)
     ok, note = mtf_alignment_check("ETHUSDT", m, "BULLISH")
     assert not ok and "1h=neutral" in note
+    # Cascade 2026-10-16: 5m leg must align too — a bearish 5m vetoes.
+    m2 = FakeMarket(bullish=True)
+    m2.klines["5m"] = bear_candles()
+    ok, note = mtf_alignment_check("ETHUSDT", m2, "BULLISH")
+    assert not ok and "5m=bearish" in note
+    # ...and a bearish 5m passes a BEARISH signal.
+    m3 = FakeMarket(bullish=False)
+    ok, note = mtf_alignment_check("ETHUSDT", m3, "BEARISH")
+    assert ok, note
 
 
 def test_btc_direction_check_unit():
