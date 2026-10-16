@@ -1385,3 +1385,28 @@ def test_has_terminal_event(rig):
     assert not lifecycle.has_terminal_event("sA")
     lifecycle.log("sA", "BTCUSDT", "tp1_hit", realized=1.25, terminal=True)
     assert lifecycle.has_terminal_event("sA")
+
+
+def test_one_position_per_coin_cap(rig):
+    # 2026-10-16 WCTUSDT incident: two SHORT entries stacked $2 margin on
+    # one coin. The second entry on an already-positioned symbol must be
+    # rejected, regardless of direction or signal quality.
+    executor, market, exchange, state, lifecycle, risk = rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    assert summary["opened"] == 1
+    assert len(executor._open_positions()) == 1
+    # Second signal on the same coin -> rejected, no new position.
+    summary2 = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+                "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary2)
+    assert summary2["opened"] == 0
+    assert summary2["rejected"] == 1
+    assert len(executor._open_positions()) == 1
+    # A different coin is unaffected.
+    summary3 = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+                "errors": []}
+    executor._scan_symbol("ETHUSDT", 10_000.0, summary3)
+    assert summary3["opened"] == 1
+    assert len(executor._open_positions()) == 2
