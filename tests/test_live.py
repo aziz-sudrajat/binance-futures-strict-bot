@@ -185,3 +185,63 @@ def test_balance_reports_exchange_error(monkeypatch, capsys):
     rc = main(["--live", "--balance"])
     assert rc == 1
     assert "unavailable" in capsys.readouterr().out
+
+
+# -------------------------------- listenKey auth (cyb fix 2026-10-17)
+class _CapturingSession:
+    """requests.Session stand-in capturing method/url/params/headers."""
+
+    def __init__(self, body=None):
+        self.calls = []
+        self._body = body
+
+    def request(self, method, url, params=None, headers=None, timeout=None):
+        self.calls.append({"method": method, "url": url,
+                           "params": dict(params or {}),
+                           "headers": dict(headers or {})})
+        body = self._body
+
+        class _R:
+            status_code = 200
+            text = "{}"
+
+            def json(self):
+                return body
+
+        return _R()
+
+
+def _listenkey_client(monkeypatch, body=None):
+    import rate_limiter
+    monkeypatch.setattr(rate_limiter, "wait", lambda *a, **k: True)
+    from exchange import ExchangeClient
+    sess = _CapturingSession(body=body or {})
+    return ExchangeClient("KEY123", "SECRET123", session=sess), sess
+
+
+def test_listenkey_create_sends_api_key_without_signature(monkeypatch):
+    client, sess = _listenkey_client(monkeypatch, {"listenKey": "k" * 60})
+    assert client.create_listen_key() == "k" * 60
+    call = sess.calls[0]
+    assert call["method"] == "POST"
+    assert call["headers"].get("X-MBX-APIKEY") == "KEY123"
+    assert "signature" not in call["params"]
+    assert "timestamp" not in call["params"]
+
+
+def test_listenkey_keepalive_sends_api_key_without_signature(monkeypatch):
+    client, sess = _listenkey_client(monkeypatch, {"listenKey": "k" * 60})
+    assert client.keepalive_listen_key() is True
+    call = sess.calls[0]
+    assert call["method"] == "PUT"
+    assert call["headers"].get("X-MBX-APIKEY") == "KEY123"
+    assert "signature" not in call["params"]
+
+
+def test_listenkey_close_sends_api_key_without_signature(monkeypatch):
+    client, sess = _listenkey_client(monkeypatch, {"listenKey": "k" * 60})
+    assert client.close_listen_key() is True
+    call = sess.calls[0]
+    assert call["method"] == "DELETE"
+    assert call["headers"].get("X-MBX-APIKEY") == "KEY123"
+    assert "signature" not in call["params"]
