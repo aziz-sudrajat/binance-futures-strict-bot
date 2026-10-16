@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 aziz-sudrajat <azizsudrajat.stb4@gmail.com>
+# https://github.com/aziz-sudrajat
+#
+# All rights reserved. This file is part of the binance-futures-strict-bot project.
+# Unauthorized copying, modification, distribution, or false claim of
+# authorship is prohibited.
+
 # Switch the bot between LIVE and DEMO key/mode.
 #
 #   source switch.sh live   -> mainnet keys, BOT_MODE=live (REAL MONEY)
