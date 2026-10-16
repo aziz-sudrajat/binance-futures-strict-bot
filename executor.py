@@ -47,6 +47,7 @@ behavioral gain; the sections below are the documented boundaries):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -407,6 +408,17 @@ class Executor:
     def _leg_id(self, pos_id: str, leg: str) -> str:
         # Binance clientOrderId: [a-zA-Z0-9-_], keep it short.
         return f"SHE-{pos_id[-14:]}-{leg}"
+
+    @staticmethod
+    def _entry_client_id(sid: str) -> str:
+        """Deterministic entry clientOrderId from the signal id (H7).
+
+        A retry of the same signal reuses the same clientOrderId, so
+        Binance rejects it as a duplicate instead of opening a second
+        position (exchange-side idempotency for the crash/timeout window).
+        """
+        h = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:16]
+        return f"SHE-{h}-EN"
 
     # ------------------------------------------------------------ scan loop
     def scan_once(self) -> dict:
@@ -813,12 +825,21 @@ class Executor:
         # Opt-in via EXEC_POST_ONLY_ENTRY (user feature 2026-10-16).
         tif = "GTX" if (entry_type == "LIMIT"
                         and getattr(config, "EXEC_POST_ONLY_ENTRY", False)) else "GTC"
+        # H7: mark the signal BEFORE placing the entry order. A crash
+        # (or a place_order timeout with the order actually placed) between
+        # place_order and mark_signal used to leave a live order with no
+        # idempotency mark -> the retry opened a SECOND position. At-most-
+        # once: a missed trade beats a double entry, and the deterministic
+        # clientOrderId above makes even a retried signal collide instead
+        # of double-submitting.
+        self.state.mark_signal(sid, symbol, "placing entry")
+        self.state.save()
         order = self.exchange.place_order(
             symbol, entry_side, entry_type,
             quantity=qty,
             price=None if entry_type == "MARKET" else entry_px,
             time_in_force=tif,
-            client_order_id=self._leg_id(pos_id, "EN"))
+            client_order_id=self._entry_client_id(sid))
         if not order:
             return self._reject(symbol, sid, f"entry order placement failed (type={entry_type}, tif={tif})")
 
@@ -905,10 +926,41 @@ class Executor:
                          fill_px, net)
         pos["qty"] = max(0.0, remaining)
 
+        # H2: keep the live SL sized to the remainder and verify the SL
+        # leg is still alive on the exchange.
+        if pos["qty"] > 0 and not pos.get("closed"):
+            self._resize_sl_to_remaining(pos_id, pos, sid)
+            self._ensure_sl_alive(pos_id, pos, sid, summary)
+            if pos.get("closed"):
+                return
+
         # Breakeven: TP1 filled -> move SL to the entry price.
         if (config.EXEC_BREAKEVEN_AFTER_TP1 and pos["tp"]["tp1"]["filled"]
                 and not pos.get("breakeven_moved") and pos["qty"] > 0):
             self._move_sl_to_breakeven(pos_id, pos, sid)
+
+        # H5: TP dust — split_tp_qty floors every leg to stepSize, so a
+        # sub-step residual never sits in any TP leg. Once all TP legs are
+        # filled, a remainder below minQty can never be exited (a market
+        # close would be rejected) — treat it as fully closed so the dust
+        # can't occupy the one-position-per-coin slot forever.
+        if pos["qty"] > 0 and all(
+                (pos["tp"][leg].get("filled") or
+                 (pos["tp"][leg].get("qty") or 0.0) <= 0)
+                for leg in ("tp1", "tp2", "tp3")):
+            try:
+                min_qty = float(
+                    (self.exchange.get_symbol_filters(symbol) or {})
+                    .get("minQty") or 0.0)
+            except Exception:  # noqa: BLE001
+                min_qty = 0.0
+            dust_cap = max(min_qty, _CLOSE_DUST_QTY)
+            if 0 < pos["qty"] <= dust_cap:
+                log.info("%s TP dust %s <= minQty %s - marking closed",
+                         pos_id, pos["qty"], dust_cap)
+                self.lifecycle.log(sid, symbol, "dust_closed",
+                                   qty=pos["qty"])
+                pos["qty"] = 0.0
 
         # Terminal state: position fully closed.
         if pos["qty"] <= 0:
@@ -1021,6 +1073,16 @@ class Executor:
             self.state.save()
             return False
         if status in ("CANCELED", "EXPIRED", "REJECTED"):
+            try:
+                filled = float(o.get("executedQty") or 0.0)
+            except (TypeError, ValueError):
+                filled = 0.0
+            if filled > 0 and not pos.get("brackets_placed"):
+                # H8: cancelled after a partial fill — the filled portion is
+                # a real position. Adopt it (resize + brackets), don't strand
+                # it as closed/naked.
+                self._adopt_filled_entry(pos_id, pos, sid, filled, o)
+                return True
             pos["closed"] = True
             pos["closed_reason"] = f"entry order {status}"
             self.lifecycle.log(sid, symbol, CANCELLED,
@@ -1038,11 +1100,92 @@ class Executor:
             return
         symbol = pos["symbol"]
         self.exchange.cancel_order(symbol, order_id=pos.get("entry_order_id"))
+        # H8: the entry may have filled (fully or partially) in the race
+        # window between _check_entry_fill's get_order and this cancel.
+        # Never mark a filled portion as closed — it would become a naked,
+        # unmanaged position. Re-fetch and adopt any fill.
+        try:
+            o = self.exchange.get_order(symbol,
+                                        order_id=pos.get("entry_order_id"))
+        except Exception:  # noqa: BLE001
+            o = None
+        filled = 0.0
+        if o:
+            try:
+                filled = float(o.get("executedQty") or 0.0)
+            except (TypeError, ValueError):
+                filled = 0.0
+            if o.get("status") == "FILLED" and filled <= 0:
+                filled = pos.get("qty") or 0.0
+        if filled > 0:
+            self._adopt_filled_entry(pos_id, pos, sid, filled, o or {})
+            return
         pos["closed"] = True
         pos["closed_reason"] = f"entry unfilled after {_ENTRY_TIMEOUT_MINUTES}m"
         self.lifecycle.log(sid, symbol, EXPIRED,
                            reason=pos["closed_reason"], terminal=True)
         log.info("%s expired: %s", pos_id, pos["closed_reason"])
+        self.state.save()
+
+    def _adopt_filled_entry(self, pos_id: str, pos: dict, sid: str,
+                            filled_qty: float, order: dict) -> None:
+        """H8: adopt a (partially) filled entry — resize + bracket it.
+
+        Called when the entry filled around the cancel/timeout window.
+        The TP ladder was sized for the full requested qty, so it is
+        re-split for what actually filled. Never leaves the filled portion
+        naked.
+        """
+        symbol = pos["symbol"]
+        try:
+            fill_px = float(order.get("avgPrice") or pos["entry_price"])
+        except (TypeError, ValueError):
+            fill_px = pos["entry_price"]
+        pos["entry_price"] = fill_px
+        pos["qty"] = filled_qty
+        lev = pos.get("leverage") or 1
+        pos["margin_usdt"] = round(filled_qty * fill_px / lev, 2) if lev else 0.0
+        try:
+            filters = self.exchange.get_symbol_filters(symbol) or {}
+        except Exception:  # noqa: BLE001
+            filters = {}
+        tp_qty, note = split_tp_qty(
+            filled_qty, filters.get("stepSize") or 0.0,
+            filters.get("minQty") or 0.0)
+        if tp_qty is None:
+            # Filled qty cannot be exited via the TP ladder (dust): market
+            # -close it now rather than hold an un-exitable position.
+            log.error("%s adopted fill %s unsplittable (%s) - market-closing",
+                      pos_id, filled_qty, note)
+            side = "SELL" if pos.get("direction") == "LONG" else "BUY"
+            try:
+                self.exchange.place_order(symbol, side, "MARKET",
+                                          quantity=filled_qty,
+                                          reduce_only=True)
+            except Exception:  # noqa: BLE001
+                log.exception("%s dust close failed", pos_id)
+            pos["closed"] = True
+            pos["closed_reason"] = f"adopted dust fill {filled_qty:g} closed"
+            self.lifecycle.log(sid, symbol, EXPIRED,
+                               reason=pos["closed_reason"], terminal=True)
+            self.state.save()
+            return
+        for leg, q in zip(("tp1", "tp2", "tp3"), tp_qty):
+            pos["tp"][leg]["qty"] = q
+            pos["tp"][leg]["filled"] = False
+            pos["tp"][leg]["order_id"] = None
+        self.lifecycle.log(sid, symbol, ENTRY_TRIGGERED, price=fill_px,
+                           qty=filled_qty,
+                           reason="entry (partially) filled near timeout - adopted")
+        if self._place_brackets(pos_id, pos):
+            pos["brackets_placed"] = True
+            self.lifecycle.log(sid, symbol, POSITION_OPENED,
+                               qty=filled_qty, entry=fill_px)
+        else:
+            # Brackets failed: _check_entry_fill retries next cycle; the
+            # CANCELED+executedQty path above re-adopts instead of closing.
+            log.error("%s adopted fill but brackets FAILED - retrying",
+                      pos_id)
         self.state.save()
 
     def _place_brackets(self, pos_id: str, pos: dict) -> bool:
@@ -1085,6 +1228,7 @@ class Executor:
         placed_algo.append(sl["algoId"])
         pos["sl_order_id"] = sl["algoId"]
         pos["sl_is_algo"] = True
+        pos["sl_qty"] = pos["qty"]  # H2: track live SL size for resizing
 
         for leg in ("tp1", "tp2", "tp3"):
             tp = pos["tp"][leg]
@@ -1122,6 +1266,117 @@ class Executor:
             return self.exchange.get_algo_order(symbol, aid)
         return self.exchange.get_order(symbol, order_id=aid)
 
+    def _place_sl(self, pos_id: str, pos: dict, qty: float, tag: str) -> bool:
+        """Place a new SL STOP_MARKET for qty and swap it in (H2).
+
+        The replacement is placed BEFORE the old leg is cancelled so the
+        position is never unprotected. On success the old leg is cancelled
+        and pos["sl_qty"] is updated. Returns True on success.
+        """
+        symbol = pos["symbol"]
+        exit_side = "BUY" if pos.get("direction") == "SHORT" else "SELL"
+        tick = None
+        try:
+            tick = (self.exchange.get_symbol_filters(symbol) or {}).get("tickSize")
+        except Exception:  # noqa: BLE001
+            pass
+        sl = self.exchange.place_algo_order(
+            symbol, exit_side, "STOP_MARKET", quantity=qty,
+            trigger_price=quantize_price(pos["stop_loss"], tick),
+            reduce_only=True, working_type="MARK_PRICE",
+            client_algo_id=self._leg_id(pos_id, tag))
+        if not (sl and sl.get("algoId")):
+            return False
+        self._sl_cancel(symbol, pos)
+        pos["sl_order_id"] = sl["algoId"]
+        pos["sl_is_algo"] = True
+        pos["sl_qty"] = qty
+        return True
+
+    def _resize_sl_to_remaining(self, pos_id: str, pos: dict, sid: str) -> None:
+        """H2: keep the live SL sized to the remaining position qty.
+
+        An oversized reduce-only STOP_MARKET can be rejected at trigger
+        time, leaving the tail position unprotected while the bot believes
+        it is safe. Called after every TP-fill pass.
+        """
+        remaining = pos.get("qty") or 0.0
+        if remaining <= 0 or pos.get("closed"):
+            return
+        if pos.get("stop_loss") is None:
+            return  # cannot size an SL without a trigger price
+        sl_qty = pos.get("sl_qty")
+        if sl_qty is None:
+            # Legacy position (pre-fix): the live SL was placed with the
+            # full entry qty ~= sum of the TP legs.
+            sl_qty = sum((pos.get("tp", {}).get(leg, {}) or {}).get("qty", 0.0)
+                         for leg in ("tp1", "tp2", "tp3"))
+        if remaining >= sl_qty - 1e-9:
+            return
+        n = int(pos.get("sl_resizes") or 0) + 1
+        if self._place_sl(pos_id, pos, remaining, f"SLR{n}"):
+            pos["sl_resizes"] = n
+            self.lifecycle.log(sid, pos["symbol"], "sl_resized",
+                               price=pos["stop_loss"], qty=remaining)
+            log.info("%s SL resized to remaining qty %s", pos_id, remaining)
+            self.state.save()
+        else:
+            log.error("%s SL resize FAILED - oversized SL left live", pos_id)
+
+    def _ensure_sl_alive(self, pos_id: str, pos: dict, sid: str,
+                         summary: dict) -> None:
+        """H2: poll the SL leg every cycle; emergency re-place if dead.
+
+        A rejected/failed SL trigger is otherwise invisible — the bot would
+        keep managing a position it believes is protected. On a dead SL
+        (CANCELED/REJECTED/EXPIRED), re-place immediately; if re-placement
+        keeps failing, market-close rather than hold a naked position.
+        """
+        if pos.get("closed") or not pos.get("sl_order_id"):
+            return
+        if (pos.get("qty") or 0.0) <= 0:
+            return
+        if pos.get("stop_loss") is None:
+            return  # cannot re-place an SL without a trigger price
+        try:
+            st = self._sl_status(pos["symbol"], pos)
+        except Exception:  # noqa: BLE001
+            return  # poll error: skip this cycle, cross-check still runs
+        if st is None:
+            return
+        status = str(st.get("algoStatus") or st.get("status") or "").upper()
+        if status in ("NEW", "WORKING", "TRIGGERING", "PARTIALLY_FILLED",
+                      "TRIGGERED", ""):
+            # TRIGGERED: the stop fired; the end-of-cycle cross-check will
+            # close the position via _close_position. Don't re-place.
+            pos.pop("sl_replace_fails", None)
+            return
+        fails = int(pos.get("sl_replace_fails") or 0)
+        log.error("%s SL leg dead (%s) - emergency re-place (attempt %d)",
+                  pos_id, status, fails + 1)
+        if self._place_sl(pos_id, pos, pos["qty"], f"SLE{fails + 1}"):
+            pos.pop("sl_replace_fails", None)
+            self.lifecycle.log(sid, pos["symbol"], "sl_replaced",
+                               price=pos["stop_loss"], qty=pos["qty"],
+                               reason=f"dead SL ({status})")
+            log.warning("%s SL re-placed after dead leg (%s)", pos_id, status)
+            self.state.save()
+            return
+        fails += 1
+        pos["sl_replace_fails"] = fails
+        self.state.save()
+        if fails >= 3:
+            # No working stop and we cannot make one: close the position
+            # rather than hold it naked. Fail-closed on price fetch.
+            mark = self.market.get_live_price(pos["symbol"])
+            if mark:
+                log.error("%s SL re-place failed %d times - market-closing "
+                          "unprotected position", pos_id, fails)
+                self._flat_position(pos_id, pos, sid, summary, mark,
+                                    "sl_dead", "sl_hit",
+                                    reason=f"SL dead ({status}), re-place "
+                                           f"failed {fails}x")
+
     def _move_sl_to_breakeven(self, pos_id: str, pos: dict, sid: str) -> None:
         symbol = pos["symbol"]
         tick = None
@@ -1145,6 +1400,7 @@ class Executor:
             pos["sl_is_algo"] = True  # breakeven leg is an algo STOP_MARKET
             pos["breakeven_moved"] = True
             pos["stop_loss"] = be
+            pos["sl_qty"] = pos["qty"]  # H2: breakeven SL sized to remainder
             log.info("%s SL moved to breakeven @ %s", pos_id, be)
             self.state.save()
         else:
@@ -1373,8 +1629,12 @@ class Executor:
             # unconditional retry so it can never strand unprotected.
             self._mark_pending_close(pos, closed_reason, lifecycle_state,
                                      reason)
+        # H4: consumers (metrics/report/notify) read "realized" from the
+        # terminal event; "pnl" alone leaves them at 0. pos["realized"]
+        # already includes net by this point.
         self.lifecycle.log(sid, symbol, lifecycle_state, price=fill_px,
-                           qty=closed_qty, pnl=round(net, 4), terminal=done,
+                           qty=closed_qty, pnl=round(net, 4),
+                           realized=round(pos["realized"], 4), terminal=done,
                            reason=(reason if done else
                                    f"{reason} (partial fill, "
                                    f"{remaining:g} remaining)"))
@@ -1595,10 +1855,29 @@ class Executor:
                     if tp_data.get("order_id"):
                         known_order_ids.add(str(tp_data["order_id"]))
 
+            # H6: adopted (unmanaged) positions' real orders must NOT be
+            # cancelled. reconcile() cannot know their order IDs (it stores
+            # tp={} / sl_order_id=None), so every live order on those
+            # symbols would look like an orphan. Exempt their symbols and
+            # surface the orders for manual review instead.
+            unmanaged_symbols = {
+                str(pos.get("symbol") or "") for pos in
+                self.state.get("positions", {}).values()
+                if not pos.get("closed") and pos.get("unmanaged")
+            }
+            unmanaged_symbols.discard("")
+
             for o in open_orders:
                 oid = str(o.get("orderId", ""))
                 sym = o.get("symbol", "")
                 if oid and oid not in known_order_ids:
+                    if sym in unmanaged_symbols:
+                        log.warning(
+                            "Keeping order %s (%s %s @ %s): symbol has an "
+                            "adopted/unmanaged position - manual review, "
+                            "NOT cancelling", oid, sym, o.get("side"),
+                            o.get("price"))
+                        continue
                     log.warning("Cancelling orphan order %s (%s %s @ %s) not tracked in state",
                                 oid, sym, o.get("side"), o.get("price"))
                     try:
