@@ -132,6 +132,10 @@ MAX_LEVERAGE = 3               # max leverage multiplier
 TP_SPLIT = (0.4, 0.3, 0.3)     # scale-out fractions at TP1 / TP2 / TP3
 MAX_CONCURRENT_POSITIONS = 3
 DAILY_LOSS_CAP_PCT = 3.0       # kill switch: stop trading if daily loss exceeds this
+PROFIT_TAKE_PCT = 0.0          # auto TP: market-close the whole position once
+                               # unrealized PnL reaches this % of margin.
+                               # 0 = off. User 2026-10-16: "+20% langsung TP"
+                               # (live). Dashboard knob: profit_take_pct.
 
 # ------------------------------------------------------- backtest defaults
 # ROADMAP ITEM 4 (honest backtester). Costs are applied per side; every
@@ -292,6 +296,10 @@ DASH_NUMERIC_OVERRIDES = {
     # daily loss; 100 = effectively off. Widened only on explicit operator
     # instruction (user 2026-10-15: "habiskan saja saldonya").
     "daily_loss_cap_pct": ("DAILY_LOSS_CAP_PCT", 0, 100),
+    # profit take: market-close the whole position once unrealized PnL
+    # reaches this % of the position margin. 0 = off (default).
+    # User 2026-10-16: "+20% langsung TP" (live).
+    "profit_take_pct": ("PROFIT_TAKE_PCT", 0, 100),
 }
 # Boolean engine knobs: setting name -> config attribute.
 DASH_BOOL_OVERRIDES = {
@@ -461,6 +469,8 @@ DASHBOARD_DEFAULTS = {
     "fixed_usdt": 10.0,          # USDT margin per position when fixed_usdt
     # risk: max position notional as % of balance (default 20 = safe)
     "max_exposure_pct_per_symbol": 20.0,
+    # profit take: close whole position at +% of margin (0 = off)
+    "profit_take_pct": 0.0,
 }
 
 _ORIGINALS: dict = {}
