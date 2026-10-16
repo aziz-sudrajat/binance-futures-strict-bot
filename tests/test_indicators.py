@@ -1,3 +1,10 @@
+# Copyright (c) 2026 aziz-sudrajat <azizsudrajat.stb4@gmail.com>
+# https://github.com/aziz-sudrajat
+#
+# All rights reserved. This file is part of the binance-futures-strict-bot project.
+# Unauthorized copying, modification, distribution, or false claim of
+# authorship is prohibited.
+
 """Unit tests for indicators.py — exact-port verification against GAS.
 
 Reference: emaSeries_ (L1648), rsiWilder_ (L1658), macd_ (L1701),
