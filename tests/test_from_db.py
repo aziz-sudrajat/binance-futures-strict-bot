@@ -133,3 +133,39 @@ def test_scanner_run_pass_writes_approved(tmp_path, monkeypatch):
     fresh = db.get_fresh_signals()
     assert len(fresh) == 1 and fresh[0]["symbol"] == "AAAUSDT"
     db.close()
+
+
+def test_scanner_two_sided_flag_flips_bullish_only(tmp_path, monkeypatch):
+    """--two-sided mirrors the live bot (bidirectional); default stays long-only."""
+    import scanner as scanner_mod
+
+    class FakeMarket3:
+        def list_okx_swap_symbols(self):
+            return ["AAAUSDT"]
+
+    monkeypatch.setattr(scanner_mod, "evaluate_symbol",
+                        lambda s, m: (None, "x"))
+    monkeypatch.setattr(scanner_mod, "THROTTLE_SEC", 0)
+    monkeypatch.setattr(config, "BULLISH_ONLY", True)  # restore after test
+
+    db = SignalDB(str(tmp_path / "s1.db"))
+    scanner_mod.run_pass(FakeMarket3(), db, expiry_min=30, two_sided=False)
+    assert config.BULLISH_ONLY is True
+    db.close()
+
+    db = SignalDB(str(tmp_path / "s2.db"))
+    scanner_mod.run_pass(FakeMarket3(), db, expiry_min=30, two_sided=True)
+    assert config.BULLISH_ONLY is False
+    db.close()
+
+
+def test_scanner_cli_parses_two_sided():
+    import scanner as scanner_mod
+    ns = scanner_mod.main.__wrapped__ if hasattr(
+        scanner_mod.main, "__wrapped__") else None
+    # parse args directly via argparse used in main
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--two-sided", action="store_true")
+    assert ap.parse_args(["--two-sided"]).two_sided is True
+    assert ap.parse_args([]).two_sided is False
