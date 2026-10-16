@@ -2473,3 +2473,44 @@ def test_adopt_dust_readopt_clamps_to_residual(rig, monkeypatch):
     executor._adopt_filled_entry(pos_id, pos, sid, 0.0015, {"avgPrice": 100.0})
     assert calls == [0.0015, 0.0005], calls
     assert pos.get("closed") is True  # residual fully closed this time
+
+
+def test_expire_stale_entry_skips_pending_close_residual(rig):
+    """R2: _expire_stale_entry must not expire a position with an armed
+    pending_close and nonzero qty. After a partial dust close, the
+    residual is live on the exchange and its retry runs through
+    _check_entry_fill -> _adopt_filled_entry -> _flat_position. Expiring
+    it here on a transient get_order failure (None twice in one cycle,
+    entry older than the timeout) would strand the residual as "entry
+    unfilled" — a phantom expiry. The retry path owns it until done."""
+    executor, market, exchange, state, lifecycle, risk = rig
+    pos_id, sid = "pos_r2", "sid_r2"
+    pos = _dust_pos()
+    pos["qty"] = 0.0005
+    pos["pending_close"] = {
+        "closed_reason": "adopted dust fill 0.0015 closed",
+        "lifecycle_state": "expired",
+        "reason": "dust fill (partial fill, 0.0005 remaining)",
+    }
+    state.set("positions", {pos_id: pos})
+    # FakeExchange has no order 1001 -> get_order returns None, exactly the
+    # transient-failure shape; opened_at is far older than the 30m timeout.
+    executor._expire_stale_entry(pos_id, pos, sid)
+    assert not pos.get("closed"), \
+        "pending-close residual expired as 'entry unfilled' (phantom expiry!)"
+    assert pos.get("qty") == 0.0005
+    terminal = [e for e in lifecycle.read_all() if e.get("terminal")]
+    assert terminal == [], "terminal event logged for a live residual"
+
+
+def test_expire_stale_entry_still_expires_without_pending_close(rig):
+    """R2 companion: the guard must not disable normal expiry — a stale,
+    unfilled entry with no pending_close still expires as before."""
+    executor, market, exchange, state, lifecycle, risk = rig
+    pos_id, sid = "pos_r2b", "sid_r2b"
+    pos = _dust_pos()
+    pos["qty"] = 0.001
+    state.set("positions", {pos_id: pos})
+    executor._expire_stale_entry(pos_id, pos, sid)
+    assert pos.get("closed") is True
+    assert "entry unfilled after" in pos.get("closed_reason", "")
