@@ -104,10 +104,14 @@ def mtf_4h_delta(a4h: dict | None,
 
 def mtf_1d_delta(trend: str | None,
                  direction: str = "BULLISH") -> tuple[int, str]:
-    """Soft 1d-trend scoring. Used when the 1d cascade leg is NOT a hard gate
-    (relaxed modes, e.g. biasa): the major-trend information still moves the
-    quality score — aligned -> +MTF_CONFIRM_1D_BOOST, opposed ->
-    -MTF_CONFIRM_1D_PENALTY, neutral/missing -> 0. Never a veto."""
+    """Soft 1d-trend scoring, used ONLY in biasa mode (never a hard gate
+    there). When the 1d leg is a hard gate (sedang/ketat with the
+    MTF_REQUIRE_1D knob on), this function is not used — aligned is the
+    only outcome that reaches scoring.
+
+    The major-trend information still moves the quality score: aligned ->
+    +MTF_CONFIRM_1D_BOOST, opposed -> -MTF_CONFIRM_1D_PENALTY,
+    neutral/missing -> 0. Never a veto."""
     want = "BEARISH" if direction == "BEARISH" else "BULLISH"
     if not trend:
         return 0, "mtf 1d: data tidak tersedia"
