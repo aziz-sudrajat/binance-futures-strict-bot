@@ -1,4 +1,11 @@
 #!/data/data/com.termux/files/usr/bin/bash
+# Copyright (c) 2026 aziz-sudrajat <azizsudrajat.stb4@gmail.com>
+# https://github.com/aziz-sudrajat
+#
+# All rights reserved. This file is part of the binance-futures-strict-bot project.
+# Unauthorized copying, modification, distribution, or false claim of
+# authorship is prohibited.
+
 # Jalankan live auto-trading di Termux dalam tmux (persisten).
 # UANG BENERAN. Baca dulu sebelum jalanin.
 set -euo pipefail
