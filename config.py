@@ -326,8 +326,8 @@ DASH_VETO_CODES = ("leverage_risk", "funding", "squeeze", "whale",
 # not a lock.
 SIGNAL_MODES = ("ketat", "sedang", "biasa")
 # Signal mode semantics (user spec 2026-10-15; aturan MTF 2026-10-15:
-# SEMUA mode cek MTF 4h/1h/30m/15m):
-#   biasa : 15m indicators (MACD, MA/EMA, RSI) + MTF 4h/1h/30m/15m.
+# SEMUA mode cek MTF 4h/1h/30m/15m/5m (cascade 2026-10-16):
+#   biasa : 15m indicators (MACD, MA/EMA, RSI) + MTF 4h/1h/30m/15m/5m.
 #           No BTC, no vetoes, no derivatives gate.
 #   sedang: biasa + MTF alignment (4h, 1h, 30m, 15m all same direction)
 #           + BTC direction must match.
@@ -380,7 +380,7 @@ SIGNAL_MODE_PRESETS = {
         "min_quality_score": 50,
         "mtf_30m_mode": "LEAN",
         "mtf_require_1d": False,
-        "mtf_require_1h": True,   # aturan user 2026-10-15: semua mode cek MTF 4h/1h/30m/15m
+        "mtf_require_1h": True,   # aturan user 2026-10-15, cascade 2026-10-16: semua mode cek MTF 4h/1h/30m/15m/5m
         "btc_align_required": False,
         "pattern_required": False,
         "news_check": False,
