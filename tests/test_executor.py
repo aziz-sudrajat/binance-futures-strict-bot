@@ -1746,3 +1746,302 @@ def test_fresh_entry_kept_within_30min(rig):
     assert pos.get("closed") is not True
     assert exchange.get_order("BTCUSDT", order_id=oid)["status"] == "NEW"
     assert "expired" not in [e["state"] for e in lifecycle.read_all()]
+
+
+# ------------------------------------------- _flat_position partial fills
+def _partial_fill_order(executed_qty, avg_price, status="PARTIALLY_FILLED"):
+    return {"orderId": 2001, "clientOrderId": "fake_2001",
+            "status": status, "executedQty": executed_qty,
+            "avgPrice": avg_price}
+
+
+def test_flat_position_partial_fill_keeps_residual(rig, monkeypatch):
+    # A partially filled market close must NOT mark a phantom flat: only the
+    # filled qty is accounted, the residual stays open, event non-terminal.
+    import executor as ex_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(exchange, "place_order",
+                        lambda *a, **k: _partial_fill_order(0.4, 120.0))
+    pos = _profit_take_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    executor._flat_position("p1", pos, pos["signal_id"], _mgmt_summary(),
+                            120.0, "profit_take", ex_mod.PROFIT_TAKE,
+                            reason="profit_take +20% of margin")
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True
+    assert pos["qty"] == 0.6
+    # PnL only for the filled 0.4: (120-100)*0.4 - fee(120*0.4*0.05%)
+    assert pos["realized"] == (20 * 0.4 - 120 * 0.4 * 0.0005)
+    evts = [e for e in lifecycle.read_all() if e["state"] == "profit_take"]
+    assert len(evts) == 1
+    assert evts[0]["terminal"] is False
+    assert evts[0]["qty"] == 0.4
+    assert "partial fill" in evts[0]["reason"]
+
+
+def test_flat_position_partial_then_full_single_terminal(rig, monkeypatch):
+    # Residual from a partial fill closes fully on retry: exactly one
+    # terminal event, realized = sum of both fills, no double count.
+    import executor as ex_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    calls = {"n": 0}
+
+    def _place(symbol, side, type, quantity=None, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _partial_fill_order(0.4, 120.0)
+        return _partial_fill_order(0.6, 121.0, status="FILLED")
+
+    monkeypatch.setattr(exchange, "place_order", _place)
+    pos = _profit_take_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    flat = lambda: executor._flat_position(
+        "p1", pos, pos["signal_id"], _mgmt_summary(), 120.0,
+        "profit_take", ex_mod.PROFIT_TAKE, reason="profit_take +20% of margin")
+    flat()   # partial: 0.4 filled, 0.6 remains
+    assert state.get("positions")["p1"].get("closed") is not True
+    flat()   # retry: remaining 0.6 fully filled
+    pos = state.get("positions")["p1"]
+    assert pos["closed"] is True
+    assert pos["qty"] == 0.0
+    assert pos["closed_reason"] == "profit_take"
+    evts = [e for e in lifecycle.read_all() if e["state"] == "profit_take"]
+    assert len(evts) == 2
+    assert [e["terminal"] for e in evts] == [False, True]
+    exp = ((20 * 0.4 - 120 * 0.4 * 0.0005)
+           + (21 * 0.6 - 121 * 0.6 * 0.0005))
+    assert pos["realized"] == exp
+
+
+def test_flat_position_zero_fill_retries(rig, monkeypatch):
+    # executedQty 0 (e.g. immediately expired): nothing accounted, position
+    # untouched, no lifecycle event — retry next cycle.
+    import executor as ex_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(exchange, "place_order",
+                        lambda *a, **k: _partial_fill_order(0.0, 0.0,
+                                                           status="EXPIRED"))
+    pos = _profit_take_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    executor._flat_position("p1", pos, pos["signal_id"], _mgmt_summary(),
+                            120.0, "profit_take", ex_mod.PROFIT_TAKE,
+                            reason="profit_take +20% of margin")
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True
+    assert pos["qty"] == 1.0
+    assert pos["realized"] == 0.0
+    assert "profit_take" not in [e["state"] for e in lifecycle.read_all()]
+
+
+def test_flat_position_missing_fill_info_trusts_filled(rig, monkeypatch):
+    # Wrappers that omit executedQty (test fakes): status FILLED -> full
+    # close as before; any other status -> no fill. Never invent a qty.
+    import executor as ex_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(exchange, "place_order",
+                        lambda *a, **k: {"orderId": 2001, "status": "FILLED"})
+    pos = _profit_take_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    executor._flat_position("p1", pos, pos["signal_id"], _mgmt_summary(),
+                            120.0, "profit_take", ex_mod.PROFIT_TAKE,
+                            reason="profit_take +20% of margin")
+    pos = state.get("positions")["p1"]
+    assert pos["closed"] is True and pos["qty"] == 0.0
+
+
+# ------------------------------------------- pending_close retry
+def _residual_pos():
+    # Simulates the state right after a partial _flat_position: brackets
+    # cancelled, 0.6 residual open, pending_close armed.
+    import executor as ex_mod
+    pos = _profit_take_pos()
+    pos["qty"] = 0.6
+    pos["realized"] = 7.976  # from the earlier 0.4 partial fill
+    pos["pending_close"] = {"closed_reason": "profit_take",
+                            "lifecycle_state": ex_mod.PROFIT_TAKE,
+                            "reason": "profit_take +20% of margin"}
+    return pos
+
+
+def test_flat_position_partial_arms_pending_close(rig, monkeypatch):
+    import executor as ex_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(exchange, "place_order",
+                        lambda *a, **k: _partial_fill_order(0.4, 120.0))
+    pos = _profit_take_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    executor._flat_position("p1", pos, pos["signal_id"], _mgmt_summary(),
+                            120.0, "profit_take", ex_mod.PROFIT_TAKE,
+                            reason="profit_take +20% of margin")
+    pc = state.get("positions")["p1"].get("pending_close")
+    assert pc is not None
+    assert pc["closed_reason"] == "profit_take"
+    assert pc["lifecycle_state"] == ex_mod.PROFIT_TAKE
+
+
+def test_flat_position_zero_fill_arms_pending_close(rig, monkeypatch):
+    import executor as ex_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(exchange, "place_order",
+                        lambda *a, **k: _partial_fill_order(0.0, 0.0,
+                                                           status="EXPIRED"))
+    pos = _profit_take_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    executor._flat_position("p1", pos, pos["signal_id"], _mgmt_summary(),
+                            120.0, "profit_take", ex_mod.PROFIT_TAKE,
+                            reason="profit_take +20% of margin")
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True and pos["qty"] == 1.0
+    assert pos.get("pending_close", {}).get("closed_reason") == "profit_take"
+
+
+def test_flat_position_order_failure_arms_pending_close(rig, monkeypatch):
+    # place_order -> None AFTER brackets were cancelled: still arm the retry.
+    import executor as ex_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(exchange, "place_order", lambda *a, **k: None)
+    pos = _profit_take_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    executor._flat_position("p1", pos, pos["signal_id"], _mgmt_summary(),
+                            120.0, "profit_take", ex_mod.PROFIT_TAKE,
+                            reason="profit_take +20% of margin")
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True
+    assert pos.get("pending_close") is not None
+
+
+def test_pending_close_retries_without_trigger(rig, monkeypatch):
+    # Reviewer scenario: profit-take partial fill, then price retreats BELOW
+    # the +20% trigger. The residual must STILL be closed — the retry is
+    # unconditional, never gated on the trigger firing again.
+    import executor as ex_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "PROFIT_TAKE_PCT", 20.0)
+    pos = _residual_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    # trigger cold: unrealized 0.6*(100.20-100) = $0.12 < $0.20 threshold —
+    # any close below must come from the pending_close retry, not the trigger
+    market.live = 100.20
+    exchange.market_price["BTCUSDT"] = 100.20
+    exchange._pos["BTCUSDT"] = 0.6           # keep the gone-check quiet
+    n_orders = len(exchange.orders)
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    # a NEW market close was placed despite the trigger being cold...
+    closes = [o for o in list(exchange.orders.values())[n_orders:]
+              if o.get("type") == "MARKET" and o.get("reduceOnly")]
+    assert len(closes) == 1, "pending_close retry did not fire"
+    # ...and the FakeExchange full-fills it -> position closed, flag cleared
+    assert pos["closed"] is True
+    assert pos.get("pending_close") is None
+    assert pos["qty"] == 0.0
+    terminals = [e for e in lifecycle.read_all()
+                 if e.get("terminal") is True]
+    assert len(terminals) == 1 and terminals[0]["state"] == "profit_take"
+
+
+def test_flat_position_string_executed_qty(rig, monkeypatch):
+    # Real Binance returns executedQty as a STRING — must be handled.
+    import executor as ex_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(exchange, "place_order",
+                        lambda *a, **k: _partial_fill_order("0.4", 120.0))
+    pos = _profit_take_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    executor._flat_position("p1", pos, pos["signal_id"], _mgmt_summary(),
+                            120.0, "profit_take", ex_mod.PROFIT_TAKE,
+                            reason="profit_take +20% of margin")
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True
+    assert pos["qty"] == 0.6
+
+
+def test_flat_position_short_partial_fill(rig, monkeypatch):
+    # SHORT direction: sign flip applies to the partial qty as well.
+    import executor as ex_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(exchange, "place_order",
+                        lambda *a, **k: _partial_fill_order(0.4, 80.0))
+    pos = _profit_take_pos()
+    pos["direction"] = "SHORT"
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    executor._flat_position("p1", pos, pos["signal_id"], _mgmt_summary(),
+                            80.0, "profit_take", ex_mod.PROFIT_TAKE,
+                            reason="profit_take +20% of margin")
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True and pos["qty"] == 0.6
+    # SHORT profit: (entry - fill) * qty - fee = (100-80)*0.4 - 80*0.4*0.0005
+    assert pos["realized"] == (20 * 0.4 - 80 * 0.4 * 0.0005)
+    assert pos.get("pending_close") is not None
+
+
+# ------------------------------------------- pending_close fall-through
+def test_pending_close_vanished_residual_goes_via_close_position(
+        rig, monkeypatch):
+    # Residual vanished externally (manual close / liquidation) while
+    # pending_close is armed: the retry's market order fails, but instead of
+    # looping forever the fall-through reaches the end-of-cycle cross-check,
+    # which routes via _close_position (ground-truth classification).
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "PROFIT_TAKE_PCT", 20.0)
+    monkeypatch.setattr(config, "TIME_STOP_HOURS", 0.0)
+    pos = _residual_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    # trigger cold: unrealized 0.6*(100.20-100) = $0.12 < $0.20 threshold
+    market.live = 100.20
+    exchange.market_price["BTCUSDT"] = 100.20
+    exchange._pos = {}                       # nothing on the exchange
+    monkeypatch.setattr(exchange, "place_order", lambda *a, **k: None)
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos["closed"] is True
+    assert pos.get("pending_close") is None  # cleared on close
+    terminals = [e for e in lifecycle.read_all()
+                 if e.get("terminal") is True]
+    assert len(terminals) == 1
+    # no close fills on the exchange -> fail-closed sl_hit classification
+    assert terminals[0]["state"] == "sl_hit"
+    assert "no close fills found" in terminals[0]["reason"]
+
+
+def test_pending_close_retry_partial_then_trigger_completes(rig, monkeypatch):
+    # Fall-through: pending retry partial-fills again, then the still-hot
+    # trigger completes the close in the SAME cycle (bounded: max 2
+    # attempts). Exactly one terminal event.
+    import executor as ex_mod
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "PROFIT_TAKE_PCT", 20.0)
+    calls = {"n": 0}
+
+    def _place(symbol, side, type, quantity=None, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _partial_fill_order(0.3, 120.0)   # pending retry: partial
+        return _partial_fill_order(0.3, 120.0, status="FILLED")  # trigger: rest
+
+    monkeypatch.setattr(exchange, "place_order", _place)
+    pos = _residual_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 120.0                      # trigger HOT for the 0.6 residual
+    exchange.market_price["BTCUSDT"] = 120.0
+    exchange._pos["BTCUSDT"] = 0.6
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert calls["n"] == 2, "expected retry + trigger attempt in one cycle"
+    assert pos["closed"] is True and pos["qty"] == 0.0
+    assert pos.get("pending_close") is None
+    terminals = [e for e in lifecycle.read_all()
+                 if e.get("terminal") is True]
+    assert len(terminals) == 1 and terminals[0]["state"] == "profit_take"
