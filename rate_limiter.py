@@ -28,6 +28,12 @@ class TokenBucket:
         rate: tokens added per second
         capacity: maximum burst capacity
         """
+        # L7: fail fast on nonsense config — rate<=0 makes acquire() divide
+        # by zero, capacity<=0 makes every acquire unsatisfiable.
+        if float(rate) <= 0:
+            raise ValueError(f"rate must be > 0 (got {rate})")
+        if float(capacity) <= 0:
+            raise ValueError(f"capacity must be > 0 (got {capacity})")
         self.rate = float(rate)
         self.capacity = float(capacity)
         self.tokens = float(capacity)
@@ -52,6 +58,14 @@ class TokenBucket:
             with self.lock:
                 now = time.monotonic()
                 self._refill(now)
+
+                if tokens > self.capacity:
+                    # L7: never satisfiable — the bucket caps at capacity,
+                    # so blocking here would spin forever.
+                    log.warning("rate_limiter: requested %.3g tokens > "
+                                "capacity %.3g — refusing", tokens,
+                                self.capacity)
+                    return False
 
                 if self.tokens >= tokens:
                     self.tokens -= tokens
