@@ -344,6 +344,9 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("max_leverage", "Max leverage", "int"),
     ("daily_loss_cap_pct", "Daily loss cap % (100=off)", "float"),
     ("profit_take_pct", "Profit take +% of margin (0=off)", "float"),
+    ("trail_trigger_pct", "Trail trigger +% of margin (0=off)", "float"),
+    ("trail_distance_pct", "Trail distance % from peak (0=off)", "float"),
+    ("time_stop_hours", "Time stop hours (0=off)", "float"),
     ("max_exposure_pct_per_symbol", "Max exposure %/coin", "float"),
     ("poll_interval_min", "Scan interval (min)", "int"),
     ("trading_hours_enabled", "Trading hours gate (LIVE)", "bool"),
@@ -621,6 +624,18 @@ th{color:#8b949e;font-weight:600}
     <span class="dim" style="font-size:12px">auto TP: close seluruh posisi
     saat profit tembus; 0 = off</span></label>
     <input type="number" id="s-ptake" step="1" min="0" max="100"></div>
+  <div class="setrow"><label>Trail trigger (% of margin)<br>
+    <span class="dim" style="font-size:12px">trailing aktif saat profit
+    tembus; 0 = off</span></label>
+    <input type="number" id="s-trailtrig" step="1" min="0" max="100"></div>
+  <div class="setrow"><label>Trail distance (% dari peak)<br>
+    <span class="dim" style="font-size:12px">close saat pullback sejauh ini
+    dari peak; 0 = off</span></label>
+    <input type="number" id="s-traildist" step="0.5" min="0" max="20"></div>
+  <div class="setrow"><label>Time stop (jam)<br>
+    <span class="dim" style="font-size:12px">close posisi yang terbuka lebih
+    lama dari ini; 0 = off</span></label>
+    <input type="number" id="s-tstop" step="1" min="0" max="168"></div>
   <div class="setrow"><label>Max exposure / coin (%)<br>
     <span class="dim" style="font-size:12px">batas notional posisi per coin
     dari balance</span></label>
@@ -770,6 +785,9 @@ async function refresh(){
     $('s-int').value = st.poll_interval_min;
     $('s-dlcap').value = st.daily_loss_cap_pct;
     $('s-ptake').value = st.profit_take_pct || 0;
+    $('s-trailtrig').value = st.trail_trigger_pct || 0;
+    $('s-traildist').value = st.trail_distance_pct || 0;
+    $('s-tstop').value = st.time_stop_hours || 0;
     $('s-maxexp').value = st.max_exposure_pct_per_symbol;
     $('s-th').checked = st.trading_hours_enabled !== false;
     $('s-minq').value = st.min_quality_score;
@@ -875,6 +893,9 @@ $('save').onclick = ()=>{
     poll_interval_min:parseInt($('s-int').value),
     daily_loss_cap_pct:parseFloat($('s-dlcap').value),
     profit_take_pct:parseFloat($('s-ptake').value),
+    trail_trigger_pct:parseFloat($('s-trailtrig').value),
+    trail_distance_pct:parseFloat($('s-traildist').value),
+    time_stop_hours:parseFloat($('s-tstop').value),
     max_exposure_pct_per_symbol:parseFloat($('s-maxexp').value),
     trading_hours_enabled:$('s-th').checked,
     min_quality_score:parseInt($('s-minq').value),
