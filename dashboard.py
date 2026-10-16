@@ -116,6 +116,10 @@ def validate_settings(data: dict) -> dict:
     _bool("breakeven_after_tp1")
     _bool("trading_hours_enabled")
     _bool("ws_price_feed_enabled")  # item 2.5: OKX WS price feed switch
+    _bool("market_data_fallback_binance")
+    _bool("exec_post_only_entry")
+    _bool("cancel_orphan_orders_on_startup")
+    _bool("adaptive_volatility_targets")
     for code in config.DASH_VETO_CODES:
         _bool(f"veto_{code}")
 
@@ -408,6 +412,14 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("veto_liq_wall", "Veto: liquidity wall", "bool"),
     ("veto_btc_breaker", "Veto: BTC breaker", "bool"),
     ("veto_sr_zone", "Veto: S/R zone", "bool"),
+    ("max_drawdown_cap_pct", "Max drawdown cap %", "float"),
+    ("max_consecutive_losses", "Max consecutive losses", "int"),
+    ("consecutive_loss_cooldown_hours", "Loss cooldown (jam)", "float"),
+    ("market_data_fallback_binance", "Market data fallback Binance", "bool"),
+    ("exec_post_only_entry", "Entry post-only (GTX)", "bool"),
+    ("cancel_orphan_orders_on_startup", "Cancel orphan orders saat startup",
+     "bool"),
+    ("adaptive_volatility_targets", "Adaptive volatility targets", "bool"),
 ]
 
 
