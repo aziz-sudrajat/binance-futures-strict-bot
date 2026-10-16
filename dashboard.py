@@ -34,6 +34,26 @@ from urllib.parse import urlparse, parse_qs
 
 import config
 
+# Process start time for the dashboard's own uptime_sec in /api/health.
+_START_TIME = time.time()
+
+
+def _git_commit() -> str | None:
+    """Short HEAD commit of this checkout, best-effort (None if unknown)."""
+    try:
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(
+            ["git", "-C", here, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5)
+        sha = (out.stdout or "").strip()
+        return sha or None
+    except Exception:  # noqa: BLE001 - health must never crash on this
+        return None
+
+
+_GIT_COMMIT = _git_commit()
+
 # ------------------------------------------------------------------ settings
 SETTINGS_PATH = config.DASHBOARD_SETTINGS_FILE
 
@@ -95,6 +115,7 @@ def validate_settings(data: dict) -> dict:
     _bool("whale_review")
     _bool("breakeven_after_tp1")
     _bool("trading_hours_enabled")
+    _bool("ws_price_feed_enabled")  # item 2.5: OKX WS price feed switch
     for code in config.DASH_VETO_CODES:
         _bool(f"veto_{code}")
 
@@ -357,6 +378,9 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("max_exposure_pct_per_symbol", "Max exposure %/coin", "float"),
     ("poll_interval_min", "Scan interval (min)", "int"),
     ("trading_hours_enabled", "Trading hours gate (LIVE)", "bool"),
+    ("ws_price_feed_enabled", "WS price feed (OKX)", "bool"),
+    ("ws_stale_sec", "WS stale (detik)", "float"),
+    ("live_signal_expiry_hours", "Signal expiry jam (db)", "float"),
     ("min_quality_score", "Min quality score", "int"),
     ("mtf_30m_mode", "MTF 30m mode", "choice:STRICT,LEAN"),
     ("mtf_require_1d", "MTF: 1d wajib selaras", "bool"),
@@ -523,6 +547,47 @@ def build_status(mode: str) -> dict:
     }
 
 
+def build_health(mode: str = "live") -> dict:
+    """Cheap, read-only health snapshot for GET /api/health.
+
+    Reads the mode's state file only (atomic os.replace writes on the
+    executor side make a torn read impossible, so no lock is needed);
+    never calls exchange/trading functions and never mutates anything.
+    loop_alive means the executor wrote its last_cycle_ts heartbeat
+    within 2x the configured poll interval (+2 min grace).
+    """
+    state_path, _ = mode_files(mode)
+    st = _read_json_file(state_path)  # missing/corrupt -> {} (degraded)
+    now_ms = int(time.time() * 1000)
+    last_cycle_ts = st.get("last_cycle_ts") or 0
+    age_sec = (now_ms - last_cycle_ts) / 1000 if last_cycle_ts else None
+    try:
+        poll_min = int(load_settings(mode=mode).get("poll_interval_min")
+                       or config.EXEC_POLL_INTERVAL_MIN)
+    except (TypeError, ValueError):
+        poll_min = config.EXEC_POLL_INTERVAL_MIN
+    poll_min = max(1, min(poll_min, 1440))
+    stale_after_sec = 2 * poll_min * 60 + 120
+    loop_alive = bool(last_cycle_ts and age_sec is not None
+                      and age_sec <= stale_after_sec)
+    positions = st.get("positions") or {}
+    open_positions = sum(
+        1 for p in positions.values()
+        if isinstance(p, dict) and not p.get("closed"))
+    return {
+        "status": "ok" if loop_alive else "degraded",
+        "mode": mode,
+        "loop_alive": loop_alive,
+        "last_cycle_ts": last_cycle_ts or None,
+        "last_cycle_age_sec": round(age_sec, 1)
+        if age_sec is not None else None,
+        "open_positions": open_positions,
+        "uptime_sec": round(time.time() - _START_TIME, 1),
+        "version": None,
+        "commit": _GIT_COMMIT,
+    }
+
+
 # ------------------------------------------------------------------ HTTP
 PAGE = """<!DOCTYPE html>
 <html lang="id"><head><meta charset="utf-8">
@@ -652,6 +717,19 @@ th{color:#8b949e;font-weight:600}
     05:00–18:00 WIB; OFF = kapan saja</span></label>
     <label class="switch"><input type="checkbox" id="s-th">
     <span class="sl"></span></label></div>
+  <div class="setrow"><label><b>WS price feed (OKX)</b><br>
+    <span class="dim" style="font-size:12px">ON = harga freshness check dari
+    cache WebSocket OKX (fallback REST otomatis); OFF = REST saja</span></label>
+    <label class="switch"><input type="checkbox" id="s-wsfeed">
+    <span class="sl"></span></label></div>
+  <div class="setrow"><label>WS stale (detik)<br>
+    <span class="dim" style="font-size:12px">harga WS lebih tua dari ini
+    dianggap basi → fallback REST</span></label>
+    <input type="number" id="s-wsstale" step="5" min="5" max="300"></div>
+  <div class="setrow"><label>Signal expiry (jam)<br>
+    <span class="dim" style="font-size:12px">sinyal db lebih tua dari ini
+    ditolak (fail-closed)</span></label>
+    <input type="number" id="s-sigexp" step="1" min="1" max="72"></div>
 </div>
 <div class="card"><h2>🌐 Universe</h2>
   <div class="setrow"><label>Mode universe<br>
@@ -797,6 +875,9 @@ async function refresh(){
     $('s-tstop').value = st.time_stop_hours || 0;
     $('s-maxexp').value = st.max_exposure_pct_per_symbol;
     $('s-th').checked = st.trading_hours_enabled !== false;
+    $('s-wsfeed').checked = st.ws_price_feed_enabled !== false;
+    $('s-wsstale').value = st.ws_stale_sec;
+    $('s-sigexp').value = st.live_signal_expiry_hours || 24;
     $('s-minq').value = st.min_quality_score;
     $('s-mode').value = st.signal_mode || 'ketat';    $('s-mtf').value = st.mtf_30m_mode;
     $('s-req1d').checked = st.mtf_require_1d !== false;
@@ -892,6 +973,7 @@ $('s-bull').onchange = ()=>postSettings({bullish_only:$('s-bull').checked}, true
 $('s-req1d').onchange = ()=>postSettings({mtf_require_1d:$('s-req1d').checked}, true);
 $('s-be').onchange = ()=>postSettings({breakeven_after_tp1:$('s-be').checked}, true);
 $('s-th').onchange = ()=>postSettings({trading_hours_enabled:$('s-th').checked}, true);
+$('s-wsfeed').onchange = ()=>postSettings({ws_price_feed_enabled:$('s-wsfeed').checked}, true);
 $('save').onclick = ()=>{
   postSettings({
     auto_trade:$('s-auto').checked,
@@ -905,6 +987,9 @@ $('save').onclick = ()=>{
     time_stop_hours:parseFloat($('s-tstop').value),
     max_exposure_pct_per_symbol:parseFloat($('s-maxexp').value),
     trading_hours_enabled:$('s-th').checked,
+    ws_price_feed_enabled:$('s-wsfeed').checked,
+    ws_stale_sec:parseFloat($('s-wsstale').value),
+    live_signal_expiry_hours:parseFloat($('s-sigexp').value),
     min_quality_score:parseInt($('s-minq').value),
     mtf_30m_mode:$('s-mtf').value,
     mtf_require_1d:$('s-req1d').checked,
@@ -1039,6 +1124,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/scanner":
             try:
                 self._json(200, scanner_status())
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"error": str(e)})
+        elif path == "/api/health":
+            try:
+                self._json(200, build_health(self._mode()))
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"error": str(e)})
         else:
