@@ -35,6 +35,7 @@ from urllib.parse import urlencode
 import requests
 
 import config
+import httputil
 
 log = logging.getLogger("executor.exchange")
 
@@ -62,7 +63,7 @@ class ExchangeClient:
         self._secret = api_secret.encode()
         self.base_url = base_url.rstrip("/")
         self.recv_window = recv_window_ms
-        self.session = session or requests.Session()
+        self.session = session or httputil.ThrottledSession()
         self._exchange_info: dict | None = None
         self._exchange_info_ts: float = 0.0
 
