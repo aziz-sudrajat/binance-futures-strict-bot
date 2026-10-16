@@ -1410,3 +1410,99 @@ def test_one_position_per_coin_cap(rig):
     executor._scan_symbol("ETHUSDT", 10_000.0, summary3)
     assert summary3["opened"] == 1
     assert len(executor._open_positions()) == 2
+
+
+# ------------------------------------------------------- profit take (+% TP)
+def _profit_take_pos():
+    return {
+        "symbol": "BTCUSDT", "signal_id": "BTCUSDT:1:LONG", "direction": "LONG",
+        "qty": 1.0, "entry_price": 100.0, "margin_usdt": 1.0,
+        "leverage": 10, "brackets_placed": True, "realized": 0.0,
+        "tp": {leg: {"price": 110.0 + i, "qty": 0.34,
+                     "order_id": 1001 + i, "filled": False}
+               for i, leg in enumerate(("tp1", "tp2", "tp3"))},
+        "sl_order_id": 1004,
+    }
+
+
+def _mgmt_summary():
+    return {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+            "errors": []}
+
+
+def test_profit_take_closes_at_plus_20pct(rig, monkeypatch):
+    # User 2026-10-16: "+20% langsung TP" (live). The whole position is
+    # market-closed once unrealized PnL reaches +PROFIT_TAKE_PCT% of margin.
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "PROFIT_TAKE_PCT", 20.0)
+    pos = _profit_take_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 120.0                      # +$20 unrealized on $1 margin
+    exchange.market_price["BTCUSDT"] = 120.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos["closed"] is True
+    assert pos["closed_reason"] == "profit_take"
+    assert pos["qty"] == 0.0
+    evts = [e for e in lifecycle.read_all() if e["state"] == "profit_take"]
+    assert len(evts) == 1
+    assert evts[0]["terminal"] is True
+    assert evts[0]["pnl"] > 0
+    # brackets cancelled; one reduce-only MARKET close on the right side
+    closes = [o for o in exchange.orders.values()
+              if o.get("type") == "MARKET" and o.get("reduceOnly")]
+    assert len(closes) == 1 and closes[0]["side"] == "SELL"
+
+
+def test_profit_take_not_triggered_below_threshold(rig, monkeypatch):
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "PROFIT_TAKE_PCT", 20.0)
+    pos = _profit_take_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 100.10                     # +$0.10 < $0.20 threshold
+    exchange.market_price["BTCUSDT"] = 100.10
+    exchange._pos["BTCUSDT"] = 1.0           # keep the gone-check quiet
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True
+    assert "profit_take" not in [e["state"] for e in lifecycle.read_all()]
+    closes = [o for o in exchange.orders.values()
+              if o.get("type") == "MARKET" and o.get("reduceOnly")]
+    assert closes == []
+
+
+def test_profit_take_short_direction(rig, monkeypatch):
+    # SHORT: profit when the price FALLS 20% of margin.
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "PROFIT_TAKE_PCT", 20.0)
+    pos = _profit_take_pos()
+    pos["direction"] = "SHORT"
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 80.0                       # -$20 move = +$20 for a short
+    exchange.market_price["BTCUSDT"] = 80.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos["closed"] is True
+    assert pos["closed_reason"] == "profit_take"
+    closes = [o for o in exchange.orders.values()
+              if o.get("type") == "MARKET" and o.get("reduceOnly")]
+    assert len(closes) == 1 and closes[0]["side"] == "BUY"
+
+
+def test_profit_take_off_by_default(rig):
+    # PROFIT_TAKE_PCT = 0 (default) -> no behavior change for paper/testnet.
+    executor, market, exchange, state, lifecycle, risk = rig
+    assert config.PROFIT_TAKE_PCT == 0.0
+    pos = _profit_take_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 200.0                      # huge profit, still no trigger
+    exchange.market_price["BTCUSDT"] = 200.0
+    exchange._pos["BTCUSDT"] = 1.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True
+    assert "profit_take" not in [e["state"] for e in lifecycle.read_all()]
