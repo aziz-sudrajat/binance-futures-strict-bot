@@ -2384,3 +2384,92 @@ def test_cleanup_orphan_orders_keeps_tracked_algo_sl(rig, monkeypatch):
         lambda symbol, algo_id: calls.append((symbol, algo_id)) or True)
     assert executor.cleanup_orphan_orders() == []
     assert calls == []
+
+
+# ------------------------------------- dust-adopt close verification (2026-10-17)
+def _dust_pos():
+    return {
+        "symbol": "BTCUSDT", "signal_id": "sid_dust1", "direction": "LONG",
+        "qty": 0.0, "entry_price": 100.0, "margin_usdt": 0.0,
+        "leverage": 10, "stop_loss": 98.0,
+        "tp": {leg: {"price": 103.0, "qty": 0.0, "order_id": None,
+                     "filled": False}
+               for leg in ("tp1", "tp2", "tp3")},
+        "sl_order_id": None, "entry_order_id": 1001,
+        "breakeven_moved": False, "brackets_placed": False,
+        "opened_at": 1_728_900_000_000, "entry_type": "MARKET",
+        "unmanaged": False, "realized": 0.0,
+    }
+
+
+def test_adopt_dust_fill_close_verified(rig):
+    """Dust adopt path closes through _flat_position (fill-verified): a
+    successful market close marks the position closed with a terminal
+    EXPIRED event — never a blind closed flag."""
+    executor, market, exchange, state, lifecycle, risk = rig
+    exchange.market_price = {"BTCUSDT": 100.0}
+    pos_id, sid = "pos_dust1", "sid_dust1"
+    pos = _dust_pos()
+    state.set("positions", {pos_id: pos})
+    # filled qty below the TP ladder's minQty (0.0015 vs 0.001) -> dust path.
+    executor._adopt_filled_entry(pos_id, pos, sid, 0.0015, {"avgPrice": 100.0})
+    assert pos.get("closed") is True
+    assert pos.get("closed_reason") == "adopted dust fill 0.0015 closed"
+    terminal = [e for e in lifecycle.read_all()
+                if e.get("terminal") and e.get("state") == "expired"]
+    assert len(terminal) == 1, lifecycle.read_all()
+    assert terminal[0].get("realized") is not None
+
+
+def test_adopt_dust_fill_failed_close_not_phantom(rig, monkeypatch):
+    """Dust adopt path must never record a phantom flat: if the market
+    close fails, the position stays open, pending_close is armed, and no
+    terminal event is logged (retry next cycle)."""
+    executor, market, exchange, state, lifecycle, risk = rig
+    pos_id, sid = "pos_dust2", "sid_dust2"
+    pos = _dust_pos()
+    state.set("positions", {pos_id: pos})
+
+    def boom(*a, **k):
+        raise RuntimeError("network down")
+    monkeypatch.setattr(exchange, "place_order", boom)
+
+    executor._adopt_filled_entry(pos_id, pos, sid, 0.0015, {"avgPrice": 100.0})
+    assert not pos.get("closed"), "failed dust close marked closed (phantom flat!)"
+    pc = pos.get("pending_close")
+    assert isinstance(pc, dict) and pc.get("lifecycle_state") == "expired", pc
+    terminal = [e for e in lifecycle.read_all() if e.get("terminal")]
+    assert terminal == [], "terminal event logged for an unclosed dust fill"
+
+
+def test_adopt_dust_readopt_clamps_to_residual(rig, monkeypatch):
+    """Review 2026-10-17: after a partial dust close, re-adopt must clamp
+    pos["qty"] to the tracked residual instead of restoring the entry
+    order's original executedQty — an oversized reduceOnly retry would be
+    rejected every cycle (-2022), wedging the position forever."""
+    executor, market, exchange, state, lifecycle, risk = rig
+    exchange.market_price = {"BTCUSDT": 100.0}
+    pos_id, sid = "pos_dust3", "sid_dust3"
+    pos = _dust_pos()
+    state.set("positions", {pos_id: pos})
+
+    calls = []
+    def partial_close(symbol, side, type, quantity=None, **kw):
+        calls.append(quantity)
+        oid = 9000 + len(calls)
+        return {"orderId": oid, "clientOrderId": f"fake_{oid}",
+                "status": "PARTIALLY_FILLED", "executedQty": 0.001,
+                "avgPrice": 100.0}
+    monkeypatch.setattr(exchange, "place_order", partial_close)
+
+    executor._adopt_filled_entry(pos_id, pos, sid, 0.0015, {"avgPrice": 100.0})
+    assert not pos.get("closed")
+    assert abs(pos["qty"] - 0.0005) < 1e-12, pos["qty"]
+    assert calls == [0.0015], calls
+
+    # Next cycle: the entry order still reports executedQty=0.0015, so
+    # _check_entry_fill re-adopts. The retry must target the 0.0005
+    # residual, not the original 0.0015.
+    executor._adopt_filled_entry(pos_id, pos, sid, 0.0015, {"avgPrice": 100.0})
+    assert calls == [0.0015, 0.0005], calls
+    assert pos.get("closed") is True  # residual fully closed this time
