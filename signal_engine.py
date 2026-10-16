@@ -137,9 +137,24 @@ def build_trade_plan(signal: str, price: float, ema9: float, ema21: float,
 
     risk = max(abs(entry - stop), atr * 0.5)
     direction = 1 if signal == "BULLISH WATCH" else -1
-    tp1 = entry + direction * risk * config.TP1_RR
-    tp2 = entry + direction * risk * config.TP2_RR
-    tp3 = entry + direction * risk * config.TP3_RR
+    tp1_rr = config.TP1_RR
+    tp2_rr = config.TP2_RR
+    tp3_rr = config.TP3_RR
+    # Adaptive volatility targets (user feature 2026-10-16, opt-in):
+    # scale TP2/TP3 by the ratio of current ATR to recent mean true range,
+    # clamped to [0.8, 1.5]. In high-vol regimes targets stretch; in calm
+    # regimes they tighten.
+    if getattr(config, "ADAPTIVE_VOLATILITY_TARGETS", False) and candles:
+        recent_30 = candles[-30:] if len(candles) >= 30 else candles
+        mean_tr = sum(max(float(c.get("high", 0)) - float(c.get("low", 0)), 1e-8)
+                      for c in recent_30) / max(1, len(recent_30))
+        if mean_tr > 0:
+            vol_ratio = max(0.8, min(1.5, atr / mean_tr))
+            tp2_rr = tp2_rr * vol_ratio
+            tp3_rr = tp3_rr * vol_ratio
+    tp1 = entry + direction * risk * tp1_rr
+    tp2 = entry + direction * risk * tp2_rr
+    tp3 = entry + direction * risk * tp3_rr
     zone = config.ENTRY_ZONE_ATR * atr
     return {
         "entry": entry,
