@@ -1,3 +1,10 @@
+# Copyright (c) 2026 aziz-sudrajat <azizsudrajat.stb4@gmail.com>
+# https://github.com/aziz-sudrajat
+#
+# All rights reserved. This file is part of the binance-futures-strict-bot project.
+# Unauthorized copying, modification, distribution, or false claim of
+# authorship is prohibited.
+
 """Technical indicators — exact ports from the GAS signal bot.
 
 GAS source: workspace/user/files/AZZATSSINS-20261013-imageperf-v4_5_02o2.gs
