@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 aziz-sudrajat <azizsudrajat.stb4@gmail.com>
+# https://github.com/aziz-sudrajat
+#
+# All rights reserved. This file is part of the binance-futures-strict-bot project.
+# Unauthorized copying, modification, distribution, or false claim of
+# authorship is prohibited.
+
 """All-coin signal scanner — OKX perpetuals -> signals.db.
 
 This is stage 1 of the two-stage pipeline:
@@ -51,11 +58,17 @@ def list_symbols(market: MarketData) -> list[str]:
 
 
 def run_pass(market: MarketData, db: SignalDB,
-             expiry_min: int = 30) -> dict:
-    """One full pass over all symbols. Returns stats."""
+             expiry_min: int = 30, two_sided: bool = False) -> dict:
+    """One full pass over all symbols. Returns stats.
+
+    two_sided=True mirrors the LIVE bot (bullish_only=False): both LONG
+    and SHORT signals are evaluated. Default is long-only (ketat preset).
+    """
     # Studio settings apply to the scanner too (quality threshold etc.).
     from dashboard import load_settings
     config.apply_dashboard_overrides(load_settings(mode="live"))
+    if two_sided:
+        config.BULLISH_ONLY = False
     t0 = time.time()
     symbols = list_symbols(market)
     approved = rejected = errors = 0
@@ -103,19 +116,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--expiry-min", type=int, default=30,
                     help="signal expiry in minutes (default 30)")
     ap.add_argument("--db", default="signals.db")
+    ap.add_argument("--two-sided", action="store_true",
+                    help="evaluate LONG and SHORT (mirror live bot); "
+                         "default is long-only ketat preset")
     args = ap.parse_args(argv)
 
     market = MarketData()
     db = SignalDB(args.db)
     try:
         if args.once:
-            run_pass(market, db, expiry_min=args.expiry_min)
+            run_pass(market, db, expiry_min=args.expiry_min,
+                     two_sided=args.two_sided)
             return 0
         interval = max(5, args.interval)
         log.info("scanner loop every %d min (Ctrl+C to stop)", interval)
         while True:
             try:
-                run_pass(market, db, expiry_min=args.expiry_min)
+                run_pass(market, db, expiry_min=args.expiry_min,
+                         two_sided=args.two_sided)
             except Exception:  # noqa: BLE001 - loop never dies on a pass
                 log.exception("pass failed")
             time.sleep(interval * 60)
