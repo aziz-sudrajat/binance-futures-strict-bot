@@ -343,6 +343,7 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("risk_pct_per_trade", "Risk %/trade", "float"),
     ("max_leverage", "Max leverage", "int"),
     ("daily_loss_cap_pct", "Daily loss cap % (100=off)", "float"),
+    ("profit_take_pct", "Profit take +% of margin (0=off)", "float"),
     ("max_exposure_pct_per_symbol", "Max exposure %/coin", "float"),
     ("poll_interval_min", "Scan interval (min)", "int"),
     ("trading_hours_enabled", "Trading hours gate (LIVE)", "bool"),
@@ -616,6 +617,10 @@ th{color:#8b949e;font-weight:600}
     <span class="dim" style="font-size:12px">kill switch: stop entry baru kalau
     rugi harian tembus; 100 = off</span></label>
     <input type="number" id="s-dlcap" step="0.5" min="0" max="100"></div>
+  <div class="setrow"><label>Profit take (% of margin)<br>
+    <span class="dim" style="font-size:12px">auto TP: close seluruh posisi
+    saat profit tembus; 0 = off</span></label>
+    <input type="number" id="s-ptake" step="1" min="0" max="100"></div>
   <div class="setrow"><label>Max exposure / coin (%)<br>
     <span class="dim" style="font-size:12px">batas notional posisi per coin
     dari balance</span></label>
@@ -764,6 +769,7 @@ async function refresh(){
     $('s-lev').value = st.max_leverage;
     $('s-int').value = st.poll_interval_min;
     $('s-dlcap').value = st.daily_loss_cap_pct;
+    $('s-ptake').value = st.profit_take_pct || 0;
     $('s-maxexp').value = st.max_exposure_pct_per_symbol;
     $('s-th').checked = st.trading_hours_enabled !== false;
     $('s-minq').value = st.min_quality_score;
@@ -868,6 +874,7 @@ $('save').onclick = ()=>{
     max_leverage:parseInt($('s-lev').value),
     poll_interval_min:parseInt($('s-int').value),
     daily_loss_cap_pct:parseFloat($('s-dlcap').value),
+    profit_take_pct:parseFloat($('s-ptake').value),
     max_exposure_pct_per_symbol:parseFloat($('s-maxexp').value),
     trading_hours_enabled:$('s-th').checked,
     min_quality_score:parseInt($('s-minq').value),
