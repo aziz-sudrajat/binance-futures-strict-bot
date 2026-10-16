@@ -406,6 +406,15 @@ DASH_NUMERIC_OVERRIDES = {
     # live signal expiry (item 1.4): max age (hours) of a signals.db row
     # before the executor rejects it fail-closed. 1 = strict, 72 = lenient.
     "live_signal_expiry_hours": ("LIVE_SIGNAL_EXPIRY_HOURS", 1, 72),
+    # User risk guards v2 (2026-10-17): dashboard knobs, tighten-only —
+    # never wider than the code defaults.
+    # max drawdown cap: the kill switch trips sooner at lower values.
+    "max_drawdown_cap_pct": ("MAX_DRAWDOWN_CAP_PCT", 1.0, 10.0),
+    # consecutive losses: entries pause sooner at lower counts.
+    "max_consecutive_losses": ("MAX_CONSECUTIVE_LOSSES", 1, 3),
+    # loss cooldown: a longer pause is stricter.
+    "consecutive_loss_cooldown_hours": ("CONSECUTIVE_LOSS_COOLDOWN_HOURS",
+                                        4.0, 72.0),
 }
 # Boolean engine knobs: setting name -> config attribute.
 DASH_BOOL_OVERRIDES = {
@@ -422,6 +431,12 @@ DASH_BOOL_OVERRIDES = {
     # WS price feed master switch (item 2.5): False = pure REST polling,
     # exactly the pre-2.5 behavior.
     "ws_price_feed_enabled": "WS_PRICE_FEED_ENABLED",
+    # User features v2 (2026-10-17): operator toggles, wired to the engine
+    # via getattr(config, ...) in data.py / executor.py / signal_engine.py.
+    "market_data_fallback_binance": "MARKET_DATA_FALLBACK_BINANCE",
+    "exec_post_only_entry": "EXEC_POST_ONLY_ENTRY",
+    "cancel_orphan_orders_on_startup": "CANCEL_ORPHAN_ORDERS_ON_STARTUP",
+    "adaptive_volatility_targets": "ADAPTIVE_VOLATILITY_TARGETS",
 }
 # MTF 30m leg mode: STRICT (default) or LEAN (GAS default behavior).
 DASH_MTF_MODES = ("STRICT", "LEAN")
@@ -634,6 +649,8 @@ def apply_dashboard_overrides(settings: dict) -> None:
                 continue
             v = max(lo, min(hi, v))
             if attr == "MIN_QUALITY_SCORE":
+                v = int(round(v))
+            elif attr == "MAX_CONSECUTIVE_LOSSES":
                 v = int(round(v))
             globals()[attr] = v
         for name, attr in DASH_BOOL_OVERRIDES.items():
