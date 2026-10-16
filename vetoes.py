@@ -319,6 +319,11 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
 
     # V17 — CVD / Taker aggressor imbalance veto (Phase 4).
     # Rejects when aggressive market orders strongly oppose the signal direction.
+    # Best-effort by design (M1): taker_volume is an OPTIONAL derivatives
+    # component — Stage 8 of the engine flags its absence on the signal and
+    # lets the signal through (test_derivatives_optional_gap_flagged_on_signal).
+    # This veto fires only when the feed is present; a missing feed is NOT a
+    # hold here, it is recorded as deriv_missing by the engine.
     taker = snap.get("taker_buy_sell_ratio")  # H3: was "taker_ratio" (dead key)
     if _finite(taker):
         taker = float(taker)
@@ -334,10 +339,15 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
     if adv is not None:
         oi_chg = adv.get("oi_change")
         spike = adv.get("spike")
-        if _finite(oi_chg) and _finite(spike):
-            if float(oi_chg) <= -5.0 and float(spike) >= 2.5:
-                _block("oi_flush", "veto",
-                       f"OI flush cascade (OI {float(oi_chg):+.1f}% with {float(spike):.1f}x liq spike) — high slippage & cascade risk")
+        if not _finite(oi_chg) or not _finite(spike):
+            # M1: fail-closed — open_interest is a REQUIRED derivatives
+            # component; the OI-flush cascade veto cannot be evaluated on
+            # partial data, so hold instead of silently skipping.
+            _block("oi_flush", "hold",
+                   "OI/liquidation inputs incomplete — holding (fail-closed)")
+        elif float(oi_chg) <= -5.0 and float(spike) >= 2.5:
+            _block("oi_flush", "veto",
+                   f"OI flush cascade (OI {float(oi_chg):+.1f}% with {float(spike):.1f}x liq spike) — high slippage & cascade risk")
 
     return blocks
 
