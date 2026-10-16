@@ -564,3 +564,48 @@ def test_live_signal_expiry_override_roundtrip():
     assert cfg.LIVE_SIGNAL_EXPIRY_HOURS == 72.0
     importlib.reload(cfg)
     assert cfg.LIVE_SIGNAL_EXPIRY_HOURS == 24
+def test_new_knobs_wire_end_to_end(dash_env, monkeypatch):
+    """The 7 v2 knobs must survive the full chain: validate -> save/load ->
+    apply_dashboard_overrides -> config attrs (were dead knobs before)."""
+    from dashboard import save_settings, load_settings
+    saved = save_settings({
+        "max_drawdown_cap_pct": 5.0,
+        "max_consecutive_losses": 2,
+        "consecutive_loss_cooldown_hours": 8.0,
+        "market_data_fallback_binance": False,
+        "exec_post_only_entry": True,
+        "cancel_orphan_orders_on_startup": False,
+        "adaptive_volatility_targets": True,
+    }, dash_env)
+    assert saved["max_drawdown_cap_pct"] == 5.0
+    assert saved["max_consecutive_losses"] == 2
+    loaded = load_settings(dash_env)
+    for attr in ("MAX_DRAWDOWN_CAP_PCT", "MAX_CONSECUTIVE_LOSSES",
+                 "CONSECUTIVE_LOSS_COOLDOWN_HOURS",
+                 "MARKET_DATA_FALLBACK_BINANCE", "EXEC_POST_ONLY_ENTRY",
+                 "CANCEL_ORPHAN_ORDERS_ON_STARTUP",
+                 "ADAPTIVE_VOLATILITY_TARGETS"):
+        monkeypatch.setattr(config, attr, getattr(config, attr))
+    config.apply_dashboard_overrides(loaded)
+    assert config.MAX_DRAWDOWN_CAP_PCT == 5.0
+    assert config.MAX_CONSECUTIVE_LOSSES == 2
+    assert isinstance(config.MAX_CONSECUTIVE_LOSSES, int)
+    assert config.CONSECUTIVE_LOSS_COOLDOWN_HOURS == 8.0
+    assert config.MARKET_DATA_FALLBACK_BINANCE is False
+    assert config.EXEC_POST_ONLY_ENTRY is True
+    assert config.CANCEL_ORPHAN_ORDERS_ON_STARTUP is False
+    assert config.ADAPTIVE_VOLATILITY_TARGETS is True
+
+
+def test_new_knobs_tighten_only(dash_env):
+    """Risk knobs may only tighten: wider-than-default values are rejected."""
+    from dashboard import validate_settings
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        validate_settings({"max_drawdown_cap_pct": 50.0})  # default 10
+    with _pt.raises(ValueError):
+        validate_settings({"max_consecutive_losses": 5})  # default 3
+    with _pt.raises(ValueError):
+        validate_settings({"consecutive_loss_cooldown_hours": 1.0})  # min 4
+    with _pt.raises(ValueError):
+        validate_settings({"market_data_fallback_binance": "yes"})
