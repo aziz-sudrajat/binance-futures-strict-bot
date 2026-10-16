@@ -155,6 +155,12 @@ class FakeExchange:
         o = self.orders.get(algo_id)
         return dict(o) if o is not None else None
 
+    def get_open_algo_orders(self, symbol=None):
+        # Mirrors PaperBroker/ExchangeClient.get_open_algo_orders.
+        return [dict(o) for o in self.orders.values()
+                if o["status"] == "NEW" and o.get("algoId") is not None
+                and (symbol is None or o["symbol"] == symbol)]
+
     # test helper: force an order to FILLED
     def fill(self, order_id, px, qty=None):
         o = self.orders[order_id]
@@ -2209,6 +2215,41 @@ def test_h6_orphan_cleanup_keeps_adopted_position_orders(rig):
     assert "ETHUSDT:9002" in cancelled
 
 
+# ---------------------------------------------------------------- M4 regression
+def test_m4_orphan_algo_sweep_runs_on_happy_path(rig):
+    """M4: an orphan algo order (e.g. a STOP_MARKET SL placed via
+    place_algo_order, then a crash before the state save) must be cancelled
+    by cleanup_orphan_orders even when the regular-order sweep succeeds
+    without raising. (The algo sweep used to live inside the regular
+    sweep's except handler - dead code on the happy path.)"""
+    executor, market, exchange, state, lifecycle, risk = rig
+    # Tracked SL algo order of a live managed position -> must be kept.
+    sl = exchange.place_algo_order("BTCUSDT", "SELL", "STOP_MARKET",
+                                   quantity=1.0, trigger_price=95.0,
+                                   reduce_only=True)
+    # Orphan algo order: live on the exchange, unknown to state.
+    orphan = exchange.place_algo_order("ETHUSDT", "SELL", "STOP_MARKET",
+                                       quantity=2.0, trigger_price=2900.0,
+                                       reduce_only=True)
+    # A regular orphan as well, so the regular sweep completes normally.
+    ro = exchange.place_order("XRPUSDT", "SELL", "LIMIT", quantity=5.0,
+                              price=2.0)
+    state._data["positions"] = {
+        "p1": {"symbol": "BTCUSDT", "qty": 1.0, "closed": False,
+               "sl_order_id": sl["algoId"], "tp": {},
+               "entry_order_id": 111},
+    }
+    state.save()
+    cancelled = executor.cleanup_orphan_orders()
+    assert f"ETHUSDT:algo:{orphan['algoId']}" in cancelled, \
+        "orphan algo order was NOT swept on the happy path"
+    assert exchange.orders[orphan["algoId"]]["status"] == "CANCELED"
+    assert exchange.orders[sl["algoId"]]["status"] == "NEW", \
+        "tracked SL algo order was cancelled!"
+    assert f"XRPUSDT:{ro['orderId']}" in cancelled, \
+        "regular orphan was not cancelled"
+
+
 # ---------------------------------------------------------------- H7 regression
 def test_h7_entry_client_id_deterministic_from_sid():
     """H7: the entry clientOrderId must derive from the signal id so a retry
@@ -2278,3 +2319,68 @@ def test_h8_partial_fill_at_timeout_is_adopted_not_stranded(rig, monkeypatch):
     assert abs(pos["qty"] - 0.4) < 1e-9, f"qty not resized to fill: {pos['qty']}"
     assert pos.get("brackets_placed") is True, "brackets not placed for adopted fill"
     assert pos.get("sl_order_id") is not None, "no SL for adopted fill"
+
+
+# ------------------------------------------------- M2/M4 regression (2026-10-17)
+def test_try_open_rejects_when_exchange_already_positioned(rig):
+    # M2: a position opened manually on the exchange after startup is
+    # invisible to the state-based gate 4b — the exchange snapshot check
+    # must block the second entry.
+    executor, market, exchange, state, lifecycle, risk = rig
+    exchange._pos["BTCUSDT"] = 1.0  # manual position, unknown to state
+    ok, note = executor._try_open("BTCUSDT", _signal("BTCUSDT"),
+                                  "sid-m2", 10_000.0)
+    assert not ok
+    assert "already positioned in BTCUSDT on the exchange" in note
+
+
+def test_try_open_rejects_when_positions_snapshot_fails(rig, monkeypatch):
+    # M2 fail-closed: an unfetchable exchange snapshot rejects the entry
+    # instead of risking a double position.
+    executor, market, exchange, state, lifecycle, risk = rig
+
+    def boom():
+        raise RuntimeError("api down")
+
+    monkeypatch.setattr(exchange, "get_positions", boom)
+    ok, note = executor._try_open("BTCUSDT", _signal("BTCUSDT"),
+                                  "sid-m2b", 10_000.0)
+    assert not ok
+    assert "fail-closed" in note
+
+
+def test_cleanup_orphan_orders_cancels_algo_orphans(rig, monkeypatch):
+    # M4: an orphan ALGO order (STOP_MARKET SL placed before a crash, never
+    # tracked in state) must be cancelled via the algo endpoint.
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(exchange, "get_open_orders", lambda: [])
+    monkeypatch.setattr(exchange, "get_open_algo_orders", lambda: [
+        {"algoId": 777, "symbol": "BTCUSDT", "side": "SELL"}])
+    cancelled = []
+    monkeypatch.setattr(
+        exchange, "cancel_algo_order",
+        lambda symbol, algo_id: cancelled.append((symbol, algo_id)) or True)
+    result = executor.cleanup_orphan_orders()
+    assert result == ["BTCUSDT:algo:777"]
+    assert cancelled == [("BTCUSDT", 777)]
+
+
+def test_cleanup_orphan_orders_keeps_tracked_algo_sl(rig, monkeypatch):
+    # M4: an algo SL tracked in state is not an orphan — never cancelled.
+    executor, market, exchange, state, lifecycle, risk = rig
+    state.set("positions", {"p1": {
+        "symbol": "BTCUSDT", "closed": False, "sl_order_id": 777,
+        "sl_is_algo": True,
+        "tp": {"tp1": {"order_id": None}, "tp2": {"order_id": None},
+               "tp3": {"order_id": None}},
+    }})
+    state.save()
+    monkeypatch.setattr(exchange, "get_open_orders", lambda: [])
+    monkeypatch.setattr(exchange, "get_open_algo_orders", lambda: [
+        {"algoId": 777, "symbol": "BTCUSDT", "side": "SELL"}])
+    calls = []
+    monkeypatch.setattr(
+        exchange, "cancel_algo_order",
+        lambda symbol, algo_id: calls.append((symbol, algo_id)) or True)
+    assert executor.cleanup_orphan_orders() == []
+    assert calls == []
