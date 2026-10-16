@@ -493,49 +493,69 @@ class Executor:
             rows = db.get_fresh_signals(limit=config.DB_SCAN_LIMIT)
             log.info("db signals: %d fresh", len(rows))
             for row in rows:
-                sid = row["signal_id"]
-                symbol = row["symbol"]
-                # Live signal expiry (1.4): absolute age gate on created_at,
-                # independent of the scanner-set expires_at. After an executor
-                # crash/restart a row can linger past its usefulness; stale =
-                # fail-closed (marked consumed, logged, never entered).
-                age_h = _signal_age_hours(row)
-                if age_h > config.LIVE_SIGNAL_EXPIRY_HOURS:
-                    self.lifecycle.log(
-                        sid, symbol, REJECTED,
-                        reason=(f"stale db signal: age {age_h:.1f}h > "
-                                f"LIVE_SIGNAL_EXPIRY_HOURS="
-                                f"{config.LIVE_SIGNAL_EXPIRY_HOURS}h"))
+                # M5: one bad row must never abort the batch. A crashed
+                # row is marked consumed (fail-closed, audit-trailed) so a
+                # poison row cannot block every cycle.
+                try:
+                    sid = row["signal_id"]
+                    symbol = row["symbol"]
+                    # Live signal expiry (1.4): absolute age gate on created_at,
+                    # independent of the scanner-set expires_at. After an executor
+                    # crash/restart a row can linger past its usefulness; stale =
+                    # fail-closed (marked consumed, logged, never entered).
+                    age_h = _signal_age_hours(row)
+                    if age_h > config.LIVE_SIGNAL_EXPIRY_HOURS:
+                        self.lifecycle.log(
+                            sid, symbol, REJECTED,
+                            reason=(f"stale db signal: age {age_h:.1f}h > "
+                                    f"LIVE_SIGNAL_EXPIRY_HOURS="
+                                    f"{config.LIVE_SIGNAL_EXPIRY_HOURS}h"))
+                        db.mark_consumed(row["id"])
+                        summary["rejected"] += 1
+                        continue
+                    if self.state.seen_signal(sid):
+                        self.lifecycle.log(sid, symbol, REJECTED,
+                                           reason="duplicate signal id (db)")
+                        db.mark_consumed(row["id"])
+                        summary["rejected"] += 1
+                        continue
+                    signal = db.to_signal(row)
+                    self.lifecycle.log(sid, symbol, APPROVED,
+                                       quality=signal.get("quality"),
+                                       entry=signal.get("entry"),
+                                       stop_loss=signal.get("stop_loss"),
+                                       tp1=signal.get("tp1"),
+                                       tp2=signal.get("tp2"),
+                                       tp3=signal.get("tp3"))
+                    summary["approved"] += 1
+                    if not self._dash_settings().get("auto_trade", True):
+                        self.lifecycle.log(sid, symbol, REJECTED,
+                                           reason="auto-trade disabled (dashboard)")
+                        db.mark_consumed(row["id"])
+                        summary["rejected"] += 1
+                        continue
+                    ok, _note = self._try_open(symbol, signal, sid, balance)
                     db.mark_consumed(row["id"])
+                    if ok:
+                        summary["opened"] += 1
+                    else:
+                        summary["rejected"] += 1
+                except Exception as e:  # noqa: BLE001 - one row never kills the batch
+                    log.exception("db signal %s failed", row.get("signal_id"))
+                    summary["errors"].append(f"db row {row.get('signal_id')}: {e}")
+                    try:
+                        self.lifecycle.log(row.get("signal_id"),
+                                           row.get("symbol"), REJECTED,
+                                           reason=f"db row crashed: {e}")
+                    except Exception:  # noqa: BLE001 - audit trail best effort
+                        pass
+                    try:
+                        db.mark_consumed(row["id"])
+                    except Exception:  # noqa: BLE001 - best effort
+                        log.warning("db mark_consumed failed for row %s",
+                                    row.get("id"))
                     summary["rejected"] += 1
-                    continue
-                if self.state.seen_signal(sid):
-                    self.lifecycle.log(sid, symbol, REJECTED,
-                                       reason="duplicate signal id (db)")
-                    db.mark_consumed(row["id"])
-                    summary["rejected"] += 1
-                    continue
-                signal = db.to_signal(row)
-                self.lifecycle.log(sid, symbol, APPROVED,
-                                   quality=signal.get("quality"),
-                                   entry=signal.get("entry"),
-                                   stop_loss=signal.get("stop_loss"),
-                                   tp1=signal.get("tp1"),
-                                   tp2=signal.get("tp2"),
-                                   tp3=signal.get("tp3"))
-                summary["approved"] += 1
-                if not self._dash_settings().get("auto_trade", True):
-                    self.lifecycle.log(sid, symbol, REJECTED,
-                                       reason="auto-trade disabled (dashboard)")
-                    db.mark_consumed(row["id"])
-                    summary["rejected"] += 1
-                    continue
-                ok, _note = self._try_open(symbol, signal, sid, balance)
-                db.mark_consumed(row["id"])
-                if ok:
-                    summary["opened"] += 1
-                else:
-                    summary["rejected"] += 1
+
         except Exception as e:  # noqa: BLE001 - db failure never kills manage
             log.exception("db scan failed")
             summary["errors"].append(f"db: {e}")
@@ -807,6 +827,25 @@ class Executor:
                 return self._reject(
                     symbol, sid,
                     f"already positioned in {symbol} ({pid})")
+
+        # M2: the exchange is ground truth for gate 4b. A position opened
+        # manually on the exchange after startup is invisible to the
+        # state-based check above until the next restart — without this the
+        # bot would stack a second entry on the same coin (WCTUSDT,
+        # 2026-10-16). Fail-closed: an unfetchable snapshot rejects the
+        # entry rather than risking a double position.
+        try:
+            xp_symbols = {str(p.get("symbol") or "")
+                          for p in self.exchange.get_positions()}
+        except Exception as e:  # noqa: BLE001 - fail-closed on unknown state
+            return self._reject(
+                symbol, sid,
+                f"exchange positions snapshot unavailable ({e}) — "
+                "holding (fail-closed)")
+        if symbol in xp_symbols:
+            return self._reject(
+                symbol, sid,
+                f"already positioned in {symbol} on the exchange")
 
         # 5. TP split must be placeable.
         tp_qty, note = split_tp_qty(
@@ -1835,39 +1874,40 @@ class Executor:
         if not getattr(config, "CANCEL_ORPHAN_ORDERS_ON_STARTUP", True):
             return []
         cancelled = []
+
+        # Order IDs known to belong to live managed positions. Built from
+        # state alone, before either sweep, so the algo sweep can use them
+        # even if the regular sweep raises.
+        known_order_ids = set()
+        for pos in self.state.get("positions", {}).values():
+            if pos.get("closed"):
+                continue
+            if pos.get("entry_order_id"):
+                known_order_ids.add(str(pos["entry_order_id"]))
+            if pos.get("sl_order_id"):
+                known_order_ids.add(str(pos["sl_order_id"]))
+            for leg in ("tp1", "tp2", "tp3"):
+                tp_data = pos.get("tp", {}).get(leg, {})
+                if tp_data.get("order_id"):
+                    known_order_ids.add(str(tp_data["order_id"]))
+
+        # H6: adopted (unmanaged) positions' real orders must NOT be
+        # cancelled. reconcile() cannot know their order IDs (it stores
+        # tp={} / sl_order_id=None), so every live order on those
+        # symbols would look like an orphan. Exempt their symbols and
+        # surface the orders for manual review instead.
+        unmanaged_symbols = {
+            str(pos.get("symbol") or "") for pos in
+            self.state.get("positions", {}).values()
+            if not pos.get("closed") and pos.get("unmanaged")
+        }
+        unmanaged_symbols.discard("")
+
+        # --- regular-order sweep ---
         try:
             get_open = getattr(self.exchange, "get_open_orders", None)
-            if not callable(get_open):
-                return []
-            open_orders = get_open()
-            if not open_orders:
-                return []
-            known_order_ids = set()
-            for pos in self.state.get("positions", {}).values():
-                if pos.get("closed"):
-                    continue
-                if pos.get("entry_order_id"):
-                    known_order_ids.add(str(pos["entry_order_id"]))
-                if pos.get("sl_order_id"):
-                    known_order_ids.add(str(pos["sl_order_id"]))
-                for leg in ("tp1", "tp2", "tp3"):
-                    tp_data = pos.get("tp", {}).get(leg, {})
-                    if tp_data.get("order_id"):
-                        known_order_ids.add(str(tp_data["order_id"]))
-
-            # H6: adopted (unmanaged) positions' real orders must NOT be
-            # cancelled. reconcile() cannot know their order IDs (it stores
-            # tp={} / sl_order_id=None), so every live order on those
-            # symbols would look like an orphan. Exempt their symbols and
-            # surface the orders for manual review instead.
-            unmanaged_symbols = {
-                str(pos.get("symbol") or "") for pos in
-                self.state.get("positions", {}).values()
-                if not pos.get("closed") and pos.get("unmanaged")
-            }
-            unmanaged_symbols.discard("")
-
-            for o in open_orders:
+            open_orders = get_open() if callable(get_open) else []
+            for o in open_orders or []:
                 oid = str(o.get("orderId", ""))
                 sym = o.get("symbol", "")
                 if oid and oid not in known_order_ids:
@@ -1887,5 +1927,45 @@ class Executor:
                     except Exception:  # noqa: BLE001
                         pass
         except Exception:  # noqa: BLE001
-            log.exception("cleanup_orphan_orders failed")
+            log.exception("cleanup_orphan_orders: regular-order sweep failed")
+
+        # --- algo-order sweep (M4) ---
+        # Orphan ALGO orders (e.g. a STOP_MARKET SL placed via
+        # place_algo_order in _place_brackets, then a crash before the
+        # state save) are invisible to the regular-order sweep above. An
+        # orphan algo stop can market-close an unrelated later position
+        # on the same symbol - so the algo book is swept on EVERY run.
+        # (2026-10-17 cyb: this block used to live inside the except
+        # handler above, i.e. it only ran when the regular sweep raised -
+        # dead code on the happy path.)
+        try:
+            get_algo = getattr(self.exchange, "get_open_algo_orders", None)
+            cancel_algo = getattr(self.exchange, "cancel_algo_order", None)
+            if callable(get_algo) and callable(cancel_algo):
+                try:
+                    algo_orders = get_algo() or []
+                except Exception:  # noqa: BLE001
+                    algo_orders = []
+                    log.warning("orphan sweep: get_open_algo_orders failed")
+                for o in algo_orders:
+                    aid = str(o.get("algoId", "") or "")
+                    sym = str(o.get("symbol", "") or "")
+                    if not aid or aid in known_order_ids:
+                        continue
+                    if sym in unmanaged_symbols:
+                        log.warning(
+                            "Keeping algo order %s (%s): symbol has an "
+                            "adopted/unmanaged position - manual review, "
+                            "NOT cancelling", aid, sym)
+                        continue
+                    log.warning(
+                        "Cancelling orphan algo order %s (%s) not tracked "
+                        "in state", aid, sym)
+                    try:
+                        if cancel_algo(sym, int(aid)):
+                            cancelled.append(f"{sym}:algo:{aid}")
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            log.exception("cleanup_orphan_orders: algo-order sweep failed")
         return cancelled
