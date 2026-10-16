@@ -138,8 +138,12 @@ def test_mode_files():
 
 
 def test_build_status_paper(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "EXEC_STATE_FILE",
-                        str(tmp_path / "state.json"))
+    # Paper status reads the PAPER state file, not the default one —
+    # patch the right path so a live paper loop can't contaminate the test.
+    monkeypatch.setattr(config, "EXEC_PAPER_STATE_FILE",
+                        str(tmp_path / "state-paper.json"))
+    monkeypatch.setattr(config, "EXEC_PAPER_LIFECYCLE_FILE",
+                        str(tmp_path / "lifecycle-paper.jsonl"))
     st = build_status("paper")
     assert st["mode"] == "paper"
     assert st["balance_ok"] is True  # PaperBroker needs no keys
