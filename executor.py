@@ -28,7 +28,7 @@ from lifecycle import LifecycleLogger
 from lifecycle import (
     GENERATED, APPROVED, REJECTED, ENTRY_TRIGGERED, POSITION_OPENED,
     TP1_HIT, TP2_HIT, TP3_HIT, SL_HIT, MANUAL_CLOSE, EXPIRED, CANCELLED,
-    PROFIT_TAKE,
+    PROFIT_TAKE, TRAIL_STOP, TIME_STOP,
 )
 from risk import floor_to_step, quantize_price
 log = logging.getLogger("executor")
@@ -851,6 +851,34 @@ class Executor:
                 if margin > 0 and unreal >= margin * config.PROFIT_TAKE_PCT / 100:
                     self._take_profit(pos_id, pos, sid, summary, mark)
                     return
+        # Trailing stop: once unrealized hits TRAIL_TRIGGER_PCT% of margin,
+        # lock in gains — market-close on TRAIL_DISTANCE_PCT% pullback from
+        # the trailed peak. Bot-side trigger (the exchange SL stays as the
+        # hard stop). Fail-closed on price fetch failure.
+        if (config.TRAIL_TRIGGER_PCT > 0 and config.TRAIL_DISTANCE_PCT > 0
+                and pos["qty"] > 0):
+            mark = self.market.get_live_price(symbol)
+            if mark and self._trail_check(pos_id, pos, sid, summary, mark):
+                return
+        # Time stop: stale positions tie up margin and the edge decays —
+        # market-close anything open longer than TIME_STOP_HOURS.
+        # Fail-closed: no live price -> skip this cycle.
+        if config.TIME_STOP_HOURS > 0 and pos["qty"] > 0:
+            opened_at = pos.get("opened_at") or 0
+            if opened_at <= 0:
+                # Unknown age: skip with a warning, never instant-close a
+                # position whose open time we cannot prove (review 2026-10-16).
+                log.warning("%s time_stop: missing opened_at, skipping",
+                            pos_id)
+            elif ((time.time() * 1000 - opened_at) / 3_600_000
+                    >= config.TIME_STOP_HOURS):
+                mark = self.market.get_live_price(symbol)
+                if mark:
+                    age_h = (time.time() * 1000 - opened_at) / 3_600_000
+                    self._flat_position(
+                        pos_id, pos, sid, summary, mark, "time_stop",
+                        TIME_STOP, reason=f"time_stop after {age_h:.1f}h")
+                    return
         # Cross-check against the exchange: SL may have filled without us
         # seeing the order event (e.g. after a restart). FAIL-CLOSED: if the
         # positions snapshot cannot be fetched, skip the check this cycle —
@@ -1149,13 +1177,15 @@ class Executor:
         summary["managed"] += 1
         self.state.save()
 
-    def _take_profit(self, pos_id: str, pos: dict, sid: str,
-                     summary: dict, mark_px: float) -> None:
-        """Market-close the full position at the +PROFIT_TAKE_PCT% target.
+    def _flat_position(self, pos_id: str, pos: dict, sid: str,
+                       summary: dict, mark_px: float, closed_reason: str,
+                       lifecycle_state: str, reason: str = "") -> None:
+        """Cancel working brackets, then market-close the full position.
 
-        Cancels working TP/SL brackets first, then closes reduce-only at
-        market. Realized PnL is computed from the actual fill (fees
-        deducted). Logs a terminal `profit_take` lifecycle event.
+        Shared by profit_take / trail_stop / time_stop. Realized PnL is
+        computed from the actual fill (fees deducted). A terminal lifecycle
+        event is logged. Callers decide when to invoke; this never triggers
+        on its own.
         """
         symbol = pos["symbol"]
         direction = pos.get("direction", "LONG")
@@ -1167,15 +1197,16 @@ class Executor:
                 try:
                     self.exchange.cancel_order(symbol, order_id=oid)
                 except Exception:  # noqa: BLE001 - best effort
-                    log.warning("%s profit_take: cancel %s failed", pos_id, leg)
+                    log.warning("%s %s: cancel %s failed", pos_id,
+                                closed_reason, leg)
         if pos.get("sl_order_id"):
             self._sl_cancel(symbol, pos)
         side = "SELL" if direction == "LONG" else "BUY"
         order = self.exchange.place_order(symbol, side, "MARKET",
                                           quantity=qty, reduce_only=True)
         if not order:
-            log.warning("%s profit_take market close failed, retry next cycle",
-                        pos_id)
+            log.warning("%s %s market close failed, retry next cycle",
+                        pos_id, closed_reason)
             return
         fill_px = float(order.get("avgPrice") or mark_px)
         sign = 1.0 if direction == "LONG" else -1.0
@@ -1186,17 +1217,63 @@ class Executor:
         self.risk.record_realized(net)
         pos["qty"] = 0.0
         pos["closed"] = True
-        pos["closed_reason"] = "profit_take"
+        pos["closed_reason"] = closed_reason
         pos["closed_at"] = int(time.time() * 1000)
         pos["close_price"] = fill_px
-        self.lifecycle.log(sid, symbol, PROFIT_TAKE, price=fill_px, qty=qty,
-                           pnl=round(net, 4), terminal=True,
-                           reason=(f"profit_take +{config.PROFIT_TAKE_PCT:g}% "
-                                   "of margin"))
+        self.lifecycle.log(sid, symbol, lifecycle_state, price=fill_px,
+                           qty=qty, pnl=round(net, 4), terminal=True,
+                           reason=reason)
         summary["managed"] += 1
         self.state.save()
-        log.info("%s profit_take closed @ %s (pnl %+0.2f)", pos_id, fill_px,
-                 net)
+        log.info("%s %s closed @ %s (pnl %+0.2f)", pos_id, closed_reason,
+                 fill_px, net)
+
+    def _take_profit(self, pos_id: str, pos: dict, sid: str,
+                     summary: dict, mark_px: float) -> None:
+        """Market-close the full position at the +PROFIT_TAKE_PCT% target."""
+        self._flat_position(pos_id, pos, sid, summary, mark_px,
+                            "profit_take", PROFIT_TAKE,
+                            reason=(f"profit_take +{config.PROFIT_TAKE_PCT:g}% "
+                                    "of margin"))
+
+    def _trail_check(self, pos_id: str, pos: dict, sid: str,
+                     summary: dict, mark: float) -> bool:
+        """Trailing-stop state machine. Returns True if the position was
+        closed by the trailing stop this cycle.
+
+        Activation: unrealized PnL >= TRAIL_TRIGGER_PCT% of margin.
+        After activation the peak price is trailed; a pullback of
+        TRAIL_DISTANCE_PCT% from the peak market-closes the position.
+        """
+        direction = pos.get("direction", "LONG")
+        sign = 1.0 if direction == "LONG" else -1.0
+        unreal = sign * (mark - pos["entry_price"]) * pos["qty"]
+        margin = pos.get("margin_usdt") or 0.0
+        if not pos.get("trail_active"):
+            if margin > 0 and unreal >= margin * config.TRAIL_TRIGGER_PCT / 100:
+                pos["trail_active"] = True
+                pos["trail_peak"] = mark
+                self.state.save()
+                log.info("%s trailing stop activated @ %s", pos_id, mark)
+            return False
+        peak = pos.get("trail_peak") or mark
+        if ((direction == "LONG" and mark > peak)
+                or (direction == "SHORT" and mark < peak)):
+            pos["trail_peak"] = mark
+            peak = mark
+            self.state.save()
+        dist = config.TRAIL_DISTANCE_PCT / 100
+        if direction == "LONG":
+            hit = mark <= peak * (1 - dist)
+        else:
+            hit = mark >= peak * (1 + dist)
+        if hit:
+            self._flat_position(
+                pos_id, pos, sid, summary, mark, "trail_stop", TRAIL_STOP,
+                reason=(f"trail_stop -{config.TRAIL_DISTANCE_PCT:g}% "
+                        f"from peak {peak:g}"))
+            return True
+        return False
 
     def _close_reconciled_positions(self, pos_ids: list) -> None:
         """Attribute terminal lifecycle events to startup-reconciled closes.
