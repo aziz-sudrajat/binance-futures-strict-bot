@@ -35,7 +35,7 @@ from urllib.parse import urlencode
 import requests
 
 import config
-import httputil
+import rate_limiter
 
 log = logging.getLogger("executor.exchange")
 
@@ -63,7 +63,7 @@ class ExchangeClient:
         self._secret = api_secret.encode()
         self.base_url = base_url.rstrip("/")
         self.recv_window = recv_window_ms
-        self.session = session or httputil.ThrottledSession()
+        self.session = session or requests.Session()
         self._exchange_info: dict | None = None
         self._exchange_info_ts: float = 0.0
 
@@ -87,6 +87,7 @@ class ExchangeClient:
             headers = {}
         url = self.base_url + path
         try:
+            rate_limiter.wait("binance")
             r = self.session.request(method, url, params=params,
                                      headers=headers,
                                      timeout=config.HTTP_TIMEOUT_SEC)
@@ -202,6 +203,40 @@ class ExchangeClient:
                 except (TypeError, ValueError):
                     return None
         return None
+
+    def get_wallet_balance(self, asset: str = "USDT") -> float | None:
+        """Realized wallet balance for the asset (excludes locked margin).
+
+        Unlike get_balance() (availableBalance), the wallet balance only
+        moves on realized PnL (fills, funding, fees) — it is immune to
+        initial-margin locks when positions open. Use this for loss
+        metrics (daily-loss kill switch), never availableBalance (H1).
+        """
+        try:
+            acct = self._request("GET", "/fapi/v2/account")
+        except ExchangeError:
+            return None
+        for a in acct.get("assets", []):
+            if a.get("asset") == asset:
+                try:
+                    return float(a.get("walletBalance", 0))
+                except (TypeError, ValueError):
+                    return None
+        try:
+            return float(acct.get("totalWalletBalance", 0))
+        except (TypeError, ValueError):
+            return None
+
+    def get_margin_balance(self) -> float | None:
+        """Account equity (wallet + unrealized PnL), for drawdown guards."""
+        try:
+            acct = self._request("GET", "/fapi/v2/account")
+        except ExchangeError:
+            return None
+        try:
+            return float(acct.get("totalMarginBalance", 0))
+        except (TypeError, ValueError):
+            return None
 
     def get_positions(self) -> list[dict]:
         """Open positions (positionAmt != 0), normalized to a small dict.
@@ -409,3 +444,32 @@ class ExchangeClient:
         except ExchangeError as e:
             log.warning("get_open_algo_orders -> %s", e)
             return []
+
+    # ------------------------------------------------- user data stream
+    def create_listen_key(self) -> str | None:
+        """Create a user data stream listenKey (valid for 60m)."""
+        try:
+            res = self._request("POST", "/fapi/v1/listenKey", signed=False)
+            return res.get("listenKey") if isinstance(res, dict) else None
+        except ExchangeError as e:
+            log.warning("create_listen_key failed: %s", e)
+            return None
+
+    def keepalive_listen_key(self) -> bool:
+        """Ping user data stream listenKey to prevent expiry."""
+        try:
+            self._request("PUT", "/fapi/v1/listenKey", signed=False)
+            return True
+        except ExchangeError as e:
+            log.warning("keepalive_listen_key failed: %s", e)
+            return False
+
+    def close_listen_key(self) -> bool:
+        """Close user data stream listenKey."""
+        try:
+            self._request("DELETE", "/fapi/v1/listenKey", signed=False)
+            return True
+        except ExchangeError as e:
+            log.warning("close_listen_key failed: %s", e)
+            return False
+
