@@ -1,3 +1,10 @@
+# Copyright (c) 2026 aziz-sudrajat <azizsudrajat.stb4@gmail.com>
+# https://github.com/aziz-sudrajat
+#
+# All rights reserved. This file is part of the binance-futures-strict-bot project.
+# Unauthorized copying, modification, distribution, or false claim of
+# authorship is prohibited.
+
 """STRICT signal engine — port of the GAS bot's decision pipeline.
 
 GAS source: workspace/user/files/AZZATSSINS-20261013-imageperf-v4_5_02o2.gs
@@ -433,8 +440,8 @@ def mtf_cascade_check(klines_4h: list, klines_1d: list, a30: dict,
 
 
 # ------------------------------------------------- mode-based signal layers
-# User spec 2026-10-15 (+ aturan MTF 2026-10-15: SEMUA mode cek MTF 4h/1h/30m/15m):
-#   biasa : 15m indicators + MTF alignment (4h, 1h, 30m, 15m all same
+# User spec 2026-10-15 (+ aturan MTF 2026-10-15, cascade 2026-10-16: SEMUA mode cek MTF 4h/1h/30m/15m/5m):
+#   biasa : 15m indicators + MTF alignment (4h, 1h, 30m, 15m, 5m all same
 #           direction). Bidirectional, no BTC/veto/derivatives.
 #   sedang: biasa + BTC direction must match.
 #           + BTC 15m direction must match.
@@ -454,9 +461,10 @@ def _dir_of_signal(sig: str) -> str:
 def mtf_alignment_check(symbol: str, market, direction: str,
                         a15: dict | None = None,
                         a30: dict | None = None) -> tuple[bool, str]:
-    """sedang/ketat: 4h, 1h, 30m, 15m must ALL point the signal direction.
+    """sedang/ketat: 4h, 1h, 30m, 15m, 5m must ALL point the signal direction.
 
-    15m/30m use the indicator setup direction; 4h/1h use the EMA21/50
+    Cascade order (user spec 2026-10-16): 4h -> 1h -> 30m -> 15m -> 5m.
+    15m/30m/5m use the indicator setup direction; 4h/1h use the EMA21/50
     trend. Fail-closed on any data error — never assume alignment.
     """
     want = "BULLISH" if direction == "BULLISH" else "BEARISH"
@@ -467,23 +475,25 @@ def mtf_alignment_check(symbol: str, market, direction: str,
         if a30 is None:
             a30 = analyze_candles(symbol, "30m",
                                   market.get_klines(symbol, "30m"))
+        a5m = analyze_candles(symbol, "5m",
+                              market.get_klines(symbol, "5m"))
         k4h = market.get_klines(symbol, "4h")
         k1h = market.get_klines(symbol, "1h")
     except Exception as e:  # noqa: BLE001
         return False, f"MTF data error: {e} — holding (fail-closed)"
     legs = {
-        "15m": _dir_of_signal(a15.get("signal")),
-        "30m": _dir_of_signal(a30.get("signal")),
         "4h": mtf_trend_direction([float(c["close"]) for c in k4h]),
         "1h": mtf_trend_direction([float(c["close"]) for c in k1h]),
+        "30m": _dir_of_signal(a30.get("signal")),
+        "15m": _dir_of_signal(a15.get("signal")),
+        "5m": _dir_of_signal(a5m.get("signal")),
     }
     bad = [tf for tf, d in legs.items() if d != want]
     if bad:
-        detail = ", ".join(f"{tf}={legs[tf].lower()}" for tf in
-                           ("15m", "30m", "1h", "4h"))
+        detail = ", ".join(f"{tf}={legs[tf].lower()}" for tf in legs)
         return False, (f"MTF tak selaras ({detail}; "
                        f"butuh {want.lower()} semua)")
-    return True, f"MTF selaras {want.lower()} (15m/30m/1h/4h)"
+    return True, f"MTF selaras {want.lower()} (4h/1h/30m/15m/5m)"
 
 
 def btc_direction_check(market, direction: str) -> tuple[bool, str]:
@@ -707,7 +717,7 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
     """Mode-dispatched signal pipeline (user spec 2026-10-15).
 
     - biasa : 15m indicators (MACD, MA/EMA, RSI) + MTF alignment
-      4h/1h/30m/15m. Bidirectional.
+      4h/1h/30m/15m/5m. Bidirectional.
     - sedang: biasa + BTC 15m direction must match.
     - ketat : sedang + pattern review + news review + liquidation review
       + whale review + derivatives coverage + deterministic vetoes +
@@ -756,9 +766,9 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
 
     reviews = [f"15m {sig15.lower()} (strength {a15['strength']}/5)"]
 
-    # ---- Stage 2: MTF alignment — 4h, 1h, 30m, 15m same direction
-    # (SEMUA mode — aturan user 2026-10-15: setiap signal cek MTF
-    # 4h-1h-30m-15m). Fail-closed.
+    # ---- Stage 2: MTF alignment — 4h, 1h, 30m, 15m, 5m same direction
+    # (SEMUA mode — aturan user 2026-10-15, cascade 2026-10-16: setiap signal
+    # cek MTF 4h-1h-30m-15m-5m). Fail-closed.
     try:
         a30 = analyze_candles(symbol, "30m", market.get_klines(symbol, "30m"))
     except Exception as e:  # noqa: BLE001
