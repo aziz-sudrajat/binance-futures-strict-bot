@@ -988,7 +988,15 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
             delta_notes.append(f"{_dname}: degraded — no historical "
                                f"derivatives feed (backtest limitation)")
     else:
-        adv = market.get_advanced_derivatives(symbol)
+        # M6: fail closed with a clean hold, never a raw exception. A
+        # raising derivatives feed means the warn-tier deltas cannot be
+        # computed honestly; returning (None, reason) holds the signal
+        # exactly like a veto block.
+        try:
+            adv = market.get_advanced_derivatives(symbol)
+        except Exception as e:  # noqa: BLE001 - unevaluable -> hold
+            return None, (f"derivatives feed unavailable ({e}) — "
+                          "holding (fail-closed)")
         lev = leverage_risk_index(adv["retail_long"], adv["funding"],
                                   adv["oi_usd"], adv["volume_24h"],
                                   adv.get("spike") or 0.0)
