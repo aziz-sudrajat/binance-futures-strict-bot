@@ -136,6 +136,15 @@ PROFIT_TAKE_PCT = 0.0          # auto TP: market-close the whole position once
                                # unrealized PnL reaches this % of margin.
                                # 0 = off. User 2026-10-16: "+20% langsung TP"
                                # (live). Dashboard knob: profit_take_pct.
+TRAIL_TRIGGER_PCT = 0.0        # trailing stop: activate once unrealized PnL
+                               # reaches this % of margin. 0 = off.
+                               # Dashboard knob: trail_trigger_pct.
+TRAIL_DISTANCE_PCT = 0.0       # trailing stop: market-close when price pulls
+                               # back this % from the trailed peak. 0 = off.
+                               # Dashboard knob: trail_distance_pct.
+TIME_STOP_HOURS = 0.0          # time stop: market-close a position open longer
+                               # than this many hours. 0 = off.
+                               # Dashboard knob: time_stop_hours.
 
 # ------------------------------------------------------- backtest defaults
 # ROADMAP ITEM 4 (honest backtester). Costs are applied per side; every
@@ -300,6 +309,13 @@ DASH_NUMERIC_OVERRIDES = {
     # reaches this % of the position margin. 0 = off (default).
     # User 2026-10-16: "+20% langsung TP" (live).
     "profit_take_pct": ("PROFIT_TAKE_PCT", 0, 100),
+    # trailing stop: activate at +% of margin, exit on -% pullback from
+    # peak. Both 0 = off (default). User 2026-10-16.
+    "trail_trigger_pct": ("TRAIL_TRIGGER_PCT", 0, 100),
+    "trail_distance_pct": ("TRAIL_DISTANCE_PCT", 0, 20),
+    # time stop: close positions open longer than N hours. 0 = off.
+    # User 2026-10-16.
+    "time_stop_hours": ("TIME_STOP_HOURS", 0, 168),
 }
 # Boolean engine knobs: setting name -> config attribute.
 DASH_BOOL_OVERRIDES = {
@@ -471,6 +487,11 @@ DASHBOARD_DEFAULTS = {
     "max_exposure_pct_per_symbol": 20.0,
     # profit take: close whole position at +% of margin (0 = off)
     "profit_take_pct": 0.0,
+    # trailing stop: trigger +% of margin, distance % from peak (0 = off)
+    "trail_trigger_pct": 0.0,
+    "trail_distance_pct": 0.0,
+    # time stop: close positions open longer than N hours (0 = off)
+    "time_stop_hours": 0.0,
 }
 
 _ORIGINALS: dict = {}
