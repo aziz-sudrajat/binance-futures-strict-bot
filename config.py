@@ -12,6 +12,14 @@ CFG block lines 13-160) so the Python port makes identical decisions.
 Risk defaults below are user-correctable and feed Phase 2 (executor).
 """
 
+import os
+
+# ------------------------------------------------------------------ logging
+# LOG_JSON=1 / true / yes -> log one JSON object per line (logutil.py)
+# instead of the human-readable default. Readable stays the default.
+LOG_JSON = os.environ.get("BOT_LOG_JSON", "").strip().lower() in (
+    "1", "true", "yes")
+
 # ---------------------------------------------------------------- STRICT gate
 MIN_QUALITY_SCORE = 70          # GAS: getMinQuality_() -> 70 when SIGNAL_FILTER_MODE='STRICT' (L3137-3141)
 MTF_TIMEFRAMES = ("15m", "30m", "4h", "1d")
@@ -47,6 +55,11 @@ SIGNAL_MODE = "ketat"         # ketat | sedang | biasa — set from dashboard
 # ------------------------------------------------- indicator / setup constants
 KLINES_LIMIT = 220              # GAS: CFG.KLINES_LIMIT (L97)
 MIN_CANDLES = 80                # GAS: analyzeCandles_ requires >= 80 (L1905)
+# Item 3.1: multi-exchange klines fallback. Default OFF = historical
+# fail-closed behavior (OKX down -> RuntimeError, never another venue's
+# tape). Opt-in only: when True and OKX fails, get_klines falls back to
+# Gate.io USDT futures klines (candles tagged "source": "gateio").
+KLINES_FALLBACK_ENABLED = False
 SIGNAL_MIN_SCORE = 5            # GAS: CFG.SIGNAL_MIN_SCORE (L98)
 MIN_STRENGTH = 3                # GAS: AUTO_MIN_STRENGTH, minS = max(3, ...) (L98, L7535)
 BULLISH_ONLY = True             # GAS: CFG.BULLISH_ONLY (L84) -> STRICT is effectively LONG-only
@@ -127,7 +140,6 @@ BTC_BREAKER_TTL_SEC = 300           # own cache for the market-wide breaker chec
 # breakout above resistance) is allowed.
 SR_ZONE_LOOKBACK_4H = 500
 SR_ZONE_ATR_MULT = 2.5
-BTC_BREAKER_TTL_SEC = 300           # own cache for the market-wide breaker check
 ADV_DERIV_CACHE_SEC = 120           # Gate contract-stats cache (GAS DERIVATIVES_CACHE_SECONDS L50)
 ADV_DERIV_STATS_LIMIT = 48          # 48 x 15m buckets ~ 12h: 16-bucket window + history (GAS L1002)
 ORDER_BOOK_DEPTH_LIMIT = 100        # depth levels fetched for the wall veto
@@ -185,6 +197,13 @@ EXEC_POLL_INTERVAL_MIN = 5
 EXEC_MAX_EXPOSURE_PCT_PER_SYMBOL = 20.0  # max position notional as % of balance
 EXEC_BREAKEVEN_AFTER_TP1 = True           # move SL to entry once TP1 fills
 EXEC_SIGNAL_ID_TTL_HOURS = 72             # processed signal IDs are kept this long
+LIVE_SIGNAL_EXPIRY_HOURS = 24            # absolute max age (hours) of a
+                                         # signals.db row before the executor
+                                         # rejects it fail-closed. Defense in
+                                         # depth on top of the scanner-set
+                                         # expires_at: after an executor crash
+                                         # / restart a row can linger; older
+                                         # than this = no entry, no exceptions.
 EXEC_RECV_WINDOW_MS = 10000
 EXEC_STATE_FILE = "state.json"
 EXEC_LIFECYCLE_FILE = "lifecycle.jsonl"
@@ -282,8 +301,40 @@ DB_SCAN_LIMIT = 20  # max fresh signals considered per executor cycle
 # GAS: klinesTtlSec_ per interval (L418-428), DERIVATIVES_CACHE_SECONDS=120 (L50)
 KLINES_TTL_SEC = {"5m": 300, "15m": 480, "30m": 720, "1h": 1200, "4h": 2400, "1d": 7200}
 DERIVATIVES_CACHE_SEC = 120
+# Max entries per MarketData in-memory cache (klines / derivatives / ctVal).
+# Working-set math: klines keys are {symbol}_{interval}_{limit} and the
+# engine touches 5 intervals (15m/30m/1h/4h/1d), so universe 'all'
+# (~485 symbols) needs ~2425 klines keys alone. The bound must stay above
+# that or LRU thrash collapses the hit rate on 'scan all'. 4000 leaves
+# headroom for derivatives/ctVal keys too; TTL semantics unchanged.
+DATA_CACHE_MAX_ENTRIES = 4000
 DERIVATIVES_PERIOD = "4h"       # GAS: CFG.DERIVATIVES_DEFAULT_PERIOD (L51)
 HTTP_TIMEOUT_SEC = 15
+
+# ------------------------------------------------- HTTP throttle + retry
+# Shared by ExchangeClient (exchange.py) and MarketData (data.py) through
+# httputil.ThrottledSession: minimum gap between requests + bounded retries
+# with exponential backoff + jitter for transient failures (HTTP 429/5xx,
+# timeouts, connection errors). Non-429 4xx responses are never retried.
+HTTP_MIN_INTERVAL_SEC = 0.1  # max ~10 req/s per session; softens scan bursts
+HTTP_MAX_RETRIES = 3         # retries per request (total attempts = 4)
+HTTP_BACKOFF_BASE_SEC = 1.0  # first backoff window; doubles per retry
+
+# ------------------------------------------------- WebSocket price feed
+# Item 2.5: OKX public-WS ticker cache (wsfeed.py) as the first price
+# source for the executor's freshness re-check. REST polling stays as
+# the automatic fail-safe fallback — this changes the price SOURCE only,
+# never trading/signal/risk logic.
+WS_PRICE_FEED_ENABLED = True  # master switch; False = pure REST, as before
+WS_STALE_SEC = 30.0           # WS price older than this counts as stale
+                              # and falls back to REST
+
+# ------------------------------------------------- scanner parallelism
+# ThreadPoolExecutor workers for the all-coin scanner pass (scanner.py) and
+# the phase-1 paper scanner (scan.py). The scan is I/O-bound (OKX REST), so
+# threads are safe and need no new dependency (no aiohttp migration).
+# 1 = legacy sequential behavior (kept as the exact fallback path).
+SCAN_MAX_WORKERS = 4  # OKX rate limits still enforced via the shared session
 
 # ------------------------------------------------- dashboard studio overrides
 # Trading-studio settings (dashboard.py writes dashboard_settings.json; the
@@ -323,6 +374,12 @@ DASH_NUMERIC_OVERRIDES = {
     # time stop: close positions open longer than N hours. 0 = off.
     # User 2026-10-16.
     "time_stop_hours": ("TIME_STOP_HOURS", 0, 168),
+    # WS price feed (item 2.5): how old a cached WS tick may be before
+    # the freshness re-check falls back to REST polling.
+    "ws_stale_sec": ("WS_STALE_SEC", 5, 300),
+    # live signal expiry (item 1.4): max age (hours) of a signals.db row
+    # before the executor rejects it fail-closed. 1 = strict, 72 = lenient.
+    "live_signal_expiry_hours": ("LIVE_SIGNAL_EXPIRY_HOURS", 1, 72),
 }
 # Boolean engine knobs: setting name -> config attribute.
 DASH_BOOL_OVERRIDES = {
@@ -336,6 +393,9 @@ DASH_BOOL_OVERRIDES = {
     "whale_review": "WHALE_REVIEW",
     "breakeven_after_tp1": "EXEC_BREAKEVEN_AFTER_TP1",
     "trading_hours_enabled": "TRADING_HOURS_ENABLED",
+    # WS price feed master switch (item 2.5): False = pure REST polling,
+    # exactly the pre-2.5 behavior.
+    "ws_price_feed_enabled": "WS_PRICE_FEED_ENABLED",
 }
 # MTF 30m leg mode: STRICT (default) or LEAN (GAS default behavior).
 DASH_MTF_MODES = ("STRICT", "LEAN")
@@ -454,6 +514,11 @@ DASHBOARD_DEFAULTS = {
     "min_quality_score": 70,
     "min_24h_volume_usd": 2_000_000.0,
     "freshness_max_drift_pct": 0.4,
+    # WS price feed (item 2.5): prefer OKX WS ticker cache for the
+    # freshness re-check; REST stays as automatic fallback.
+    "ws_price_feed_enabled": True,
+    "ws_stale_sec": 30.0,
+    "live_signal_expiry_hours": 24.0,
     "bullish_only": True,
     "mtf_30m_mode": "STRICT",
     "mtf_require_1d": True,     # 1d trend alignment: hard gate (ketat)
