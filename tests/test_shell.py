@@ -160,12 +160,12 @@ def test_apply_signal_mode_preset():
     assert s["min_quality_score"] == 50
     assert s["bullish_only"] is False  # biasa = bidirectional (LONG+SHORT)
     assert s["mtf_require_1d"] is False
-    assert s["mtf_require_1h"] is True  # aturan 2026-10-15/16: semua mode cek MTF 4h/1h/30m/15m/5m
+    assert s["mtf_require_1h"] is True  # aturan 2026-10-15: semua mode cek MTF 4h/1h/30m/15m
     assert s["btc_align_required"] is False
     assert s["veto_funding"] is False  # biasa: no vetoes
     assert s["news_check"] is False
     dashboard.apply_signal_mode_preset(s, "sedang")
-    assert s["mtf_require_1h"] is True  # sedang: 4h/1h/30m/15m/5m + BTC
+    assert s["mtf_require_1h"] is True  # sedang: 4h/1h/30m/15m + BTC
     assert s["btc_align_required"] is True
     assert s["pattern_required"] is False
     dashboard.apply_signal_mode_preset(s, "ketat")
