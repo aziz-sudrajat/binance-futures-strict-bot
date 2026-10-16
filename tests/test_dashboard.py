@@ -549,3 +549,18 @@ def test_executor_dash_settings_delegates_to_dashboard(dash_env):
         got = e._dash_settings()
         assert got == dashboard.load_settings(dash_env, mode=mode)
         assert got["auto_trade"] is want
+
+
+def test_live_signal_expiry_override_roundtrip():
+    """Dashboard knob live_signal_expiry_hours reaches the executor gate."""
+    import importlib
+    import config as cfg
+    importlib.reload(cfg)
+    assert cfg.LIVE_SIGNAL_EXPIRY_HOURS == 24
+    cfg.apply_dashboard_overrides({"live_signal_expiry_hours": 6})
+    assert cfg.LIVE_SIGNAL_EXPIRY_HOURS == 6.0
+    # out of range is clamped, not applied raw
+    cfg.apply_dashboard_overrides({"live_signal_expiry_hours": 999})
+    assert cfg.LIVE_SIGNAL_EXPIRY_HOURS == 72.0
+    importlib.reload(cfg)
+    assert cfg.LIVE_SIGNAL_EXPIRY_HOURS == 24
