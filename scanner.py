@@ -23,6 +23,13 @@ tickers fetch, then the full engine runs only on the surviving
 candidates — identical approvals, a fraction of the HTTP cost.
 Use --no-two-stage for the legacy single pass.
 
+Parallel evaluation: stage 2 runs in a ThreadPoolExecutor (max_workers
+from config.SCAN_MAX_WORKERS). Each worker thread gets its own MarketData
+(thread-local; the TTL caches are not thread-safe); the shared
+ThrottledSession keeps the global OKX rate limit intact. Results are
+yielded in input order — deterministic, identical DB contents to the
+sequential path. max_workers=1 takes the sequential stage-2 path.
+
 Run:
     .venv/bin/python scanner.py --once          # single full pass
     .venv/bin/python scanner.py --loop          # continuous (default 15 min)
@@ -36,17 +43,35 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("scanner")
 
 import config
+import httputil
 from data import MarketData, normalize_symbol
 from signal_engine import evaluate_symbol, prefilter_symbol
 from executor import signal_candle_close_ms, make_signal_id
 from signals_db import SignalDB
+
+# One MarketData per worker THREAD (thread-local): the in-memory TTL
+# caches inside MarketData are not thread-safe, so they are never shared
+# between threads — but reusing one instance per thread keeps the
+# cross-symbol caches useful (e.g. the CoinTelegraph news cache, TTL 900s,
+# is then fetched ~once per thread per pass instead of once per symbol).
+_thread_markets = threading.local()
+
+
+def _worker_market(session) -> MarketData:
+    md = getattr(_thread_markets, "market", None)
+    if md is None or md.session is not session:
+        md = MarketData(session=session)
+        _thread_markets.market = md
+    return md
 
 STATE_FILE = "scanner_state.json"
 THROTTLE_SEC = 0.15  # polite gap between symbols (OKX rate limits)
@@ -98,38 +123,58 @@ def _select_candidates(symbols: list[str], market: MarketData,
     return candidates
 
 
-def run_pass(market: MarketData, db: SignalDB,
-             expiry_min: int = 30, two_sided: bool = False,
-             two_stage: bool = True) -> dict:
-    """One full pass over all symbols. Returns stats.
+def _scan_one_symbol(symbol: str, session) -> dict:
+    """Evaluate ONE symbol inside a worker thread.
 
-    two_sided=True mirrors the LIVE bot (bullish_only=False): both LONG
-    and SHORT signals are evaluated. Default is long-only (ketat preset).
+    The worker uses its thread's own MarketData(session=session) — see
+    _worker_market: the in-memory TTL caches inside MarketData are NOT
+    thread-safe, so they are never shared between threads. The shared
+    httputil.ThrottledSession keeps the global OKX rate limit intact
+    (its token bucket is lock-protected).
 
-    two_stage=True (default): stage 1 runs the cheap prefilter
-    (prefilter_symbol: engine stages 0-2) over the whole universe with one
-    bulk tickers fetch, then stage 2 runs the full engine only on the
-    candidates. Provably identical approvals to a single-stage pass
-    (candidates are a superset of approvable symbols) at a fraction of
-    the HTTP cost. two_stage=False keeps the legacy single pass.
+    Returns {"symbol", "signal", "note", "signal_id", "error"}; "error" is
+    None on success ("signal" None = rejected). Per-symbol exceptions never
+    propagate — fail-closed, exactly like the sequential path.
     """
-    # Studio settings apply to the scanner too (quality threshold etc.).
-    from dashboard import load_settings
-    config.apply_dashboard_overrides(load_settings(mode="live"))
-    if two_sided:
-        config.BULLISH_ONLY = False
-    t0 = time.time()
-    symbols = list_symbols(market)
+    result = {"symbol": symbol, "signal": None, "note": "",
+              "signal_id": None, "error": None}
+    try:
+        worker_market = _worker_market(session)
+        signal, note = evaluate_symbol(symbol, worker_market)
+        result["note"] = note
+        if signal is None:
+            return result
+        close_ms = signal_candle_close_ms(worker_market, symbol)
+        result["signal"] = signal
+        result["signal_id"] = make_signal_id(
+            symbol, close_ms, signal.get("direction", "LONG"))
+    except Exception as e:  # noqa: BLE001 - one symbol never kills a scan
+        result["error"] = str(e)
+    return result
+
+
+def evaluate_symbols_ordered(symbols: list[str], market,
+                             max_workers: int):
+    """Evaluate symbols in a ThreadPoolExecutor.
+
+    Yields per-symbol result dicts (see _scan_one_symbol) in INPUT order —
+    deterministic regardless of which thread finishes first. DB writes and
+    logging stay in the caller (single thread) in that same order, so
+    downstream code sees the same ordering as the sequential scan.
+    """
+    session = getattr(market, "session", None) or httputil.ThrottledSession()
+    workers = max(1, int(max_workers))
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="scan") as ex:
+        yield from ex.map(_scan_one_symbol, symbols,
+                          [session] * len(symbols))
+
+
+def _evaluate_sequential(symbols: list[str], market: MarketData,
+                         db: SignalDB, expiry_min: int) -> tuple[int, int, int]:
+    """Stage 2, sequential: full engine per symbol, one at a time."""
     approved = rejected = errors = 0
-    prefilter_rejected = 0
-    eval_symbols = symbols
-    if two_stage and symbols:
-        tickers = _prime_tickers(market)
-        eval_symbols = _select_candidates(symbols, market, tickers)
-        prefilter_rejected = len(symbols) - len(eval_symbols)
-        log.info("two-stage: %d/%d candidates survive prefilter",
-                 len(eval_symbols), len(symbols))
-    for i, symbol in enumerate(eval_symbols):
+    for i, symbol in enumerate(symbols):
         try:
             signal, note = evaluate_symbol(symbol, market)
             if signal is None:
@@ -146,13 +191,96 @@ def run_pass(market: MarketData, db: SignalDB,
             errors += 1
             log.debug("scan %s failed: %s", symbol, e)
         if (i + 1) % 50 == 0:
-            log.info("progress %d/%d", i + 1, len(eval_symbols))
+            log.info("progress %d/%d", i + 1, len(symbols))
         time.sleep(THROTTLE_SEC)
+    return approved, rejected, errors
+
+
+def _evaluate_parallel(symbols: list[str], market: MarketData,
+                       db: SignalDB, expiry_min: int,
+                       max_workers: int) -> tuple[int, int, int]:
+    """Stage 2, parallel: full engine in worker threads.
+
+    Evaluation runs in threads (each with its own MarketData); DB upserts
+    and logging happen here in the main thread, in symbol order, so stats
+    and DB contents match the sequential path. Pacing is handled by the
+    shared ThrottledSession's rate limiter instead of the fixed
+    per-symbol sleep.
+    """
+    approved = rejected = errors = 0
+    for i, res in enumerate(
+            evaluate_symbols_ordered(symbols, market, max_workers)):
+        symbol = res["symbol"]
+        try:
+            if res["error"] is not None:
+                errors += 1
+                log.debug("scan %s failed: %s", symbol, res["error"])
+            elif res["signal"] is None:
+                rejected += 1
+            else:
+                db.upsert_signal(res["signal"], res["signal_id"],
+                                 expiry_min=expiry_min)
+                approved += 1
+                log.info("APPROVED %s Q=%s -> db", symbol,
+                         res["signal"].get("quality"))
+        except Exception as e:  # noqa: BLE001 - one symbol never kills a pass
+            errors += 1
+            log.debug("scan %s failed: %s", symbol, e)
+        if (i + 1) % 50 == 0:
+            log.info("progress %d/%d", i + 1, len(symbols))
+    return approved, rejected, errors
+
+
+def run_pass(market: MarketData, db: SignalDB,
+             expiry_min: int = 30, two_sided: bool = False,
+             two_stage: bool = True,
+             max_workers: int | None = None) -> dict:
+    """One full pass over all symbols. Returns stats.
+
+    two_sided=True mirrors the LIVE bot (bullish_only=False): both LONG
+    and SHORT signals are evaluated. Default is long-only (ketat preset).
+
+    two_stage=True (default): stage 1 runs the cheap prefilter
+    (prefilter_symbol: engine stages 0-2) over the whole universe with one
+    bulk tickers fetch, then stage 2 runs the full engine only on the
+    candidates. Provably identical approvals to a single-stage pass
+    (candidates are a superset of approvable symbols) at a fraction of
+    the HTTP cost. two_stage=False keeps the legacy single pass.
+
+    max_workers: stage-2 thread-pool size; None -> config.SCAN_MAX_WORKERS.
+    max_workers=1 takes the sequential stage-2 path (identical behavior).
+    """
+    # Studio settings apply to the scanner too (quality threshold etc.).
+    from dashboard import load_settings
+    config.apply_dashboard_overrides(load_settings(mode="live"))
+    if two_sided:
+        config.BULLISH_ONLY = False
+    t0 = time.time()
+    symbols = list_symbols(market)
+    prefilter_rejected = 0
+    eval_symbols = symbols
+    if two_stage and symbols:
+        tickers = _prime_tickers(market)
+        eval_symbols = _select_candidates(symbols, market, tickers)
+        prefilter_rejected = len(symbols) - len(eval_symbols)
+        log.info("two-stage: %d/%d candidates survive prefilter",
+                 len(eval_symbols), len(symbols))
+    workers = config.SCAN_MAX_WORKERS if max_workers is None else max_workers
+    if max(1, int(workers)) == 1:
+        approved, rejected, errors = _evaluate_sequential(
+            eval_symbols, market, db, expiry_min)
+    else:
+        log.info("parallel stage-2: %d workers on %d candidates",
+                 max(1, int(workers)), len(eval_symbols))
+        approved, rejected, errors = _evaluate_parallel(
+            eval_symbols, market, db, expiry_min, max(1, int(workers)))
     expired = db.expire_old()
     stats = {
         "at": int(time.time() * 1000),
         "symbols": len(symbols),
         "two_stage": two_stage,
+        "two_sided": two_sided,
+        "workers": max(1, int(workers)),
         "candidates": len(eval_symbols),
         "prefilter_rejected": prefilter_rejected,
         "approved": approved,
@@ -184,6 +312,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="two-stage scan: cheap prefilter over all symbols, "
                          "full engine on candidates only (default on; "
                          "--no-two-stage for the legacy single pass)")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="stage-2 parallel workers (default: "
+                         "config.SCAN_MAX_WORKERS; 1 = sequential)")
     args = ap.parse_args(argv)
 
     market = MarketData()
@@ -191,14 +322,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.once:
             run_pass(market, db, expiry_min=args.expiry_min,
-                     two_sided=args.two_sided, two_stage=args.two_stage)
+                     two_sided=args.two_sided, two_stage=args.two_stage,
+                     max_workers=args.workers)
             return 0
         interval = max(5, args.interval)
         log.info("scanner loop every %d min (Ctrl+C to stop)", interval)
         while True:
             try:
                 run_pass(market, db, expiry_min=args.expiry_min,
-                         two_sided=args.two_sided, two_stage=args.two_stage)
+                         two_sided=args.two_sided, two_stage=args.two_stage,
+                         max_workers=args.workers)
             except Exception:  # noqa: BLE001 - loop never dies on a pass
                 log.exception("pass failed")
             time.sleep(interval * 60)
