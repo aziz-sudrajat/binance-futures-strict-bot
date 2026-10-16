@@ -22,6 +22,7 @@ import datetime
 import itertools
 import logging
 import math
+import time
 
 import config
 
@@ -135,6 +136,56 @@ class RiskManager:
             return False, reason
         return True, f"daily PnL {balance - start:+.2f} USDT ({-loss_pct:+.2f}%)"
 
+    def check_max_drawdown(self) -> tuple[bool, str]:
+        """Circuit breaker: stops trading if equity drops N% from peak balance.
+
+        Tracks a high-watermark of account balance in state["risk_metrics"].
+        When drawdown from the peak reaches MAX_DRAWDOWN_CAP_PCT, engages
+        the kill switch. Disabled when the knob is 0 (default).
+        """
+        cap_pct = float(getattr(config, "MAX_DRAWDOWN_CAP_PCT", 0.0) or 0.0)
+        if cap_pct <= 0:
+            return True, "drawdown guard disabled"
+        metrics = self.state.get("risk_metrics", {})
+        hwm = float(metrics.get("high_watermark") or 0.0)
+        balance = self.get_balance()
+        if balance is None:
+            return False, "balance unavailable - holding (fail-closed)"
+        if balance > hwm:
+            metrics["high_watermark"] = balance
+            self.state.set("risk_metrics", metrics)
+            self.state.save()
+            return True, f"new high watermark: ${balance:,.2f}"
+        if hwm <= 0:
+            metrics["high_watermark"] = balance
+            self.state.set("risk_metrics", metrics)
+            self.state.save()
+            return True, f"initial high watermark: ${balance:,.2f}"
+        dd_pct = (hwm - balance) / hwm * 100.0
+        if dd_pct >= cap_pct:
+            reason = (f"max drawdown breach: {dd_pct:.2f}% >= cap {cap_pct:g}% "
+                      f"(peak ${hwm:,.2f} -> now ${balance:,.2f})")
+            self.engage_kill_switch(reason)
+            return False, reason
+        return True, f"drawdown from peak: {dd_pct:.2f}% (safe < {cap_pct:g}%)"
+
+    def check_consecutive_losses(self) -> tuple[bool, str]:
+        """True if not currently paused by consecutive-losses cooldown.
+
+        After MAX_CONSECUTIVE_LOSSES losing trades in a row, new entries
+        are paused for CONSECUTIVE_LOSS_COOLDOWN_HOURS. The pause is
+        recorded in state["risk_metrics"]["cooldown_until_ms"].
+        """
+        metrics = self.state.get("risk_metrics", {})
+        cooldown_until = int(metrics.get("cooldown_until_ms") or 0)
+        now_ms = int(time.time() * 1000)
+        if cooldown_until > now_ms:
+            rem_m = (cooldown_until - now_ms) / 60_000
+            losses = metrics.get("consecutive_losses", 0)
+            return False, (f"consecutive loss cooldown active after {losses} losses "
+                           f"({rem_m:.1f}m remaining)")
+        return True, "no cooldown active"
+
     # ------------------------------------------------------------ new entry
     def check_can_open(self, symbol: str, notional: float,
                        open_count: int) -> tuple[bool, str]:
@@ -143,6 +194,12 @@ class RiskManager:
         ok, reason = self.check_daily_loss()
         if not ok:
             return False, reason
+        ok_dd, reason_dd = self.check_max_drawdown()
+        if not ok_dd:
+            return False, reason_dd
+        ok_cool, reason_cool = self.check_consecutive_losses()
+        if not ok_cool:
+            return False, reason_cool
         if open_count >= self.max_positions:
             return False, (f"max concurrent positions reached "
                            f"({open_count}/{self.max_positions})")
@@ -163,6 +220,28 @@ class RiskManager:
         daily = self.state.get("daily", {})
         daily["realized_pnl"] = (daily.get("realized_pnl") or 0.0) + pnl
         self.state.set("daily", daily)
+
+        # Update consecutive losses & cooldown (user feature 2026-10-16):
+        # after MAX_CONSECUTIVE_LOSSES losing trades, pause new entries
+        # for CONSECUTIVE_LOSS_COOLDOWN_HOURS. A winning trade resets
+        # the counter. Breakeven (pnl == 0) leaves the counter unchanged.
+        metrics = self.state.get("risk_metrics", {})
+        losses = int(metrics.get("consecutive_losses") or 0)
+        max_losses = int(getattr(config, "MAX_CONSECUTIVE_LOSSES", 3) or 3)
+        cooldown_h = float(getattr(config, "CONSECUTIVE_LOSS_COOLDOWN_HOURS", 4.0) or 4.0)
+
+        if pnl < 0:
+            losses += 1
+            metrics["consecutive_losses"] = losses
+            if max_losses > 0 and losses >= max_losses and cooldown_h > 0:
+                until_ms = int(time.time() * 1000 + cooldown_h * 3600 * 1000)
+                metrics["cooldown_until_ms"] = until_ms
+                log.warning("CONSECUTIVE LOSS COOLDOWN: %d losses in a row -> paused for %gh",
+                            losses, cooldown_h)
+        elif pnl > 0:
+            metrics["consecutive_losses"] = 0
+
+        self.state.set("risk_metrics", metrics)
         self.state.save()
 
 
