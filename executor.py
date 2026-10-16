@@ -1181,7 +1181,13 @@ class Executor:
         except (TypeError, ValueError):
             fill_px = pos["entry_price"]
         pos["entry_price"] = fill_px
-        pos["qty"] = filled_qty
+        # Review 2026-10-17: re-adopt after a partial dust close must not
+        # restore the entry order's original executedQty — _flat_position
+        # tracks the residual in pos["qty"], and a reduceOnly close larger
+        # than the exchange position is rejected every cycle (-2022),
+        # wedging the retry forever. On first adopt pos["qty"] is the
+        # requested qty >= filled_qty, so the clamp is a no-op there.
+        pos["qty"] = min(filled_qty, pos.get("qty") or filled_qty)
         lev = pos.get("leverage") or 1
         pos["margin_usdt"] = round(filled_qty * fill_px / lev, 2) if lev else 0.0
         try:
@@ -1196,17 +1202,34 @@ class Executor:
             # -close it now rather than hold an un-exitable position.
             log.error("%s adopted fill %s unsplittable (%s) - market-closing",
                       pos_id, filled_qty, note)
-            side = "SELL" if pos.get("direction") == "LONG" else "BUY"
+            # Close through _flat_position (fill-verified, retry-on-failure)
+            # rather than an inline blind close: a failed/partial market
+            # close must never be recorded as closed (phantom flat). On a
+            # residual the dust branch is re-entered each cycle via
+            # _check_entry_fill -> re-adopt (never-bracketed positions take
+            # the early return, not the pending_close block); the residual
+            # qty is clamped above so the retry closes what the exchange
+            # actually holds. The terminal EXPIRED event is logged only
+            # once the close actually completes.
             try:
-                self.exchange.place_order(symbol, side, "MARKET",
-                                          quantity=filled_qty,
-                                          reduce_only=True)
+                mark = self.market.get_live_price(symbol)
             except Exception:  # noqa: BLE001
-                log.exception("%s dust close failed", pos_id)
-            pos["closed"] = True
-            pos["closed_reason"] = f"adopted dust fill {filled_qty:g} closed"
-            self.lifecycle.log(sid, symbol, EXPIRED,
-                               reason=pos["closed_reason"], terminal=True)
+                mark = None
+            try:
+                self._flat_position(
+                    pos_id, pos, sid, {"managed": 0, "errors": []},
+                    mark or fill_px,
+                    f"adopted dust fill {filled_qty:g} closed",
+                    EXPIRED, reason=f"dust fill {note}")
+            except Exception:  # noqa: BLE001 - never strand a dust fill
+                # _flat_position's place_order is unwrapped by design; the
+                # manual_entry path reaches _adopt_filled_entry without a
+                # surrounding try/except, so arm the retry here instead of
+                # letting an exchange error strand a live residual.
+                log.exception("%s dust close raised", pos_id)
+                self._mark_pending_close(
+                    pos, f"adopted dust fill {filled_qty:g} closed",
+                    EXPIRED, reason=f"dust fill {note}")
             self.state.save()
             return
         for leg, q in zip(("tp1", "tp2", "tp3"), tp_qty):
