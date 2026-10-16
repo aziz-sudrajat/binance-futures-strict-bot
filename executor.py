@@ -28,6 +28,7 @@ from lifecycle import LifecycleLogger
 from lifecycle import (
     GENERATED, APPROVED, REJECTED, ENTRY_TRIGGERED, POSITION_OPENED,
     TP1_HIT, TP2_HIT, TP3_HIT, SL_HIT, MANUAL_CLOSE, EXPIRED, CANCELLED,
+    PROFIT_TAKE,
 )
 from risk import floor_to_step, quantize_price
 log = logging.getLogger("executor")
@@ -836,6 +837,19 @@ class Executor:
         if pos["qty"] <= 0:
             self._close_position(pos_id, pos, sid, summary)
             return
+        # Profit-take: market-close the whole position once unrealized PnL
+        # reaches +PROFIT_TAKE_PCT% of margin (user 2026-10-16: "+20%
+        # langsung TP", live). Fail-closed: no live price -> skip this
+        # cycle, never close blind.
+        if config.PROFIT_TAKE_PCT > 0 and pos["qty"] > 0:
+            mark = self.market.get_live_price(symbol)
+            if mark:
+                sign = 1.0 if pos.get("direction") == "LONG" else -1.0
+                unreal = sign * (mark - pos["entry_price"]) * pos["qty"]
+                margin = pos.get("margin_usdt") or 0.0
+                if margin > 0 and unreal >= margin * config.PROFIT_TAKE_PCT / 100:
+                    self._take_profit(pos_id, pos, sid, summary, mark)
+                    return
         # Cross-check against the exchange: SL may have filled without us
         # seeing the order event (e.g. after a restart). FAIL-CLOSED: if the
         # positions snapshot cannot be fetched, skip the check this cycle —
@@ -1133,6 +1147,55 @@ class Executor:
             self.risk.record_realized(net)
         summary["managed"] += 1
         self.state.save()
+
+    def _take_profit(self, pos_id: str, pos: dict, sid: str,
+                     summary: dict, mark_px: float) -> None:
+        """Market-close the full position at the +PROFIT_TAKE_PCT% target.
+
+        Cancels working TP/SL brackets first, then closes reduce-only at
+        market. Realized PnL is computed from the actual fill (fees
+        deducted). Logs a terminal `profit_take` lifecycle event.
+        """
+        symbol = pos["symbol"]
+        direction = pos.get("direction", "LONG")
+        qty = pos["qty"]
+        for leg in ("tp1", "tp2", "tp3"):
+            tpleg = (pos.get("tp") or {}).get(leg) or {}
+            oid = tpleg.get("order_id")
+            if oid and not tpleg.get("filled"):
+                try:
+                    self.exchange.cancel_order(symbol, order_id=oid)
+                except Exception:  # noqa: BLE001 - best effort
+                    log.warning("%s profit_take: cancel %s failed", pos_id, leg)
+        if pos.get("sl_order_id"):
+            self._sl_cancel(symbol, pos)
+        side = "SELL" if direction == "LONG" else "BUY"
+        order = self.exchange.place_order(symbol, side, "MARKET",
+                                          quantity=qty, reduce_only=True)
+        if not order:
+            log.warning("%s profit_take market close failed, retry next cycle",
+                        pos_id)
+            return
+        fill_px = float(order.get("avgPrice") or mark_px)
+        sign = 1.0 if direction == "LONG" else -1.0
+        pnl = sign * (fill_px - pos["entry_price"]) * qty
+        fee = fill_px * qty * _FEE_PCT / 100
+        net = pnl - fee
+        pos["realized"] = pos.get("realized", 0.0) + net
+        self.risk.record_realized(net)
+        pos["qty"] = 0.0
+        pos["closed"] = True
+        pos["closed_reason"] = "profit_take"
+        pos["closed_at"] = int(time.time() * 1000)
+        pos["close_price"] = fill_px
+        self.lifecycle.log(sid, symbol, PROFIT_TAKE, price=fill_px, qty=qty,
+                           pnl=round(net, 4), terminal=True,
+                           reason=(f"profit_take +{config.PROFIT_TAKE_PCT:g}% "
+                                   "of margin"))
+        summary["managed"] += 1
+        self.state.save()
+        log.info("%s profit_take closed @ %s (pnl %+0.2f)", pos_id, fill_px,
+                 net)
 
     def _close_reconciled_positions(self, pos_ids: list) -> None:
         """Attribute terminal lifecycle events to startup-reconciled closes.
