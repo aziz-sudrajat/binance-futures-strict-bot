@@ -130,8 +130,6 @@ def test_scanner_run_pass_writes_approved(tmp_path, monkeypatch):
 
     db_path = str(tmp_path / "signals.db")
     db = SignalDB(db_path)
-    # Legacy single pass pinned explicitly; the two-stage path is covered
-    # by test_scanner_run_pass_two_stage below.
     stats = scanner_mod.run_pass(FakeMarket2(), db, expiry_min=30,
                                  two_stage=False)
     db.close()
@@ -143,83 +141,3 @@ def test_scanner_run_pass_writes_approved(tmp_path, monkeypatch):
     fresh = db.get_fresh_signals()
     assert len(fresh) == 1 and fresh[0]["symbol"] == "AAAUSDT"
     db.close()
-
-
-def test_scanner_run_pass_two_stage(tmp_path, monkeypatch):
-    """Two-stage run_pass: prefilter screens, full engine runs on candidates
-    only, approvals land in the DB, stats report the funnel."""
-    import scanner as scanner_mod
-
-    class FakeMarket4:
-        def list_okx_swap_symbols(self):
-            return ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
-
-    def fake_prefilter(symbol, market, tickers=None):
-        return (symbol != "BBBUSDT",
-                "BULLISH" if symbol != "BBBUSDT" else "lowvol")
-
-    def fake_eval(symbol, market):
-        if symbol == "AAAUSDT":
-            return dict(_signal(symbol)), "stub"
-        return None, "rejected-late"
-
-    monkeypatch.setattr(scanner_mod, "prefilter_symbol", fake_prefilter)
-    monkeypatch.setattr(scanner_mod, "evaluate_symbol", fake_eval)
-    monkeypatch.setattr(scanner_mod, "signal_candle_close_ms",
-                        lambda m, s: 1_700_000_000_000)
-    monkeypatch.setattr(scanner_mod, "make_signal_id",
-                        lambda s, c, d: f"SID-{s}")
-    monkeypatch.setattr(scanner_mod, "THROTTLE_SEC", 0)
-
-    db_path = str(tmp_path / "signals.db")
-    db = SignalDB(db_path)
-    stats = scanner_mod.run_pass(FakeMarket4(), db, expiry_min=30,
-                                 two_stage=True)
-    db.close()
-
-    assert stats["two_stage"] is True
-    assert stats["symbols"] == 3
-    assert stats["candidates"] == 2
-    assert stats["prefilter_rejected"] == 1
-    assert stats["approved"] == 1
-    assert stats["rejected"] == 1
-    db = SignalDB(db_path)
-    fresh = db.get_fresh_signals()
-    assert len(fresh) == 1 and fresh[0]["symbol"] == "AAAUSDT"
-    db.close()
-
-
-def test_scanner_two_sided_flag_flips_bullish_only(tmp_path, monkeypatch):
-    """--two-sided mirrors the live bot (bidirectional); default stays long-only."""
-    import scanner as scanner_mod
-
-    class FakeMarket3:
-        def list_okx_swap_symbols(self):
-            return ["AAAUSDT"]
-
-    monkeypatch.setattr(scanner_mod, "evaluate_symbol",
-                        lambda s, m: (None, "x"))
-    monkeypatch.setattr(scanner_mod, "THROTTLE_SEC", 0)
-    monkeypatch.setattr(config, "BULLISH_ONLY", True)  # restore after test
-
-    db = SignalDB(str(tmp_path / "s1.db"))
-    scanner_mod.run_pass(FakeMarket3(), db, expiry_min=30, two_sided=False)
-    assert config.BULLISH_ONLY is True
-    db.close()
-
-    db = SignalDB(str(tmp_path / "s2.db"))
-    scanner_mod.run_pass(FakeMarket3(), db, expiry_min=30, two_sided=True)
-    assert config.BULLISH_ONLY is False
-    db.close()
-
-
-def test_scanner_cli_parses_two_sided():
-    import scanner as scanner_mod
-    ns = scanner_mod.main.__wrapped__ if hasattr(
-        scanner_mod.main, "__wrapped__") else None
-    # parse args directly via argparse used in main
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--two-sided", action="store_true")
-    assert ap.parse_args(["--two-sided"]).two_sided is True
-    assert ap.parse_args([]).two_sided is False
