@@ -1508,6 +1508,192 @@ def test_profit_take_off_by_default(rig):
     assert "profit_take" not in [e["state"] for e in lifecycle.read_all()]
 
 
+# ------------------------------------------------------- trailing stop
+def _trail_pos(**kw):
+    pos = _profit_take_pos()
+    pos.update(kw)
+    return pos
+
+
+def test_trail_stop_activates_and_closes_on_pullback(rig, monkeypatch):
+    # Trigger +10% of margin, distance 2%: LONG activates at 110, trails
+    # the peak to 115, then a >2% pullback closes the whole position.
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "TRAIL_TRIGGER_PCT", 10.0)
+    monkeypatch.setattr(config, "TRAIL_DISTANCE_PCT", 2.0)
+    pos = _trail_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    # Cycle 1: +$10 unrealized on $1 margin -> activates, peak = 110.
+    market.live = 110.0
+    exchange.market_price["BTCUSDT"] = 110.0
+    exchange._pos["BTCUSDT"] = 1.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos.get("trail_active") is True
+    assert pos["trail_peak"] == 110.0
+    assert pos.get("closed") is not True
+    # Cycle 2: new peak 115 -> peak trails up, no close.
+    market.live = 115.0
+    exchange.market_price["BTCUSDT"] = 115.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos["trail_peak"] == 115.0
+    assert pos.get("closed") is not True
+    # Cycle 3: pullback to 112.0 (2.6% from peak) -> market close.
+    market.live = 112.0
+    exchange.market_price["BTCUSDT"] = 112.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos["closed"] is True
+    assert pos["closed_reason"] == "trail_stop"
+    evts = [e for e in lifecycle.read_all() if e["state"] == "trail_stop"]
+    assert len(evts) == 1 and evts[0]["terminal"] is True
+    closes = [o for o in exchange.orders.values()
+              if o.get("type") == "MARKET" and o.get("reduceOnly")]
+    assert len(closes) == 1 and closes[0]["side"] == "SELL"
+
+
+def test_trail_stop_not_before_trigger(rig, monkeypatch):
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "TRAIL_TRIGGER_PCT", 10.0)
+    monkeypatch.setattr(config, "TRAIL_DISTANCE_PCT", 2.0)
+    pos = _trail_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 100.05                     # +$0.05 < $0.10 trigger
+    exchange.market_price["BTCUSDT"] = 100.05
+    exchange._pos["BTCUSDT"] = 1.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos.get("trail_active") is not True
+    assert pos.get("closed") is not True
+    assert "trail_stop" not in [e["state"] for e in lifecycle.read_all()]
+
+
+def test_trail_stop_short_direction(rig, monkeypatch):
+    # SHORT: activates when price FALLS 10% of margin; peak trails down;
+    # closes on a 2% bounce up from the trough.
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "TRAIL_TRIGGER_PCT", 10.0)
+    monkeypatch.setattr(config, "TRAIL_DISTANCE_PCT", 2.0)
+    pos = _trail_pos(direction="SHORT")
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 90.0
+    exchange.market_price["BTCUSDT"] = 90.0
+    exchange._pos["BTCUSDT"] = -1.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos.get("trail_active") is True
+    assert pos["trail_peak"] == 90.0
+    market.live = 92.0                       # 2.2% bounce from trough
+    exchange.market_price["BTCUSDT"] = 92.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos["closed"] is True
+    assert pos["closed_reason"] == "trail_stop"
+    closes = [o for o in exchange.orders.values()
+              if o.get("type") == "MARKET" and o.get("reduceOnly")]
+    assert len(closes) == 1 and closes[0]["side"] == "BUY"
+
+
+def test_trail_stop_off_by_default(rig):
+    # Both knobs 0 (default) -> no activation even deep in profit.
+    executor, market, exchange, state, lifecycle, risk = rig
+    assert config.TRAIL_TRIGGER_PCT == 0.0
+    assert config.TRAIL_DISTANCE_PCT == 0.0
+    pos = _trail_pos()
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 200.0
+    exchange.market_price["BTCUSDT"] = 200.0
+    exchange._pos["BTCUSDT"] = 1.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos.get("trail_active") is not True
+    assert pos.get("closed") is not True
+    assert "trail_stop" not in [e["state"] for e in lifecycle.read_all()]
+
+
+# ------------------------------------------------------- time stop
+def _time_stop_pos(age_hours):
+    import time as _t
+    pos = _profit_take_pos()
+    pos["opened_at"] = int(_t.time() * 1000) - int(age_hours * 3_600_000)
+    return pos
+
+
+def test_time_stop_closes_stale_position(rig, monkeypatch):
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "TIME_STOP_HOURS", 4.0)
+    pos = _time_stop_pos(age_hours=5)
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 101.0
+    exchange.market_price["BTCUSDT"] = 101.0
+    exchange._pos["BTCUSDT"] = 1.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos["closed"] is True
+    assert pos["closed_reason"] == "time_stop"
+    evts = [e for e in lifecycle.read_all() if e["state"] == "time_stop"]
+    assert len(evts) == 1 and evts[0]["terminal"] is True
+    closes = [o for o in exchange.orders.values()
+              if o.get("type") == "MARKET" and o.get("reduceOnly")]
+    assert len(closes) == 1 and closes[0]["side"] == "SELL"
+
+
+def test_time_stop_not_before_hours(rig, monkeypatch):
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "TIME_STOP_HOURS", 4.0)
+    pos = _time_stop_pos(age_hours=2)
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 101.0
+    exchange.market_price["BTCUSDT"] = 101.0
+    exchange._pos["BTCUSDT"] = 1.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True
+    assert "time_stop" not in [e["state"] for e in lifecycle.read_all()]
+
+
+def test_time_stop_missing_opened_at_skips(rig, monkeypatch):
+    # Review 2026-10-16: unknown age must skip, never instant-close.
+    executor, market, exchange, state, lifecycle, risk = rig
+    monkeypatch.setattr(config, "TIME_STOP_HOURS", 4.0)
+    pos = _profit_take_pos()                # no opened_at key at all
+    assert "opened_at" not in pos
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 101.0
+    exchange.market_price["BTCUSDT"] = 101.0
+    exchange._pos["BTCUSDT"] = 1.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True
+    assert "time_stop" not in [e["state"] for e in lifecycle.read_all()]
+    closes = [o for o in exchange.orders.values()
+              if o.get("type") == "MARKET" and o.get("reduceOnly")]
+    assert closes == []
+
+
+def test_time_stop_off_by_default(rig):
+    executor, market, exchange, state, lifecycle, risk = rig
+    assert config.TIME_STOP_HOURS == 0.0
+    pos = _time_stop_pos(age_hours=100)
+    state._data["positions"] = {"p1": pos}
+    state.save()
+    market.live = 101.0
+    exchange.market_price["BTCUSDT"] = 101.0
+    exchange._pos["BTCUSDT"] = 1.0
+    executor._manage_one("p1", pos, 10_000.0, _mgmt_summary())
+    pos = state.get("positions")["p1"]
+    assert pos.get("closed") is not True
+    assert "time_stop" not in [e["state"] for e in lifecycle.read_all()]
+
+
 # ------------------------------------------------- stale entry limit orders
 def _stale_entry_pos(entry_order_id, age_min):
     import time as _t
