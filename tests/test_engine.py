@@ -91,12 +91,13 @@ def test_build_trade_plan_math():
     # pullback = min(100, max(99.5, 99)) = 99.5
     # entry   = max(100 - 0.5*1, 99.5) = 99.5
     assert p["entry"] == pytest.approx(99.5)
-    # stop = min(99.5 - 1.25, 97 - 0.1) = 96.9 -> max(96.9, 99.5 - 2.0) = 97.5
-    assert p["stop_loss"] == pytest.approx(97.5)
-    # risk = max(2.0, 0.5) = 2.0; tp1 = 99.5 + 2*1.5
-    assert p["tp1"] == pytest.approx(102.5)
-    assert p["tp2"] == pytest.approx(104.0)
-    assert p["tp3"] == pytest.approx(105.5)
+    # V21 widened clamps [1.5x, 3.0x] ATR:
+    # stop = min(99.5 - 1.5, 97 - 0.1) = 96.9 -> max(96.9, 99.5 - 3.0) = 96.9
+    assert p["stop_loss"] == pytest.approx(96.9)
+    # risk = max(2.6, 0.5) = 2.6; tp1 = 99.5 + 2.6*1.5
+    assert p["tp1"] == pytest.approx(103.4)
+    assert p["tp2"] == pytest.approx(105.35)
+    assert p["tp3"] == pytest.approx(107.3)
     assert p["rr1"] == pytest.approx(1.5)
     assert p["entry_low"] == pytest.approx(99.4)   # zone = 0.1 * atr
     assert p["entry_high"] == pytest.approx(99.6)
@@ -108,6 +109,25 @@ def test_build_trade_plan_atr_guard():
     p = build_trade_plan("BULLISH WATCH", 100.0, 100.0, 100.0, 0.0, cs)
     assert p["atr"] == pytest.approx(0.5)  # max(price*0.005, 1e-8)
     assert p["stop_loss"] < p["entry"]
+
+
+def test_stop_atr_defaults_widened_v21():
+    # V21 fix (2026-10-17): 1.25x-2.0x ATR stops were wicked out by
+    # normal 15m chop (4 of 5 SL-hit SHORTs). Defaults widened.
+    config.reset_dashboard_overrides()
+    assert config.STOP_ATR_MIN == 1.5
+    assert config.STOP_ATR_MAX == 3.0
+
+
+def test_build_trade_plan_stop_within_widened_bounds(monkeypatch):
+    # Behavioral: stop distance clamps to [STOP_ATR_MIN, STOP_ATR_MAX] x ATR.
+    monkeypatch.setattr(config, "STOP_ATR_MIN", 1.5)
+    monkeypatch.setattr(config, "STOP_ATR_MAX", 3.0)
+    cs = [{"open": 99, "high": 102, "low": 97, "close": 100, "volume": 1}
+          for _ in range(12)]
+    p = build_trade_plan("BEARISH WATCH", 100.0, 100.5, 101.0, 1.0, cs)
+    dist = abs(p["stop_loss"] - p["entry"])
+    assert 1.5 <= dist / 1.0 <= 3.0
 
 
 # ------------------------------------------------------------------ scoring
@@ -297,25 +317,26 @@ class FakeMarket:
 
 
 def _benign_4h_for_sr(m, bullish=True):
-    """Patch market 4h history so the sr_zone veto stays quiet: a gentle
-    trend (matching the 15m direction for MTF) with the swing extreme far
+    """Patch market 4h history so the sr_zone veto stays quiet: a trend
+    (matching the 15m direction for MTF) with the swing extreme far
     from any plausible entry. Used by pass-regression tests whose intent is
-    not S/R behavior."""
+    not S/R behavior.
+
+    V21 (2026-10-17): the tape must ALSO carry a real trend — the last-7
+    4h closes displace ~+/-1.8%, clearing the 1.5% trend-strength gate.
+    (The old gentle linear slope only moved +0.08%/24h and is now vetoed.)
+    """
     kl4 = []
     if bullish:
         for i in range(500):
-            c = 180.0 + i * (12.0 / 500)
-            kl4.append({"high": c + 1.0, "low": c - 1.0, "close": c,
-                        "open": c - 0.5, "volume": 1000.0})
-        kl4[5] = {"high": 250.0, "low": 178.0, "close": 182.0,
-                  "open": 180.0, "volume": 1000.0}
+            c = 180.0 * 1.003 ** i
+            kl4.append({"high": c * 1.001, "low": c * 0.999, "close": c,
+                        "open": c / 1.003, "volume": 1000.0})
     else:
         for i in range(500):
-            c = 220.0 - i * (12.0 / 500)
-            kl4.append({"high": c + 1.0, "low": c - 1.0, "close": c,
-                        "open": c + 0.5, "volume": 1000.0})
-        kl4[5] = {"high": 222.0, "low": 150.0, "close": 218.0,
-                  "open": 220.0, "volume": 1000.0}
+            c = 220.0 * (1 / 1.003) ** i
+            kl4.append({"high": c * 1.001, "low": c * 0.999, "close": c,
+                        "open": c * 1.003, "volume": 1000.0})
     m.klines["4h"] = kl4
     return m
 

@@ -427,6 +427,7 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("lock_profit_after_tp2", "Lock profit SL ke TP1 saat TP2", "bool"),
     ("volatility_scaling_enabled", "Dynamic volatility risk scaling", "bool"),
     ("veto_volatility_shock", "Veto: volatility shock candle", "bool"),
+    ("veto_trend_strength", "Veto: trend strength (4h)", "bool"),
 ]
 
 

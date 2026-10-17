@@ -406,6 +406,37 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
                 _block("volatility_shock", "hold",
                        f"volatility shock check unevaluable ({e}) — holding (fail-closed)")
 
+    # V21 — Trend Strength gate (2026-10-17).
+    # Blocks entries when the 4h timeframe has no real trend. Post-mortem of
+    # 2026-10-17: 4 of 5 SL-hit SHORTs were taken in flat markets (|4h
+    # displacement| < 0.6%) with quality 92-98 — the engine's MA-alignment
+    # trend definition passes in chop, then normal oscillation wicked out
+    # the tight ATR stops. Requires |displacement| >=
+    # TREND_STRENGTH_MIN_DISPLACEMENT_PCT over TREND_STRENGTH_LOOKBACK_4H
+    # 4h candles *in the signal direction* (also blocks counter-trend
+    # entries). Fail-closed: unevaluable 4h history holds the signal.
+    if getattr(config, "TREND_STRENGTH_VETO_ENABLED", True):
+        try:
+            lookback = int(getattr(config, "TREND_STRENGTH_LOOKBACK_4H", 6))
+            k4 = market.get_klines(symbol, "4h", limit=lookback + 1)
+            closes = [float(c["close"]) for c in k4
+                      if c.get("close") is not None]
+            if len(closes) < lookback + 1:
+                raise ValueError("insufficient 4h history for trend strength check")
+            first, last = closes[-lookback - 1], closes[-1]
+            if first <= 0:
+                raise ValueError("bad 4h close for trend strength check")
+            disp = (last - first) / first * 100.0
+            min_disp = float(getattr(config, "TREND_STRENGTH_MIN_DISPLACEMENT_PCT", 1.5))
+            ok = (disp >= min_disp) if direction == "BULLISH" else (disp <= -min_disp)
+            if not ok:
+                _block("trend_strength", "veto",
+                       f"4h displacement {disp:+.2f}% over {lookback} candles < "
+                       f"{min_disp:g}% in {direction} direction — no real trend, chop risk")
+        except Exception as e:  # noqa: BLE001 - unevaluable -> hold
+            _block("trend_strength", "hold",
+                   f"trend strength check unevaluable ({e}) — holding (fail-closed)")
+
     return blocks
 
 

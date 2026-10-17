@@ -67,8 +67,8 @@ ATR_PERIOD = 14                 # GAS: CFG.ATR_PERIOD (L120)
 SWING_LOOKBACK = 12             # GAS: CFG.SWING_LOOKBACK (L121)
 ENTRY_MAX_PULLBACK_ATR = 0.50   # GAS: CFG.ENTRY_MAX_PULLBACK_ATR (L122)
 ENTRY_ZONE_ATR = 0.10           # GAS: CFG.ENTRY_ZONE_ATR (L123)
-STOP_ATR_MIN = 1.25             # GAS: CFG.STOP_ATR_MIN (L124)
-STOP_ATR_MAX = 2.00             # GAS: CFG.STOP_ATR_MAX (L125)
+STOP_ATR_MIN = 1.50             # GAS: CFG.STOP_ATR_MIN (L124); widened 2026-10-17 (V21 fix: 1.25x stops wicked out in chop)
+STOP_ATR_MAX = 3.00             # GAS: CFG.STOP_ATR_MAX (L125); widened 2026-10-17 (V21 fix: breathing room vs 15m noise)
 TP1_RR = 1.50                   # GAS: CFG.TP1_RR (L126)
 TP2_RR = 2.25                   # GAS: CFG.TP2_RR (L127)
 TP3_RR = 3.00                   # GAS: CFG.TP3_RR (L128)
@@ -231,6 +231,10 @@ VOLATILITY_SCALE_EXTREME_FACTOR = 0.50 # scale risk to 50% under extreme turbule
 
 VOLATILITY_SHOCK_VETO_ENABLED = True # veto V20: block entries on erratic volatility shock candles
 VOLATILITY_SHOCK_MAX_RATIO = 2.5     # candle range > 2.5x ATR_14 triggers veto
+
+TREND_STRENGTH_VETO_ENABLED = True   # veto V21 (2026-10-17): block entries when 4h has no real trend
+TREND_STRENGTH_MIN_DISPLACEMENT_PCT = 1.5  # |4h displacement| over lookback must reach 1.5% in signal direction
+TREND_STRENGTH_LOOKBACK_4H = 6       # 6x 4h candles = 24h displacement window
 
 # ------------------------------------------------------- backtest defaults
 # ROADMAP ITEM 4 (honest backtester). Costs are applied per side; every
@@ -485,6 +489,7 @@ DASH_BOOL_OVERRIDES = {
     "lock_profit_after_tp2": "EXEC_LOCK_PROFIT_AFTER_TP2",
     "volatility_scaling_enabled": "VOLATILITY_SCALING_ENABLED",
     "veto_volatility_shock": "VOLATILITY_SHOCK_VETO_ENABLED",
+    "veto_trend_strength": "TREND_STRENGTH_VETO_ENABLED",
 }
 # MTF 30m leg mode: STRICT (default) or LEAN (GAS default behavior).
 DASH_MTF_MODES = ("STRICT", "LEAN")
@@ -492,7 +497,7 @@ DASH_MTF_MODES = ("STRICT", "LEAN")
 # Disabling a veto is an explicit operator choice and is logged as such.
 DASH_VETO_CODES = ("leverage_risk", "funding", "squeeze", "whale",
                    "liq_wall", "btc_breaker", "sr_zone", "funding_window",
-                   "volatility_shock")
+                   "volatility_shock", "trend_strength")
 # Signal strictness presets: ketat | sedang | biasa.
 # Choosing a mode applies its bundle to the individual dashboard settings
 # (quality gate, MTF 30m leg, 1d cascade leg, bullish-only, volume gate,
@@ -537,6 +542,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_sr_zone": True,
         "veto_funding_window": True,
         "veto_volatility_shock": True,
+        "veto_trend_strength": True,
     },
     "sedang": {
         "min_quality_score": 60,
@@ -560,6 +566,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_sr_zone": True,
         "veto_funding_window": True,
         "veto_volatility_shock": True,
+        "veto_trend_strength": True,
     },
     "biasa": {
         "min_quality_score": 50,
@@ -583,6 +590,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_sr_zone": False,
         "veto_funding_window": False,
         "veto_volatility_shock": False,
+        "veto_trend_strength": False,
     },
 }
 # Vetoes currently disabled by the dashboard (populated by
@@ -637,8 +645,8 @@ DASHBOARD_DEFAULTS = {
     "tp1_rr": 1.5,
     "tp2_rr": 2.25,
     "tp3_rr": 3.0,
-    "stop_atr_min": 1.25,
-    "stop_atr_max": 2.0,
+    "stop_atr_min": 1.5,
+    "stop_atr_max": 3.0,
     "tp_split_1": 0.4,
     "tp_split_2": 0.3,
     "tp_split_3": 0.3,
@@ -654,6 +662,7 @@ DASHBOARD_DEFAULTS = {
     "veto_sr_zone": True,       # S/R location: no short into 4h support / long into 4h resistance
     "veto_funding_window": True,
     "veto_volatility_shock": True,
+    "veto_trend_strength": True,
     # universe
     "universe_mode": "top_movers",  # curated | top_volume | top_movers | all (GAS parity: top_movers)
     "universe_top_n": 30,        # 10-100, used when top_volume/top_movers

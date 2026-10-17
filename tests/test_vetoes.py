@@ -307,15 +307,15 @@ def test_strict_pass_regression_with_vetoes():
     # ramp as "long into resistance". S/R behavior itself is covered by the
     # dedicated sr_zone tests below.
     m = FakeMarket(bullish=True)
-    # Benign 4h history: gentle ramp (bullish for MTF) with a single distant
-    # spike high as resistance, far above any entry -> sr_zone stays quiet.
+    # Benign 4h history: exponential ramp (bullish for MTF) whose high
+    # sits far above any entry -> sr_zone stays quiet. V21 (2026-10-17):
+    # the last-7 closes must displace >= 1.5% (here ~+1.8%) so the
+    # trend-strength gate passes.
     kl4 = []
     for i in range(500):
-        c = 180.0 + i * (12.0 / 500)
-        kl4.append({"high": c + 1.0, "low": c - 1.0, "close": c,
-                    "open": c - 0.5, "volume": 1000.0})
-    kl4[5] = {"high": 250.0, "low": 178.0, "close": 182.0,
-              "open": 180.0, "volume": 1000.0}
+        c = 180.0 * 1.003 ** i
+        kl4.append({"high": c * 1.001, "low": c * 0.999, "close": c,
+                    "open": c / 1.003, "volume": 1000.0})
     m.klines["4h"] = kl4
     signal, note = evaluate_symbol("BTCUSDT", m)
     assert signal is not None, note
@@ -553,3 +553,81 @@ def test_volatility_shock_disabled_toggle():
                                    disabled={"volatility_shock"}))
     assert "volatility_shock" not in by
 
+
+# ------------------------------------------------- V21: Trend Strength gate (2026-10-17)
+def _flat_4h(n=220):
+    return candles_from_closes([100.0 + (i % 2) * 0.1 for i in range(n)])
+
+
+def _trend_4h(n=220, up=True):
+    step = 1.005 if up else 0.995
+    return candles_from_closes([100.0 * step ** i for i in range(n)])
+
+
+def _pin_trend_cfg(monkeypatch):
+    monkeypatch.setattr(config, "TREND_STRENGTH_VETO_ENABLED", True)
+    monkeypatch.setattr(config, "TREND_STRENGTH_MIN_DISPLACEMENT_PCT", 1.5)
+    monkeypatch.setattr(config, "TREND_STRENGTH_LOOKBACK_4H", 6)
+
+
+def test_trend_strength_flat_vetoes_both_directions(monkeypatch):
+    _pin_trend_cfg(monkeypatch)
+    m = FakeMarket(bullish=True)
+    m.klines["4h"] = _flat_4h()
+    for direction in ("BULLISH", "BEARISH"):
+        by = blocks_by_code(run_vetoes("BTCUSDT", direction, m, BENIGN_SNAP))
+        assert "trend_strength" in by, direction
+        assert by["trend_strength"][0] == "veto", direction
+        assert "no real trend" in by["trend_strength"][1]
+
+
+def test_trend_strength_with_trend_passes(monkeypatch):
+    _pin_trend_cfg(monkeypatch)
+    m = FakeMarket(bullish=True)
+    m.klines["4h"] = _trend_4h(up=True)  # +3.0% over lookback
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    assert "trend_strength" not in by
+    m2 = FakeMarket(bullish=False)
+    m2.klines["4h"] = _trend_4h(up=False)  # -3.0% over lookback
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BEARISH", m2, BENIGN_SNAP))
+    assert "trend_strength" not in by
+
+
+def test_trend_strength_counter_trend_vetoes(monkeypatch):
+    _pin_trend_cfg(monkeypatch)
+    m = FakeMarket(bullish=True)
+    m.klines["4h"] = _trend_4h(up=True)  # 4h up +3%, SHORT is counter-trend
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BEARISH", m, BENIGN_SNAP))
+    assert "trend_strength" in by
+    assert by["trend_strength"][0] == "veto"
+
+
+def test_trend_strength_missing_klines_holds(monkeypatch):
+    _pin_trend_cfg(monkeypatch)
+    m = FakeMarket(bullish=True)
+    m.klines["4h"] = m.klines["4h"][:5]  # too few for lookback+1
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    assert "trend_strength" in by
+    assert by["trend_strength"][0] == "hold"
+    assert "fail-closed" in by["trend_strength"][1]
+
+
+def test_trend_strength_disabled(monkeypatch):
+    _pin_trend_cfg(monkeypatch)
+    m = FakeMarket(bullish=True)
+    m.klines["4h"] = _flat_4h()
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP,
+                                   disabled={"trend_strength"}))
+    assert "trend_strength" not in by
+
+
+def test_trend_strength_reproduces_2026_10_17_chop_losses(monkeypatch):
+    # Post-mortem: CAP/HUMA/ZEC/CHIP SHORTs were taken with |4h| < 0.6%.
+    # A 4h tape drifting only +0.4% over the window must be vetoed for SHORT.
+    _pin_trend_cfg(monkeypatch)
+    closes = [100.0 * (1 + 0.004 * i / 219) for i in range(220)]
+    m = FakeMarket(bullish=False)
+    m.klines["4h"] = candles_from_closes(closes)
+    by = blocks_by_code(run_vetoes("CAPUSDT", "BEARISH", m, BENIGN_SNAP))
+    assert "trend_strength" in by
+    assert by["trend_strength"][0] == "veto"
