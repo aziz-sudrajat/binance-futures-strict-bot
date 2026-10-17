@@ -54,7 +54,7 @@ def test_24h_volume(market):
 def test_derivatives_snapshot(market):
     snap = market.get_derivatives_snapshot(SYMBOL)
     assert snap["symbol"] == SYMBOL
-    assert snap["provider"] == "okx"
+    assert snap["provider"] in ("okx", "binance")
     got = [k for k in ("aggregate_long", "aggregate_funding",
                        "aggregate_oi_change", "taker_buy_sell_ratio")
            if snap.get(k) is not None]

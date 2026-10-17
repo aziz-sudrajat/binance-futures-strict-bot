@@ -56,7 +56,7 @@ def test_klines_cache_hit_avoids_refetch(monkeypatch):
         calls["n"] += 1
         return _fake_candles(calls["n"])
 
-    monkeypatch.setattr(m, "_okx_klines", fake_klines)
+    monkeypatch.setattr(m, "_binance_klines", fake_klines)
     a = m.get_klines("BTCUSDT", "15m", limit=100)
     b = m.get_klines("BTCUSDT", "15m", limit=100)
     assert calls["n"] == 1
@@ -71,7 +71,7 @@ def test_klines_ttl_expiry_triggers_refetch(monkeypatch):
         calls["n"] += 1
         return _fake_candles(calls["n"])
 
-    monkeypatch.setattr(m, "_okx_klines", fake_klines)
+    monkeypatch.setattr(m, "_binance_klines", fake_klines)
     key = "BTCUSDT_15m_100"
     a = m.get_klines("BTCUSDT", "15m", limit=100)
     assert calls["n"] == 1
@@ -90,7 +90,7 @@ def test_marketdata_caches_bounded_by_config(monkeypatch):
     def fake_klines(symbol, interval, limit):
         return _fake_candles(0)
 
-    monkeypatch.setattr(m, "_okx_klines", fake_klines)
+    monkeypatch.setattr(m, "_binance_klines", fake_klines)
     for i in range(20):  # 20 distinct keys
         m.get_klines(f"C{i}USDT", "15m", limit=100)
     assert len(m._klines_cache) <= 5

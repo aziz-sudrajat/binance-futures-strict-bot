@@ -609,3 +609,26 @@ def test_new_knobs_tighten_only(dash_env):
         validate_settings({"consecutive_loss_cooldown_hours": 1.0})  # min 4
     with _pt.raises(ValueError):
         validate_settings({"market_data_fallback_binance": "yes"})
+
+
+def test_market_data_source_str_override():
+    """Shiki audit 2026-10-17: market_data_source must round-trip through
+    validate_settings -> apply_dashboard_overrides -> data._source() live."""
+    from data import MarketData
+    config.reset_dashboard_overrides()
+    try:
+        cleaned = validate_settings({"market_data_source": "okx"})
+        assert cleaned["market_data_source"] == "okx"
+        config.apply_dashboard_overrides(cleaned)
+        assert config.MARKET_DATA_SOURCE == "okx"
+        assert MarketData()._source() == "okx"
+        # invalid values are rejected at validation and ignored at apply
+        with pytest.raises(ValueError):
+            validate_settings({"market_data_source": "bogus"})
+        config.apply_dashboard_overrides({"market_data_source": "bogus"})
+        assert config.MARKET_DATA_SOURCE == "okx"
+        config.apply_dashboard_overrides({"market_data_source": "binance"})
+        assert MarketData()._source() == "binance"
+    finally:
+        config.reset_dashboard_overrides()
+    assert config.MARKET_DATA_SOURCE == "binance"

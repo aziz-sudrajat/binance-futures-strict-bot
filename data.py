@@ -210,6 +210,17 @@ class MarketData:
         self._news_ok: bool = False  # True if last RSS fetch succeeded
 
     # ------------------------------------------------------------- klines
+    def _source(self) -> str:
+        """Primary signal-data venue: 'binance' or 'okx'.
+
+        Read LIVE from the config module every call (Shiki audit
+        2026-10-17): a from-imported snapshot would ignore dashboard
+        overrides applied at runtime by apply_dashboard_overrides().
+        """
+        import config as _config
+        s = str(getattr(_config, "MARKET_DATA_SOURCE", "binance") or "binance")
+        return "okx" if s.strip().lower() == "okx" else "binance"
+
     def _klines_ttl(self, interval: str) -> int:
         return KLINES_TTL_SEC.get(interval, 600)
 
@@ -239,41 +250,44 @@ class MarketData:
 
     def _klines_with_fallback(self, symbol: str, interval: str,
                               limit: int) -> list[dict]:
-        """OKX first; Gate.io / Binance futures only if the opt-in knobs allow.
+        """Primary venue first (MARKET_DATA_SOURCE), then fallbacks.
 
-        Default (KLINES_FALLBACK_ENABLED=False,
-        MARKET_DATA_FALLBACK_BINANCE=False) = historical fail-closed
-        behavior: OKX down -> RuntimeError, never another venue's tape.
-        Opt-in fallbacks exist for data continuity; fallback candles are
-        tagged with "source": "gateio" / "binance" so callers can tell
-        venues apart. All down -> RuntimeError (still fail-closed).
+        Default source="binance": Binance USDT-M Futures first (same venue
+        as execution — no cross-exchange price basis), OKX as fallback when
+        MARKET_DATA_FALLBACK_BINANCE allows. source="okx": previous behavior
+        (OKX first, Binance/Gate.io as opt-in fallbacks).
+
+        Fallback candles are tagged with "source" so callers can tell venues
+        apart. All down -> RuntimeError (fail-closed).
         """
-        okx_err = None
-        try:
-            return self._okx_klines(symbol, interval, limit)
-        except Exception as exc:
-            okx_err = exc
-            if not KLINES_FALLBACK_ENABLED and not MARKET_DATA_FALLBACK_BINANCE:
-                raise
-            log.warning("OKX klines failed for %s %s (%r); trying fallbacks",
-                        symbol, interval, exc)
-        # Gate.io fallback (PDF hardening, opt-in)
-        if KLINES_FALLBACK_ENABLED:
+        primary = self._source()
+        order = ("binance", "okx") if primary == "binance" else ("okx", "binance")
+        fetchers = {"binance": self._binance_klines, "okx": self._okx_klines}
+        first_err = None
+        for venue in order:
             try:
-                return self._gateio_klines(symbol, interval, limit)
-            except Exception as gexc:
-                log.debug("Gate.io klines fallback failed for %s: %r", symbol, gexc)
-        # Binance fallback (user feature 2026-10-16, opt-in)
-        if MARKET_DATA_FALLBACK_BINANCE:
-            try:
-                candles = self._binance_klines(symbol, interval, limit)
-                log.info("OKX klines unavailable for %s (%s); fell back to Binance",
-                         symbol, okx_err)
+                candles = fetchers[venue](symbol, interval, limit)
+                if venue != primary:
+                    log.info("%s klines primary failed for %s %s (%r); "
+                             "fell back to %s", primary, symbol, interval,
+                             first_err, venue)
                 return candles
-            except Exception as bexc:
-                log.debug("Binance klines fallback failed for %s: %r", symbol, bexc)
+            except Exception as exc:  # noqa: BLE001
+                if first_err is None:
+                    first_err = exc
+                # Gate.io as last resort (opt-in)
+                if venue == order[-1] and KLINES_FALLBACK_ENABLED:
+                    try:
+                        return self._gateio_klines(symbol, interval, limit)
+                    except Exception as gexc:
+                        log.debug("Gate.io klines fallback failed: %r", gexc)
+                # Continue to next venue only if fallback allowed
+                if not MARKET_DATA_FALLBACK_BINANCE and venue == primary:
+                    raise
+                log.warning("%s klines failed for %s %s (%r); trying next",
+                            venue, symbol, interval, exc)
         raise RuntimeError(
-            f"klines unavailable for {symbol} {interval}: OKX failed ({okx_err!r})"
+            f"klines unavailable for {symbol} {interval}: {first_err!r}"
         )
 
     def _gateio_klines(self, symbol: str, interval: str,
@@ -374,64 +388,74 @@ class MarketData:
 
     # ------------------------------------------------------- 24h statistics
     def get_24h_quote_volume_usd(self, symbol: str) -> float | None:
-        """Quote-volume (USDT) over the last 24h from the OKX perpetual
-        ticker; None if unavailable.
+        """Quote-volume (USDT) over the last 24h; None if unavailable.
 
-        NOTE: for SWAP tickers OKX returns volCcy24h in *base* currency,
-        so it is multiplied by the last price to get USDT notional.
+        Binance primary (quoteVolume directly in USDT); OKX fallback
+        (volCcy24h is base currency, multiplied by last price).
+        Best effort — None on any failure.
         """
         symbol = normalize_symbol(symbol)
-        try:
-            rows = self._okx_get("/api/v5/market/ticker",
-                                 {"instId": okx_swap_id(symbol)})
-            if rows:
-                base_vol = self._num(rows[0].get("volCcy24h"))
-                last = self._num(rows[0].get("last"))
-                if base_vol is not None and last:
-                    return base_vol * last
-        except Exception:  # noqa: BLE001 - best effort, like GAS
-            pass
+        order = ("binance", "okx") if self._source() == "binance" else ("okx", "binance")
+        for venue in order:
+            try:
+                if venue == "binance":
+                    r = self.session.get(
+                        f"{_BINANCE_BASE}/fapi/v1/ticker/24hr",
+                        params={"symbol": symbol}, timeout=HTTP_TIMEOUT_SEC)
+                    r.raise_for_status()
+                    qv = self._num(r.json().get("quoteVolume"))
+                    if qv:
+                        return qv
+                else:
+                    rows = self._okx_get("/api/v5/market/ticker",
+                                         {"instId": okx_swap_id(symbol)})
+                    if rows:
+                        base_vol = self._num(rows[0].get("volCcy24h"))
+                        last = self._num(rows[0].get("last"))
+                        if base_vol is not None and last:
+                            return base_vol * last
+            except Exception:  # noqa: BLE001 - best effort, like GAS
+                continue
         return None
 
     # ---------------------------------------------------------- live price
     def get_live_price(self, symbol: str) -> float | None:
-        """Live last price for the freshness gate (GAS: freshnessCheck_ L5075)
-        from the OKX perpetual ticker — OKX is the primary signal venue.
+        """Live last price for the freshness gate (GAS: freshnessCheck_ L5075).
 
-        When MARKET_DATA_FALLBACK_BINANCE is enabled and OKX fails, falls
-        back to the Binance Futures ticker price (user feature 2026-10-16).
+        Primary venue from MARKET_DATA_SOURCE ("binance" default — same
+        venue as execution, no cross-exchange basis); the other venue is
+        the fallback.
 
         Returns None on ANY failure — the caller must fail closed, never
         treat a missing price as "fine" (audit C2: GAS returned ok:true on
         price_unavailable — a fail-open we do not reproduce).
         """
         symbol = normalize_symbol(symbol)
-        try:
-            r = self.session.get(
-                f"{_OKX_BASE}/api/v5/market/ticker",
-                params={"instId": okx_swap_id(symbol)},
-                timeout=HTTP_TIMEOUT_SEC)
-            r.raise_for_status()
-            data = r.json().get("data") or []
-            if data:
-                price = float(data[0].get("last") or 0)
-                if price > 0:
-                    return price
-        except Exception:  # noqa: BLE001 - try Binance fallback below
-            pass
-
-        if MARKET_DATA_FALLBACK_BINANCE:
+        order = ("binance", "okx") if self._source() == "binance" else ("okx", "binance")
+        for venue in order:
             try:
-                r2 = self.session.get(
-                    f"{_BINANCE_BASE}/fapi/v1/ticker/price",
-                    params={"symbol": symbol},
-                    timeout=HTTP_TIMEOUT_SEC)
-                if r2.status_code == 200:
-                    px = float(r2.json().get("price") or 0)
+                if venue == "binance":
+                    r = self.session.get(
+                        f"{_BINANCE_BASE}/fapi/v1/ticker/price",
+                        params={"symbol": symbol},
+                        timeout=HTTP_TIMEOUT_SEC)
+                    r.raise_for_status()
+                    px = float(r.json().get("price") or 0)
                     if px > 0:
                         return px
-            except Exception:  # noqa: BLE001
-                pass
+                else:
+                    r = self.session.get(
+                        f"{_OKX_BASE}/api/v5/market/ticker",
+                        params={"instId": okx_swap_id(symbol)},
+                        timeout=HTTP_TIMEOUT_SEC)
+                    r.raise_for_status()
+                    data = r.json().get("data") or []
+                    if data:
+                        price = float(data[0].get("last") or 0)
+                        if price > 0:
+                            return price
+            except Exception:  # noqa: BLE001 - try next venue
+                continue
         return None
 
     # ---------------------------------------------------------- derivatives
@@ -445,10 +469,21 @@ class MarketData:
         if hit and time.time() - hit[0] < DERIVATIVES_CACHE_SEC:
             return hit[1]
 
-        try:
-            src = self._okx_derivatives(symbol, period)
-        except Exception:  # noqa: BLE001 - GAS derivSafe_ (L722)
-            src = {"provider": "okx"}
+        if self._source() == "binance":
+            try:
+                src = self._binance_derivatives(symbol, period)
+            except Exception:  # noqa: BLE001 - fall back to OKX
+                log.warning("Binance derivatives snapshot failed for %s; "
+                            "trying OKX", symbol)
+                try:
+                    src = self._okx_derivatives(symbol, period)
+                except Exception:
+                    src = {"provider": "okx"}
+        else:
+            try:
+                src = self._okx_derivatives(symbol, period)
+            except Exception:  # noqa: BLE001 - GAS derivSafe_ (L722)
+                src = {"provider": "okx"}
 
         snap = {
             "symbol": symbol,
@@ -489,6 +524,47 @@ class MarketData:
             return f if math.isfinite(f) else None
         except (TypeError, ValueError):
             return None
+
+    def _binance_derivatives(self, symbol: str, period: str) -> dict:
+        """Basic derivatives snapshot from Binance USDT-M futures."""
+        out: dict = {"provider": "binance"}
+        r = self.session.get(f"{_BINANCE_BASE}/fapi/v1/fundingRate",
+                             params={"symbol": symbol, "limit": 1},
+                             timeout=HTTP_TIMEOUT_SEC)
+        r.raise_for_status()
+        rows = r.json()
+        if rows and isinstance(rows[0], dict):
+            v = self._num(rows[0].get("fundingRate"))
+            if v is not None:
+                out["funding"] = v
+        # OI change: use premium index klines (2 latest) as proxy.
+        try:
+            r2 = self.session.get(
+                f"{_BINANCE_BASE}/fapi/v1/premiumIndexKlines",
+                params={"symbol": symbol, "interval": "1h", "limit": 3},
+                timeout=HTTP_TIMEOUT_SEC)
+            r2.raise_for_status()
+            k = r2.json()
+            if isinstance(k, list) and len(k) >= 2:
+                # premiumIndexKlines has no OI; skip oi_change for basic snap
+                pass
+        except Exception:  # noqa: BLE001
+            pass
+        # Long/short ratio -> long %
+        try:
+            r3 = self.session.get(
+                f"{_BINANCE_BASE}/futures/data/globalLongShortAccountRatio",
+                params={"symbol": symbol, "period": "1h", "limit": 2},
+                timeout=HTTP_TIMEOUT_SEC)
+            r3.raise_for_status()
+            rows3 = r3.json()
+            if rows3:
+                v = self._num(rows3[-1].get("longShortRatio"))
+                if v is not None and v > 0:
+                    out["long_pct"] = ratio_to_long_pct(v)
+        except Exception:  # noqa: BLE001
+            pass
+        return out
 
     def _okx_derivatives(self, symbol: str, period: str) -> dict:
         """Basic derivatives snapshot from OKX public endpoints.
@@ -541,18 +617,28 @@ class MarketData:
     def get_advanced_derivatives(self, symbol: str,
                                  period: str = DERIVATIVES_PERIOD) -> dict:
         """Positioning, leverage-risk inputs, squeeze inputs, and the
-        liquidation window — all from OKX public endpoints (the only signal
-        venue; Binance is execution-only).
+        liquidation window — from the primary signal venue
+        (MARKET_DATA_SOURCE).
 
         Returns a dict whose individual fields may be None; raises
-        RuntimeError when OKX delivers nothing usable at all. Callers must
-        fail closed (hold the signal), never treat missing fields as neutral.
+        RuntimeError when the venue delivers nothing usable at all.
+        Callers must fail closed (hold the signal), never treat missing
+        fields as neutral.
         """
         symbol = normalize_symbol(symbol)
         key = f"adv_{symbol}_{period}"
         hit = self._deriv_cache.get(key)
         if hit and time.time() - hit[0] < ADV_DERIV_CACHE_SEC:
             return hit[1]
+
+        if self._source() == "binance":
+            try:
+                return self._binance_advanced_derivatives(symbol, period, key)
+            except RuntimeError:
+                raise
+            except Exception as e:  # noqa: BLE001 - fall back to OKX
+                log.warning("Binance advanced derivatives failed for %s (%r); "
+                            "trying OKX", symbol, e)
 
         inst = okx_swap_id(symbol)
         base = inst.split("-")[0]
@@ -686,6 +772,140 @@ class MarketData:
         self._deriv_cache.put(key, adv)
         return adv
 
+    def _binance_advanced_derivatives(self, symbol: str, period: str,
+                                      key: str) -> dict:
+        """Binance USDT-M futures version of get_advanced_derivatives.
+
+        Maps Binance futures-data endpoints to the same adv dict shape as
+        the OKX path so downstream vetoes/scoring stay venue-agnostic.
+        """
+        num = self._num
+        bin_period = {"4h": "1h", "1d": "1d"}.get(period, "1h")
+
+        def _get(path, params):
+            r = self.session.get(f"{_BINANCE_BASE}{path}", params=params,
+                                 timeout=HTTP_TIMEOUT_SEC)
+            r.raise_for_status()
+            return r.json()
+
+        def long_pct(v):
+            # Binance ratios are long/short ratios (e.g. 2.0 = 2:1);
+            # convert to long % like OKX's ratio_to_long_pct.
+            return ratio_to_long_pct(v) if v is not None and v > 0 else None
+
+        # Retail positioning: global long/short account ratio.
+        retail_long = None
+        try:
+            rows = _get("/futures/data/globalLongShortAccountRatio",
+                        {"symbol": symbol, "period": bin_period, "limit": 10})
+            if rows:
+                retail_long = long_pct(num(rows[-1].get("longShortRatio")))
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Whale positioning: top-trader long/short position ratio.
+        top_long = None
+        try:
+            rows = _get("/futures/data/topLongShortPositionRatio",
+                        {"symbol": symbol, "period": bin_period, "limit": 10})
+            if rows:
+                top_long = long_pct(num(rows[-1].get("longShortRatio")))
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Taker flow: taker buy/sell volume ratio -> long %.
+        taker_long = None
+        try:
+            rows = _get("/futures/data/takerlongshortRatio",
+                        {"symbol": symbol, "period": "5m", "limit": 12})
+            buy = sum(num(r.get("buyVol")) or 0 for r in rows)
+            sell = sum(num(r.get("sellVol")) or 0 for r in rows)
+            if (buy + sell) > 0:
+                taker_long = buy / (buy + sell) * 100
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Funding rate (latest).
+        funding = None
+        try:
+            rows = _get("/fapi/v1/fundingRate",
+                        {"symbol": symbol, "limit": 1})
+            if rows:
+                funding = num(rows[0].get("fundingRate"))
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Open interest (USD notional) + change vs 1 period ago.
+        oi_usd, oi_change = None, None
+        try:
+            oi_raw = num(_get("/fapi/v1/openInterest",
+                              {"symbol": symbol}).get("openInterest"))
+            px = self.get_live_price(symbol)
+            if oi_raw and px:
+                oi_usd = oi_raw * px
+            # Change: compare with OI history via klines volume proxy is
+            # unreliable; use premium index history length 2 as fallback.
+            # Simpler: skip oi_change for Binance (None = veto skips the leg).
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Liquidation window: Binance forceOrders (recent 100).
+        long_liq_usd, short_liq_usd, spike = 0.0, 0.0, 0.0
+        try:
+            rows = _get("/fapi/v1/forceOrders",
+                        {"symbol": symbol, "limit": 100})
+            vals = []
+            for o in rows if isinstance(rows, list) else []:
+                px = num(o.get("price"))
+                qty = num(o.get("origQty"))
+                ts = num(o.get("time"))
+                if px and qty and ts:
+                    # forceOrders side is the liquidation direction:
+                    # SELL = long liquidated, BUY = short liquidated.
+                    side = "long" if o.get("side") == "SELL" else "short"
+                    vals.append((ts, side, px * qty))
+            vals.sort(key=lambda x: x[0])
+            half = len(vals) // 2
+            for _ts, side, usd in vals[half:]:
+                if side == "long":
+                    long_liq_usd += usd
+                else:
+                    short_liq_usd += usd
+            older_total = sum(u for _t, _s, u in vals[:half])
+            recent_total = long_liq_usd + short_liq_usd
+            spike = (recent_total / older_total if older_total > 0
+                     else (1.0 if recent_total > 0 else 0.0))
+        except Exception:  # noqa: BLE001
+            pass
+
+        volume_24h = self.get_24h_quote_volume_usd(symbol)
+
+        adv = {
+            "symbol": symbol, "period": period,
+            "at": int(time.time() * 1000), "provider": "binance",
+            "retail_long": retail_long,
+            "top_long": top_long,
+            "top_position_long": top_long,
+            "taker_long": taker_long,
+            "divergence": (top_long - retail_long
+                           if top_long is not None and retail_long is not None
+                           else None),
+            "funding": funding,
+            "oi_usd": oi_usd,
+            "oi_change": oi_change,
+            "volume_24h": volume_24h,
+            "price_change_24h": None,
+            "long_liq_usd": long_liq_usd,
+            "short_liq_usd": short_liq_usd,
+            "spike": spike,
+        }
+        if all(adv[k] is None for k in ("retail_long", "top_long", "funding",
+                                        "oi_usd", "taker_long")) \
+                and not (long_liq_usd or short_liq_usd):
+            raise RuntimeError(f"Binance advanced derivatives empty for {symbol}")
+        self._deriv_cache.put(key, adv)
+        return adv
+
     def list_okx_swap_symbols(self) -> list[str]:
         """All USDT-margined OKX perpetuals as Binance-style symbols.
 
@@ -706,12 +926,16 @@ class MarketData:
         return sorted(set(out))
 
     def get_swap_tickers(self) -> list[dict]:
-        """Bulk 24h stats for every USDT-margined OKX perpetual (one HTTP call).
+        """Bulk 24h stats for every USDT-margined perpetual (one HTTP call).
 
-        Returns Binance-style dicts: symbol, last, vol_usd_24h, chg_pct_24h.
-        chg is derived from open24h because /market/tickers has no % field.
-        Leveraged tokens and non-USDT-SWAP instruments are excluded.
+        Primary venue from MARKET_DATA_SOURCE. Returns uniform dicts:
+        symbol, last, vol_usd_24h, chg_pct_24h. Leveraged tokens excluded.
         """
+        if self._source() == "binance":
+            try:
+                return self._binance_tickers()
+            except Exception as e:  # noqa: BLE001 - fall back to OKX
+                log.warning("Binance tickers failed (%r); trying OKX", e)
         rows = self._okx_get("/api/v5/market/tickers", {"instType": "SWAP"})
         out = []
         for r in rows:
@@ -732,6 +956,30 @@ class MarketData:
                        if open24 else 0.0)
             out.append({"symbol": f"{base}USDT", "base": base, "last": last,
                         "vol_usd_24h": vol_usd, "chg_pct_24h": chg_pct})
+        return out
+
+    def _binance_tickers(self) -> list[dict]:
+        """Binance USDT-M futures 24h tickers, normalized like _okx path."""
+        r = self.session.get(f"{_BINANCE_BASE}/fapi/v1/ticker/24hr",
+                             timeout=HTTP_TIMEOUT_SEC)
+        r.raise_for_status()
+        rows = r.json()
+        if not isinstance(rows, list):
+            raise ValueError("Binance invalid tickers response")
+        out = []
+        for t in rows:
+            sym = str(t.get("symbol", ""))
+            if not sym.endswith("USDT"):
+                continue
+            base = sym[:-4]
+            if base.endswith(("UP", "DOWN", "BULL", "BEAR")):
+                continue
+            last = self._num(t.get("lastPrice"))
+            if not last:
+                continue
+            out.append({"symbol": sym, "base": base, "last": last,
+                        "vol_usd_24h": self._num(t.get("quoteVolume")) or 0.0,
+                        "chg_pct_24h": self._num(t.get("priceChangePercent")) or 0.0})
         return out
 
     def _okx_ct_val(self, inst_id: str) -> float:
@@ -765,31 +1013,51 @@ class MarketData:
 
     def get_order_book(self, symbol: str,
                        limit: int = ORDER_BOOK_DEPTH_LIMIT) -> dict:
-        """Order book for the liquidity-wall veto — OKX perpetual ONLY
-        (the only signal venue; Binance is execution-only).
+        """Order book for the liquidity-wall veto.
 
-        Sizes come in contracts; converted to base-asset units via the
-        instrument ctVal so downstream notional math stays venue-agnostic.
-        Raises if OKX fails — the caller must fail closed, never assume
-        'no wall'.
+        Primary venue from MARKET_DATA_SOURCE. Binance sizes are already
+        in base-asset units; OKX sizes come in contracts and are converted
+        via ctVal so downstream notional math stays venue-agnostic.
+        Raises if the primary fails and fallback is unavailable — the
+        caller must fail closed, never assume 'no wall'.
         """
         symbol = normalize_symbol(symbol)
-        inst = okx_swap_id(symbol)
-        try:
-            rows = self._okx_get("/api/v5/market/books",
-                                 {"instId": inst,
-                                  "sz": str(min(max(int(limit), 5), 400))})
-            if not rows:
-                raise ValueError("OKX empty book")
-            book = rows[0]
-            ct_val = self._okx_ct_val(inst)
-            bids = [(float(b[0]), float(b[1]) * ct_val)
-                    for b in book.get("bids", []) if len(b) >= 2]
-            asks = [(float(a[0]), float(a[1]) * ct_val)
-                    for a in book.get("asks", []) if len(a) >= 2]
-            return self._pack_book(bids, asks, "okx_swap")
-        except Exception as e:  # noqa: BLE001
-            raise RuntimeError(f"order book unavailable for {symbol}: {e}")
+        order = ("binance", "okx") if self._source() == "binance" else ("okx", "binance")
+        last_err = None
+        for venue in order:
+            try:
+                if venue == "binance":
+                    return self._binance_order_book(symbol, limit)
+                inst = okx_swap_id(symbol)
+                rows = self._okx_get("/api/v5/market/books",
+                                     {"instId": inst,
+                                      "sz": str(min(max(int(limit), 5), 400))})
+                if not rows:
+                    raise ValueError("OKX empty book")
+                book = rows[0]
+                ct_val = self._okx_ct_val(inst)
+                bids = [(float(b[0]), float(b[1]) * ct_val)
+                        for b in book.get("bids", []) if len(b) >= 2]
+                asks = [(float(a[0]), float(a[1]) * ct_val)
+                        for a in book.get("asks", []) if len(a) >= 2]
+                return self._pack_book(bids, asks, "okx_swap")
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                continue
+        raise RuntimeError(f"order book unavailable for {symbol}: {last_err}")
+
+    def _binance_order_book(self, symbol: str, limit: int) -> dict:
+        """Binance USDT-M futures order book (sizes already in base units)."""
+        r = self.session.get(
+            f"{_BINANCE_BASE}/fapi/v1/depth",
+            params={"symbol": symbol,
+                    "limit": min(max(int(limit), 5), 1000)},
+            timeout=HTTP_TIMEOUT_SEC)
+        r.raise_for_status()
+        book = r.json()
+        bids = [(float(p), float(s)) for p, s in book.get("bids", [])]
+        asks = [(float(p), float(s)) for p, s in book.get("asks", [])]
+        return self._pack_book(bids, asks, "binance_futures")
 
     # ---------------------------------------------------------------- news
     # CoinTelegraph RSS (public, no key). Cached NEWS_TTL_SEC seconds.

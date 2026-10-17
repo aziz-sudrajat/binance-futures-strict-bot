@@ -5,9 +5,21 @@
 # Unauthorized copying, modification, distribution, or false claim of
 # authorship is prohibited.
 
-"""Unit tests for the OKX-only signal data layer (mocked HTTP)."""
+"""Unit tests for the OKX signal data layer (mocked HTTP)."""
 import pytest
+import config
+import data
 from data import MarketData, okx_swap_id
+
+
+@pytest.fixture(autouse=True)
+def _force_okx_source(monkeypatch):
+    """These tests mock OKX endpoints; pin the source to OKX.
+
+    _source() reads the config module live (Shiki audit 2026-10-17),
+    so patch the config attribute, not data's namespace.
+    """
+    monkeypatch.setattr(config, "MARKET_DATA_SOURCE", "okx")
 
 
 def test_okx_swap_id():

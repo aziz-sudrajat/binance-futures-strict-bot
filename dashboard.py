@@ -180,6 +180,12 @@ def validate_settings(data: dict) -> dict:
                 f"signal_mode must be one of {list(config.SIGNAL_MODES)}")
         out["signal_mode"] = v
 
+    if "market_data_source" in data:
+        v = data["market_data_source"]
+        if v not in ("binance", "okx"):
+            raise ValueError("market_data_source must be binance or okx")
+        out["market_data_source"] = v
+
     for i in (1, 2, 3):
         k = f"tp_split_{i}"
         if k in data:
@@ -420,6 +426,7 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("max_consecutive_losses", "Max consecutive losses", "int"),
     ("consecutive_loss_cooldown_hours", "Loss cooldown (jam)", "float"),
     ("market_data_fallback_binance", "Market data fallback Binance", "bool"),
+    ("market_data_source", "Sumber data (binance/okx)", "str"),
     ("exec_post_only_entry", "Entry post-only (GTX)", "bool"),
     ("cancel_orphan_orders_on_startup", "Cancel orphan orders saat startup",
      "bool"),

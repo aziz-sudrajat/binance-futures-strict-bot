@@ -266,6 +266,13 @@ MARKET_DATA_FALLBACK_BINANCE = True  # market data: when OKX klines/price are
                                # public API (klines + ticker price).
                                # False = fail-closed on OKX outage.
                                # User feature 2026-10-16.
+MARKET_DATA_SOURCE = "binance"  # primary signal-data venue: "binance" or "okx".
+                               # "binance" = Binance USDT-M Futures (same venue
+                               # as execution — no cross-exchange price basis).
+                               # "okx" = OKX perpetuals (previous default).
+                               # The other venue is used as fallback when the
+                               # primary fails (if its fallback knob allows).
+                               # User feature 2026-10-17.
 EXEC_POST_ONLY_ENTRY = False   # entries: use post-only (GTX) limit orders so
                                # entries never cross the spread (maker only).
                                # Falls back to regular limit if unsupported.
@@ -546,6 +553,13 @@ DASH_BOOL_OVERRIDES = {
     "veto_volatility_shock": "VOLATILITY_SHOCK_VETO_ENABLED",
     "veto_trend_strength": "TREND_STRENGTH_VETO_ENABLED",
 }
+# String engine knobs: setting name -> (config attribute, allowed values).
+# Values outside the allowlist are ignored (never applied). Added for
+# MARKET_DATA_SOURCE (Shiki audit 2026-10-17): it was wrongly listed in
+# DASH_BOOL_OVERRIDES, whose applier only accepts bool values.
+DASH_STR_OVERRIDES = {
+    "market_data_source": ("MARKET_DATA_SOURCE", ("binance", "okx")),
+}
 # MTF 30m leg mode: STRICT (default) or LEAN (GAS default behavior).
 DASH_MTF_MODES = ("STRICT", "LEAN")
 # Deterministic veto codes the dashboard can toggle (default: all enabled).
@@ -682,6 +696,7 @@ DASHBOARD_DEFAULTS = {
     "max_consecutive_losses": 3,
     "consecutive_loss_cooldown_hours": 4.0,
     "market_data_fallback_binance": True,
+    "market_data_source": "binance",
     "exec_post_only_entry": False,
     "cancel_orphan_orders_on_startup": True,
     "adaptive_volatility_targets": False,
@@ -749,6 +764,8 @@ def _snapshot_originals() -> None:
         _ORIGINALS[attr] = globals()[attr]
     for attr in DASH_BOOL_OVERRIDES.values():
         _ORIGINALS[attr] = globals()[attr]
+    for attr, _allowed in DASH_STR_OVERRIDES.values():
+        _ORIGINALS[attr] = globals()[attr]
     _ORIGINALS["TP_SPLIT"] = TP_SPLIT
     _ORIGINALS["MTF_30M_MODE"] = MTF_30M_MODE
     _ORIGINALS["SIGNAL_MODE"] = SIGNAL_MODE
@@ -780,6 +797,10 @@ def apply_dashboard_overrides(settings: dict) -> None:
         for name, attr in DASH_BOOL_OVERRIDES.items():
             if name in settings and isinstance(settings[name], bool):
                 globals()[attr] = settings[name]
+        for name, (attr, allowed) in DASH_STR_OVERRIDES.items():
+            v = settings.get(name)
+            if isinstance(v, str) and v.strip().lower() in allowed:
+                globals()[attr] = v.strip().lower()
         if settings.get("mtf_30m_mode") in DASH_MTF_MODES:
             globals()["MTF_30M_MODE"] = settings["mtf_30m_mode"]
         if settings.get("signal_mode") in SIGNAL_MODES:
