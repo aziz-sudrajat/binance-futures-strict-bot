@@ -98,6 +98,32 @@ def test_t8_hand_computed_trade():
     assert tr["r_multiple"] == pytest.approx(1.203654375, abs=1e-9)
 
 
+def test_backtest_lock_profit_after_tp2(monkeypatch):
+    """When BACKTEST_LOCK_PROFIT_AFTER_TP2 is enabled, after TP2 fills,
+    SL moves to TP1 price (103.0) instead of remaining at breakeven (100.0).
+    In fixture c4, low 99.9 triggers stop at 103.0.
+    Remaining 15 exits @ 103 (+45 gross profit vs breakeven).
+    Fees: 7.12075.
+    PnL: 127.5 + 45 - 7.12075 - 0.0453125 = 165.3339375.
+    """
+    monkeypatch.setattr(config, "BACKTEST_LOCK_PROFIT_AFTER_TP2", True)
+    t0 = 1_700_000_000_000
+    candles = [
+        mk_candle(t0, 100.5, 101.0, 100.0, 100.5),          # c0 signal candle
+        mk_candle(t0 + 900_000, 100.2, 100.4, 99.8, 100.1),  # c1 entry
+        mk_candle(t0 + 1_800_000, 100.6, 103.5, 100.5, 102.0),  # c2 TP1
+        mk_candle(t0 + 2_700_000, 102.0, 104.6, 101.5, 104.0),  # c3 TP2
+        mk_candle(t0 + 3_600_000, 100.8, 101.0, 99.9, 100.3),   # c4 stop at TP1
+    ]
+    tr = simulate_trade(mk_signal(), candles, 0, 100.0)
+    assert tr["status"] == "CLOSED"
+    assert tr["exit_reason"] == "SL"
+    assert tr["tp_fills"] == [True, True, False]
+    assert tr["fees_usd"] == pytest.approx(7.12075, abs=1e-6)
+    assert tr["pnl_usd"] == pytest.approx(165.3339375, abs=1e-6)
+    assert tr["r_multiple"] == pytest.approx(1.653339375, abs=1e-9)
+
+
 # ------------------------------------------------------------------ T12
 def test_t12_same_candle_sl_tp_conservative():
     """A candle touching BOTH stop and target must resolve to the STOP for

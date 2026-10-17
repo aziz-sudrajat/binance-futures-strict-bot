@@ -171,6 +171,17 @@ def notify_time_stop(symbol: str, price: float, net_pnl: float) -> None:
     send_message(msg)
 
 
+def notify_profit_locked(symbol: str, price: float) -> None:
+    """Format and send profit locked notification (SL moved to TP1)."""
+    msg = (
+        f"<b>🔒 PROFIT LOCKED — {symbol}</b>\n\n"
+        f"<b>Info:</b> TP2 terpenuhi. Stop Loss berhasil dinaikkan ke level TP1.\n"
+        f"<b>New Guaranteed SL Price:</b> <code>{price:,.6g}</code>\n\n"
+        f"✅ <i>Sisa posisi dijamin keluar dalam kondisi profit terlindungi.</i>"
+    )
+    send_message(msg)
+
+
 def notify_kill_switch(reason: str, balance: float | None = None) -> None:
     """Format and send emergency kill switch notification."""
     bal_str = f" (${balance:,.2f} USDT)" if balance is not None else ""

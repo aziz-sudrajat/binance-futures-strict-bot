@@ -514,3 +514,42 @@ def test_stage10_adv_incomplete_inputs_holds_cleanly(monkeypatch):
     assert "incomplete" in reason or "unavailable" in reason
     assert "holding" in reason
 
+
+# ------------------------------------------------- V20: Volatility Shock (Phase 4)
+def test_volatility_shock_benign_passes():
+    m = FakeMarket(bullish=True)
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    assert "volatility_shock" not in by
+
+
+def test_volatility_shock_fires_on_extreme_candle():
+    m = FakeMarket(bullish=True)
+    # Inflate last candle's high so true range is 3.5x ATR
+    from indicators import atr_wilder
+    atr = atr_wilder(m.klines["15m"][:-1], 14)
+    last = m.klines["15m"][-1]
+    last["high"] = float(last["low"]) + atr * 3.5
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    assert "volatility_shock" in by
+    assert by["volatility_shock"][0] == "veto"
+    assert "extreme volatility shock" in by["volatility_shock"][1]
+
+
+def test_volatility_shock_missing_klines_holds():
+    m = FakeMarket(bullish=True)
+    m.klines["15m"] = m.klines["15m"][:5]  # too few klines
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP))
+    assert "volatility_shock" in by
+    assert by["volatility_shock"][0] == "hold"
+    assert "fail-closed" in by["volatility_shock"][1]
+
+
+def test_volatility_shock_disabled_toggle():
+    m = FakeMarket(bullish=True)
+    from indicators import atr_wilder
+    atr = atr_wilder(m.klines["15m"][:-1], 14)
+    m.klines["15m"][-1]["high"] = float(m.klines["15m"][-1]["low"]) + atr * 4.0
+    by = blocks_by_code(run_vetoes("BTCUSDT", "BULLISH", m, BENIGN_SNAP,
+                                   disabled={"volatility_shock"}))
+    assert "volatility_shock" not in by
+

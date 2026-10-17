@@ -110,16 +110,37 @@ def make_signal_id(symbol: str, close_ms: int, direction: str) -> str:
 
 
 def compute_qty(balance: float, entry: float, stop: float,
-                filters: dict, risk_pct: float | None = None) -> tuple[float, str]:
+                filters: dict, risk_pct: float | None = None,
+                atr: float | None = None) -> tuple[float, str]:
     """Risk-based sizing. Returns (qty, note); qty == 0 means skip.
 
     qty = (balance * RISK_PCT_PER_TRADE/100) / |entry - stop|, floored to
     stepSize, honoring minQty / minNotional and the per-symbol exposure cap.
     risk_pct overrides the config default (dashboard may only tighten it).
+    When VOLATILITY_SCALING_ENABLED is True and atr is provided, dynamically
+    scales down risk under high or extreme ATR % regimes.
     """
     if balance is None or balance <= 0:
         return 0.0, "balance unavailable"
     rp = config.RISK_PCT_PER_TRADE if risk_pct is None else risk_pct
+    scale_note = ""
+    if getattr(config, "VOLATILITY_SCALING_ENABLED", True) and atr is not None and entry > 0:
+        try:
+            atr_f = float(atr)
+            if atr_f > 0:
+                atr_pct = (atr_f / entry) * 100.0
+                extreme_th = getattr(config, "VOLATILITY_EXTREME_ATR_PCT", 5.0)
+                high_th = getattr(config, "VOLATILITY_HIGH_ATR_PCT", 3.5)
+                if atr_pct >= extreme_th:
+                    f = getattr(config, "VOLATILITY_SCALE_EXTREME_FACTOR", 0.50)
+                    rp *= f
+                    scale_note = f" (volatility scaled x{f:.2f}: atr {atr_pct:.2f}% >= {extreme_th:.1f}%)"
+                elif atr_pct >= high_th:
+                    f = getattr(config, "VOLATILITY_SCALE_HIGH_FACTOR", 0.75)
+                    rp *= f
+                    scale_note = f" (volatility scaled x{f:.2f}: atr {atr_pct:.2f}% >= {high_th:.1f}%)"
+        except (TypeError, ValueError):
+            pass
     risk_usdt = balance * rp / 100
     per_unit = abs(entry - stop)
     if per_unit <= 0:
@@ -134,11 +155,11 @@ def compute_qty(balance: float, entry: float, stop: float,
         qty = floor_to_step(cap_notional / entry, step)
     if qty < min_qty:
         return 0.0, (f"qty {qty} < minQty {min_qty} "
-                     f"(risk ${risk_usdt:.2f}, stop dist {per_unit})")
+                     f"(risk ${risk_usdt:.2f}{scale_note}, stop dist {per_unit})")
     if qty * entry < min_notional:
         return 0.0, (f"notional ${qty * entry:.2f} < minNotional "
                      f"${min_notional:.2f}")
-    return qty, (f"risk ${risk_usdt:.2f} / stop-dist {per_unit} -> qty {qty}")
+    return qty, (f"risk ${risk_usdt:.2f}{scale_note} / stop-dist {per_unit} -> qty {qty}")
 
 
 def compute_test_qty(fixed_margin_usdt: float, leverage: int, entry: float,
@@ -805,9 +826,15 @@ class Executor:
                 fu = 10.0
             qty, note = compute_test_qty(max(1.0, fu), lev, entry, filters)
         else:
+            signal_atr = signal.get("atr")
+            try:
+                atr_val = float(signal_atr) if signal_atr is not None else None
+            except (TypeError, ValueError):
+                atr_val = None
             qty, note = compute_qty(balance, entry, float(signal["stop_loss"]),
                                     filters,
-                                    risk_pct=self._effective_risk_pct())
+                                    risk_pct=self._effective_risk_pct(),
+                                    atr=atr_val)
         if qty <= 0:
             return self._reject(symbol, sid, f"sizing: {note}")
         notional = qty * entry
@@ -977,6 +1004,12 @@ class Executor:
         if (config.EXEC_BREAKEVEN_AFTER_TP1 and pos["tp"]["tp1"]["filled"]
                 and not pos.get("breakeven_moved") and pos["qty"] > 0):
             self._move_sl_to_breakeven(pos_id, pos, sid)
+
+        # Step-wise profit lock: TP2 filled -> move SL to TP1 price.
+        if (getattr(config, "EXEC_LOCK_PROFIT_AFTER_TP2", True)
+                and pos["tp"]["tp2"]["filled"]
+                and not pos.get("profit_locked") and pos["qty"] > 0):
+            self._move_sl_to_profit_lock(pos_id, pos, sid)
 
         # H5: TP dust — split_tp_qty floors every leg to stepSize, so a
         # sub-step residual never sits in any TP leg. Once all TP legs are
@@ -1491,6 +1524,48 @@ class Executor:
         else:
             log.error("%s breakeven SL placement FAILED - original SL left "
                       "live", pos_id)
+
+    def _move_sl_to_profit_lock(self, pos_id: str, pos: dict, sid: str) -> None:
+        """Lock in profit: after TP2 fills, advance the live SL to the TP1 price.
+
+        Guarantees that the remaining TP3 slice exits in solid profit even if
+        the market subsequently pulls back all the way to entry.
+        """
+        symbol = pos["symbol"]
+        tp1 = (pos.get("tp") or {}).get("tp1") or {}
+        tp1_px = tp1.get("price")
+        if tp1_px is None or tp1_px <= 0:
+            return
+        tick = None
+        step = None
+        try:
+            filters = self.exchange.get_symbol_filters(symbol) or {}
+            tick = filters.get("tickSize")
+            step = filters.get("stepSize")
+        except Exception:  # noqa: BLE001
+            pass
+        lock_px = quantize_price(tp1_px, tick)
+        exit_side = "BUY" if pos.get("direction") == "SHORT" else "SELL"
+        lock_qty = pos.get("qty") or 0.0
+        if step:
+            lock_qty = floor_to_step(lock_qty, step)
+        sl = self.exchange.place_algo_order(
+            symbol, exit_side, "STOP_MARKET", quantity=lock_qty,
+            trigger_price=lock_px, reduce_only=True, working_type="MARK_PRICE",
+            client_algo_id=self._leg_id(pos_id, "SLLOCK"))
+        if sl and sl.get("algoId"):
+            self._sl_cancel(symbol, pos)
+            pos["sl_order_id"] = sl["algoId"]
+            pos["sl_is_algo"] = True
+            pos["profit_locked"] = True
+            pos["stop_loss"] = lock_px
+            pos["sl_qty"] = lock_qty
+            self.lifecycle.log(sid, symbol, "profit_locked", price=lock_px, qty=lock_qty,
+                               reason=f"advanced SL to TP1 ({lock_px}) after TP2 fill")
+            log.info("%s SL advanced to TP1 profit-lock @ %s", pos_id, lock_px)
+            self.state.save()
+        else:
+            log.error("%s profit-lock SL placement FAILED - existing SL left live", pos_id)
 
     def _classify_vanished_close(self, symbol: str, pos: dict, sid: str,
                                  pos_id: str) -> tuple:

@@ -372,6 +372,40 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
                            f"Within {min_until_funding:.1f}m of 8h funding snapshot with negative funding "
                            f"{f_val*100:+.3f}% (<= -{max_rate*100:.3f}%) paying longs — immediate funding drag")
 
+    # V20 — Volatility Shock / Extreme Candle Range Veto (Phase 4).
+    # Blocks entries when the latest 15m candle true range is an extreme outlier
+    # (> config.VOLATILITY_SHOCK_MAX_RATIO * 14-period ATR), indicating erratic wick,
+    # illiquidity sweep, or sudden news volatility.
+    if getattr(config, "VOLATILITY_SHOCK_VETO_ENABLED", True):
+        if market is None:
+            _block("volatility_shock", "hold",
+                   "market data unavailable for volatility shock check — holding (fail-closed)")
+        else:
+            try:
+                from indicators import atr_wilder
+                k15 = market.get_klines(symbol, "15m", limit=30)
+                if not k15 or len(k15) < 16:
+                    raise ValueError("insufficient 15m klines for volatility shock check")
+                last_c = k15[-1]
+                prev_c = k15[-2]
+                h = float(last_c["high"])
+                l = float(last_c["low"])
+                pc = float(prev_c["close"])
+                tr = max(h - l, abs(h - pc), abs(l - pc))
+                atr_14 = atr_wilder(k15[:-1], 14)
+                if atr_14 and atr_14 > 0:
+                    ratio = tr / atr_14
+                    max_ratio = getattr(config, "VOLATILITY_SHOCK_MAX_RATIO", 2.5)
+                    if ratio >= max_ratio:
+                        _block("volatility_shock", "veto",
+                               f"15m candle true range {tr:.6g} is {ratio:.2f}x ATR_14 "
+                               f"({atr_14:.6g} >= {max_ratio:.1f}x) — extreme volatility shock")
+                else:
+                    raise ValueError("ATR_14 unavailable or zero")
+            except Exception as e:
+                _block("volatility_shock", "hold",
+                       f"volatility shock check unevaluable ({e}) — holding (fail-closed)")
+
     return blocks
 
 

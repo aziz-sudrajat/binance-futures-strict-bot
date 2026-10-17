@@ -2573,3 +2573,64 @@ def test_expire_stale_entry_still_expires_without_pending_close(rig):
     executor._expire_stale_entry(pos_id, pos, sid)
     assert pos.get("closed") is True
     assert "entry unfilled after" in pos.get("closed_reason", "")
+
+
+# --------------------------- Phase 4 features (profit lock & volatility scaling)
+
+def test_move_sl_to_profit_lock_after_tp2(rig):
+    executor, market, exchange, state, lifecycle, risk = rig
+    pos_id, sid = "pos_plock", "sid_plock"
+    pos = _bracketed_pos(sid=sid, qty=0.3)
+    pos["sl_order_id"] = 8888
+    pos["sl_is_algo"] = True
+    exchange.orders[8888] = {
+        "algoId": 8888, "symbol": "BTCUSDT", "side": "SELL",
+        "orderType": "STOP_MARKET", "triggerPrice": 95.0,
+        "origQty": 0.3, "status": "NEW",
+    }
+    pos["tp"]["tp1"]["filled"] = True
+    pos["tp"]["tp2"]["filled"] = True
+    state.set("positions", {pos_id: pos})
+
+    executor._move_sl_to_profit_lock(pos_id, pos, sid)
+    assert pos.get("profit_locked") is True
+    assert pos.get("stop_loss") == 105.0  # advanced to TP1 price
+    assert pos["sl_order_id"] != 8888
+    assert exchange.orders[8888]["status"] == "CANCELED"
+    events = [e for e in lifecycle.read_all() if e.get("state") == "profit_locked"]
+    assert len(events) == 1
+    assert events[0]["price"] == 105.0
+
+
+def test_dynamic_volatility_scaling():
+    from executor import compute_qty
+    balance = 10_000.0
+    entry = 100.0
+    stop = 90.0  # distance = 10.0 (notional $1000 <= $2000 exposure cap)
+    filters = {"stepSize": 0.1, "minQty": 0.1, "minNotional": 10.0}
+
+    # 1. Normal ATR (atr=2.0 -> atr_pct = 2.0% < 3.5%) -> normal 1.0% risk ($100 risk -> qty 10.0)
+    qty_normal, note_normal = compute_qty(balance, entry, stop, filters, risk_pct=1.0, atr=2.0)
+    assert qty_normal == 10.0
+    assert "volatility scaled" not in note_normal
+
+    # 2. Elevated ATR (atr=4.0 -> atr_pct = 4.0% >= 3.5%) -> scaled by 0.75x ($75 risk -> qty 7.5)
+    qty_high, note_high = compute_qty(balance, entry, stop, filters, risk_pct=1.0, atr=4.0)
+    assert qty_high == 7.5
+    assert "volatility scaled x0.75" in note_high
+
+    # 3. Extreme ATR (atr=6.0 -> atr_pct = 6.0% >= 5.0%) -> scaled by 0.50x ($50 risk -> qty 5.0)
+    qty_extreme, note_extreme = compute_qty(balance, entry, stop, filters, risk_pct=1.0, atr=6.0)
+    assert qty_extreme == 5.0
+    assert "volatility scaled x0.50" in note_extreme
+
+    # 4. When VOLATILITY_SCALING_ENABLED is False, scaling is bypassed
+    orig = config.VOLATILITY_SCALING_ENABLED
+    try:
+        config.VOLATILITY_SCALING_ENABLED = False
+        qty_disabled, note_dis = compute_qty(balance, entry, stop, filters, risk_pct=1.0, atr=6.0)
+        assert qty_disabled == 10.0
+    finally:
+        config.VOLATILITY_SCALING_ENABLED = orig
+
+

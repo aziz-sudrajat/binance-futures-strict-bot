@@ -40,6 +40,7 @@ CANCELLED = "cancelled"
 PROFIT_TAKE = "profit_take"   # auto TP: unrealized hit +PROFIT_TAKE_PCT% of margin
 TRAIL_STOP = "trail_stop"     # trailing stop: -TRAIL_DISTANCE_PCT% pullback from peak
 TIME_STOP = "time_stop"       # time stop: position open longer than TIME_STOP_HOURS
+PROFIT_LOCKED = "profit_locked" # step-wise profit lock: SL moved to TP1 after TP2
 
 
 class LifecycleLogger:
@@ -115,6 +116,12 @@ class LifecycleLogger:
                         symbol=symbol,
                         price=float(px_val or 0.0),
                         net_pnl=float(pnl_val or 0.0),
+                    )
+                elif state == PROFIT_LOCKED:
+                    px_val = fields.get("price") or 0.0
+                    notifier.notify_profit_locked(
+                        symbol=symbol,
+                        price=float(px_val),
                     )
         except Exception:  # noqa: BLE001 - notifications must never break logging
             pass

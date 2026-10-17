@@ -120,6 +120,8 @@ def validate_settings(data: dict) -> dict:
     _bool("exec_post_only_entry")
     _bool("cancel_orphan_orders_on_startup")
     _bool("adaptive_volatility_targets")
+    _bool("lock_profit_after_tp2")
+    _bool("volatility_scaling_enabled")
     for code in config.DASH_VETO_CODES:
         _bool(f"veto_{code}")
 
@@ -422,6 +424,9 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("cancel_orphan_orders_on_startup", "Cancel orphan orders saat startup",
      "bool"),
     ("adaptive_volatility_targets", "Adaptive volatility targets", "bool"),
+    ("lock_profit_after_tp2", "Lock profit SL ke TP1 saat TP2", "bool"),
+    ("volatility_scaling_enabled", "Dynamic volatility risk scaling", "bool"),
+    ("veto_volatility_shock", "Veto: volatility shock candle", "bool"),
 ]
 
 

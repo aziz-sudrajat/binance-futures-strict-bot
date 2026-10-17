@@ -14,12 +14,111 @@ asynchronously without blocking the main trading loop.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from typing import Callable
 
 log = logging.getLogger("stream")
+
+
+def parse_user_stream_event(raw_data: str | dict) -> dict | None:
+    """Parse and normalize Binance Futures User Data Stream event payloads.
+
+    Supports ORDER_TRADE_UPDATE, ACCOUNT_UPDATE, and listenKeyExpired events.
+    Returns normalized dictionary with human-readable keys, or None on invalid input.
+    """
+    if isinstance(raw_data, str):
+        try:
+            msg = json.loads(raw_data)
+        except Exception:  # noqa: BLE001 - malformed JSON -> ignore
+            return None
+    elif isinstance(raw_data, dict):
+        msg = raw_data
+    else:
+        return None
+
+    if not isinstance(msg, dict):
+        return None
+
+    evt_type = msg.get("e")
+    if evt_type == "ORDER_TRADE_UPDATE":
+        o = msg.get("o") or {}
+        try:
+            return {
+                "event_type": "ORDER_TRADE_UPDATE",
+                "event_time": msg.get("E"),
+                "transaction_time": msg.get("T"),
+                "symbol": o.get("s"),
+                "client_order_id": o.get("c"),
+                "side": o.get("S"),
+                "order_type": o.get("o"),
+                "time_in_force": o.get("f"),
+                "orig_qty": float(o["q"]) if o.get("q") is not None else 0.0,
+                "orig_price": float(o["p"]) if o.get("p") is not None else 0.0,
+                "avg_price": float(o["ap"]) if o.get("ap") is not None else 0.0,
+                "stop_price": float(o["sp"]) if o.get("sp") is not None else 0.0,
+                "execution_type": o.get("x"),
+                "order_status": o.get("X"),
+                "order_id": o.get("i"),
+                "last_filled_qty": float(o["l"]) if o.get("l") is not None else 0.0,
+                "cum_filled_qty": float(o["z"]) if o.get("z") is not None else 0.0,
+                "last_filled_price": float(o["L"]) if o.get("L") is not None else 0.0,
+                "commission": float(o["n"]) if o.get("n") is not None else 0.0,
+                "commission_asset": o.get("N"),
+                "trade_time": o.get("T"),
+                "trade_id": o.get("t"),
+                "is_maker": bool(o.get("m")),
+                "is_reduce_only": bool(o.get("R")),
+                "working_type": o.get("wt"),
+                "realized_profit": float(o["rp"]) if o.get("rp") is not None else 0.0,
+            }
+        except Exception as err:
+            log.debug("error parsing ORDER_TRADE_UPDATE: %s", err)
+            return None
+
+    if evt_type == "ACCOUNT_UPDATE":
+        a = msg.get("a") or {}
+        try:
+            balances = []
+            for b in a.get("B", []):
+                balances.append({
+                    "asset": b.get("a"),
+                    "wallet_balance": float(b["wb"]) if b.get("wb") is not None else 0.0,
+                    "cross_wallet_balance": float(b["cw"]) if b.get("cw") is not None else 0.0,
+                    "balance_change": float(b["bc"]) if b.get("bc") is not None else 0.0,
+                })
+            positions = []
+            for p in a.get("P", []):
+                positions.append({
+                    "symbol": p.get("s"),
+                    "position_amount": float(p["pa"]) if p.get("pa") is not None else 0.0,
+                    "entry_price": float(p["ep"]) if p.get("ep") is not None else 0.0,
+                    "unrealized_pnl": float(p["up"]) if p.get("up") is not None else 0.0,
+                    "margin_type": p.get("mt"),
+                    "isolated_wallet": float(p["iw"]) if p.get("iw") is not None else 0.0,
+                    "position_side": p.get("ps"),
+                })
+            return {
+                "event_type": "ACCOUNT_UPDATE",
+                "event_time": msg.get("E"),
+                "transaction_time": msg.get("T"),
+                "reason": a.get("m"),
+                "balances": balances,
+                "positions": positions,
+            }
+        except Exception as err:
+            log.debug("error parsing ACCOUNT_UPDATE: %s", err)
+            return None
+
+    if evt_type == "listenKeyExpired":
+        return {
+            "event_type": "listenKeyExpired",
+            "event_time": msg.get("E"),
+        }
+
+    return None
 
 
 class BinanceUserStream:
@@ -85,6 +184,37 @@ class BinanceUserStream:
     def is_running(self) -> bool:
         """True when keep-alive loop is active."""
         return self._running and self.listen_key is not None
+
+    def handle_message(self, raw_data: str | dict) -> dict | None:
+        """Parse incoming WebSocket message and dispatch to registered callbacks."""
+        evt = parse_user_stream_event(raw_data)
+        if not evt:
+            return None
+
+        etype = evt.get("event_type")
+        if etype == "ORDER_TRADE_UPDATE":
+            if callable(self.on_order_update):
+                try:
+                    self.on_order_update(evt)
+                except Exception as err:  # noqa: BLE001
+                    log.error("error in on_order_update callback: %s", err)
+        elif etype == "ACCOUNT_UPDATE":
+            if callable(self.on_account_update):
+                try:
+                    self.on_account_update(evt)
+                except Exception as err:  # noqa: BLE001
+                    log.error("error in on_account_update callback: %s", err)
+        elif etype == "listenKeyExpired":
+            log.warning("listenKeyExpired event received from stream; refreshing")
+            create_fn = getattr(self.exchange, "create_listen_key", None)
+            if callable(create_fn):
+                new_key = create_fn()
+                if new_key:
+                    with self._lock:
+                        self.listen_key = new_key
+                    log.info("listenKey refreshed on expiry event: %s...", new_key[:8])
+
+        return evt
 
     def _keepalive_worker(self) -> None:
         """Periodically ping the exchange to maintain listenKey validity."""

@@ -223,6 +223,14 @@ ADAPTIVE_VOLATILITY_TARGETS = False  # signal engine: scale TP/SL distances
                                # by recent ATR/volatility regime instead of
                                # fixed multiples. Experimental; default off.
                                # User feature 2026-10-16.
+VOLATILITY_SCALING_ENABLED = True  # executor: scale position risk dynamically based on ATR %
+VOLATILITY_HIGH_ATR_PCT = 3.5      # > 3.5% of price -> elevated volatility
+VOLATILITY_EXTREME_ATR_PCT = 5.0   # > 5.0% of price -> high turbulence
+VOLATILITY_SCALE_HIGH_FACTOR = 0.75  # scale risk to 75% under elevated volatility
+VOLATILITY_SCALE_EXTREME_FACTOR = 0.50 # scale risk to 50% under extreme turbulence
+
+VOLATILITY_SHOCK_VETO_ENABLED = True # veto V20: block entries on erratic volatility shock candles
+VOLATILITY_SHOCK_MAX_RATIO = 2.5     # candle range > 2.5x ATR_14 triggers veto
 
 # ------------------------------------------------------- backtest defaults
 # ROADMAP ITEM 4 (honest backtester). Costs are applied per side; every
@@ -239,6 +247,7 @@ BACKTEST_SIGNAL_EXPIRY_HOURS = 24  # GAS: CRYPTO_SIGNAL_EXPIRY_HOURS — a signa
 BACKTEST_START_EQUITY = 10_000.0   # hypothetical USD equity for sizing
 BACKTEST_MIN_TRADES = 30           # below this the report says SAMPLE TOO SMALL
 BACKTEST_BREAKEVEN_AFTER_TP1 = True  # move SL to entry once TP1 fills
+BACKTEST_LOCK_PROFIT_AFTER_TP2 = False # move SL to TP1 price once TP2 fills
 BACKTEST_DEFAULT_DAYS = 60         # default lookback for the CLI smoke run
 BACKTEST_DEFAULT_STEP_H = 6        # signal evaluation step (hours)
 
@@ -255,6 +264,7 @@ BINANCE_FUTURES_MAINNET_URL = "https://fapi.binance.com"
 EXEC_POLL_INTERVAL_MIN = 5
 EXEC_MAX_EXPOSURE_PCT_PER_SYMBOL = 20.0  # max position notional as % of balance
 EXEC_BREAKEVEN_AFTER_TP1 = True           # move SL to entry once TP1 fills
+EXEC_LOCK_PROFIT_AFTER_TP2 = True         # move SL to TP1 price once TP2 fills (Phase 4)
 EXEC_SIGNAL_ID_TTL_HOURS = 72             # processed signal IDs are kept this long
 LIVE_SIGNAL_EXPIRY_HOURS = 24            # absolute max age (hours) of a
                                          # signals.db row before the executor
@@ -472,13 +482,17 @@ DASH_BOOL_OVERRIDES = {
     "cancel_orphan_orders_on_startup": "CANCEL_ORPHAN_ORDERS_ON_STARTUP",
     "adaptive_volatility_targets": "ADAPTIVE_VOLATILITY_TARGETS",
     "veto_funding_window": "FUNDING_PROXIMITY_VETO_ENABLED",
+    "lock_profit_after_tp2": "EXEC_LOCK_PROFIT_AFTER_TP2",
+    "volatility_scaling_enabled": "VOLATILITY_SCALING_ENABLED",
+    "veto_volatility_shock": "VOLATILITY_SHOCK_VETO_ENABLED",
 }
 # MTF 30m leg mode: STRICT (default) or LEAN (GAS default behavior).
 DASH_MTF_MODES = ("STRICT", "LEAN")
 # Deterministic veto codes the dashboard can toggle (default: all enabled).
 # Disabling a veto is an explicit operator choice and is logged as such.
 DASH_VETO_CODES = ("leverage_risk", "funding", "squeeze", "whale",
-                   "liq_wall", "btc_breaker", "sr_zone", "funding_window")
+                   "liq_wall", "btc_breaker", "sr_zone", "funding_window",
+                   "volatility_shock")
 # Signal strictness presets: ketat | sedang | biasa.
 # Choosing a mode applies its bundle to the individual dashboard settings
 # (quality gate, MTF 30m leg, 1d cascade leg, bullish-only, volume gate,
@@ -522,6 +536,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_btc_breaker": True,
         "veto_sr_zone": True,
         "veto_funding_window": True,
+        "veto_volatility_shock": True,
     },
     "sedang": {
         "min_quality_score": 60,
@@ -544,6 +559,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_btc_breaker": True,
         "veto_sr_zone": True,
         "veto_funding_window": True,
+        "veto_volatility_shock": True,
     },
     "biasa": {
         "min_quality_score": 50,
@@ -566,6 +582,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_btc_breaker": False,
         "veto_sr_zone": False,
         "veto_funding_window": False,
+        "veto_volatility_shock": False,
     },
 }
 # Vetoes currently disabled by the dashboard (populated by
@@ -605,6 +622,7 @@ DASHBOARD_DEFAULTS = {
     "exec_post_only_entry": False,
     "cancel_orphan_orders_on_startup": True,
     "adaptive_volatility_targets": False,
+    "volatility_scaling_enabled": True,
     "live_signal_expiry_hours": 24.0,
     "bullish_only": True,
     "mtf_30m_mode": "STRICT",
@@ -625,6 +643,7 @@ DASHBOARD_DEFAULTS = {
     "tp_split_2": 0.3,
     "tp_split_3": 0.3,
     "breakeven_after_tp1": True,
+    "lock_profit_after_tp2": True,
     # vetoes (True = enabled)
     "veto_leverage_risk": True,
     "veto_funding": True,
@@ -634,6 +653,7 @@ DASHBOARD_DEFAULTS = {
     "veto_btc_breaker": True,
     "veto_sr_zone": True,       # S/R location: no short into 4h support / long into 4h resistance
     "veto_funding_window": True,
+    "veto_volatility_shock": True,
     # universe
     "universe_mode": "top_movers",  # curated | top_volume | top_movers | all (GAS parity: top_movers)
     "universe_top_n": 30,        # 10-100, used when top_volume/top_movers

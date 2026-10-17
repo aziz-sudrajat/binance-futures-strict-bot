@@ -306,6 +306,8 @@ def simulate_trade(signal: dict, candles: list[dict], i_signal: int,
                 remaining -= q
                 if ti == 0 and breakeven:
                     sl = entry  # move stop to breakeven after TP1
+                elif ti == 1 and getattr(config, "BACKTEST_LOCK_PROFIT_AFTER_TP2", True):
+                    sl = tps[0][0]  # move stop to TP1 price after TP2 (lock profit)
         if remaining <= 1e-12:
             exit_reason, exit_k = "TP_ALL", k
             break
