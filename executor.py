@@ -849,18 +849,13 @@ class Executor:
         # entry stacked $2 margin on one coin and the 2nd SL algo order was
         # rejected by Binance -4509). Never open a second entry on a symbol
         # that already has an open position, regardless of direction.
-        for pid, p in self._open_positions().items():
-            if p.get("symbol") == symbol:
-                return self._reject(
-                    symbol, sid,
-                    f"already positioned in {symbol} ({pid})")
-
-        # M2: the exchange is ground truth for gate 4b. A position opened
-        # manually on the exchange after startup is invisible to the
-        # state-based check above until the next restart — without this the
-        # bot would stack a second entry on the same coin (WCTUSDT,
-        # 2026-10-16). Fail-closed: an unfetchable snapshot rejects the
-        # entry rather than risking a double position.
+        #
+        # M2/B3: the exchange is ground truth — check it FIRST. A position
+        # opened manually on the exchange after startup is invisible to the
+        # state-based check until the next restart, and a crash between the
+        # two checks could leave state/exchange diverged. Fail-closed: an
+        # unfetchable snapshot rejects the entry rather than risking a
+        # double position.
         try:
             xp_symbols = {str(p.get("symbol") or "")
                           for p in self.exchange.get_positions()}
@@ -873,6 +868,11 @@ class Executor:
             return self._reject(
                 symbol, sid,
                 f"already positioned in {symbol} on the exchange")
+        for pid, p in self._open_positions().items():
+            if p.get("symbol") == symbol:
+                return self._reject(
+                    symbol, sid,
+                    f"already positioned in {symbol} ({pid})")
 
         # 5. TP split must be placeable.
         tp_qty, note = split_tp_qty(

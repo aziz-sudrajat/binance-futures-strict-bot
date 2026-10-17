@@ -167,7 +167,6 @@ def _evaluate_priority(symbols: list[str], market: MarketData,
             if (approved + rejected + errors) % 50 == 0:
                 log.info("progress %d/%d", approved + rejected + errors,
                          len(symbols))
-    expired = db.expire_old()
     return approved, rejected, errors
 
 

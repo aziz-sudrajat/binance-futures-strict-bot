@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS signals (
   signal_id    TEXT NOT NULL,
   direction    TEXT NOT NULL,
   quality      REAL NOT NULL,
+  confidence   REAL DEFAULT 0,
   entry        REAL,
   entry_low    REAL,
   entry_high   REAL,
@@ -54,8 +55,8 @@ CREATE INDEX IF NOT EXISTS idx_signals_symbol
   ON signals(symbol, status);
 """
 
-_COLUMNS = ("id", "symbol", "signal_id", "direction", "quality", "strength",
-            "entry",
+_COLUMNS = ("id", "symbol", "signal_id", "direction", "quality", "confidence",
+            "strength", "entry",
             "entry_low", "entry_high", "stop_loss", "tp1", "tp2", "tp3",
             "atr",
             "reasons", "regime", "source", "created_at", "expires_at",
@@ -85,6 +86,8 @@ class SignalDB:
             self._conn.execute("ALTER TABLE signals ADD COLUMN strength REAL")
         if "atr" not in cols:
             self._conn.execute("ALTER TABLE signals ADD COLUMN atr REAL")
+        if "confidence" not in cols:
+            self._conn.execute("ALTER TABLE signals ADD COLUMN confidence REAL DEFAULT 0")
 
     def close(self):
         try:
@@ -100,31 +103,35 @@ class SignalDB:
 
         One active ('new') signal per symbol: an existing active row for the
         symbol is replaced only when the new signal is strictly better
-        (higher quality) or the old one already expired.
+        (higher quality/confidence) or the old one already expired.
         Returns the row id.
         """
         now_ms = int(time.time() * 1000)
         expires_at = now_ms + int(expiry_min) * 60_000
         cur = self._conn.execute(
-            "SELECT id, quality, strength, expires_at FROM signals "
+            "SELECT id, quality, confidence, strength, expires_at FROM signals "
             "WHERE symbol = ? AND status = 'new' "
-            "ORDER BY quality DESC, COALESCE(strength, 0) DESC LIMIT 1",
+            "ORDER BY quality DESC, COALESCE(confidence, 0) DESC, COALESCE(strength, 0) DESC LIMIT 1",
             (signal["symbol"],))
         row = cur.fetchone()
-        if row and row["expires_at"] > now_ms \
-                and row["quality"] >= float(signal.get("quality") or 0):
-            return row["id"]  # keep the better existing signal
+        sig_qual = float(signal.get("quality") or 0)
+        sig_conf = float(signal.get("confidence") or 0)
+        if row and row["expires_at"] > now_ms:
+            row_qual = float(row["quality"] or 0)
+            row_conf = float(row["confidence"] or 0)
+            if (row_qual, row_conf) >= (sig_qual, sig_conf):
+                return row["id"]  # keep the better existing signal
         if row:
             self._conn.execute("UPDATE signals SET status = 'expired' "
                                "WHERE id = ?", (row["id"],))
         cur = self._conn.execute(
             """INSERT INTO signals
-               (symbol, signal_id, direction, quality, strength, entry,
+               (symbol, signal_id, direction, quality, confidence, strength, entry,
                 entry_low, entry_high, stop_loss, tp1, tp2, tp3, atr, reasons,
                 regime, source, created_at, expires_at, status)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (signal["symbol"], signal_id, signal.get("direction", "LONG"),
-             float(signal.get("quality") or 0),
+             sig_qual, sig_conf,
              signal.get("strength"),
              signal.get("entry"), signal.get("entry_low"),
              signal.get("entry_high"), signal.get("stop_loss"),
@@ -158,7 +165,7 @@ class SignalDB:
         cur = self._conn.execute(
             f"SELECT {', '.join(_COLUMNS)} FROM signals "
             "WHERE status = 'new' AND expires_at > ? "
-            "ORDER BY quality DESC, COALESCE(strength, 0) DESC, id ASC LIMIT ?",
+            "ORDER BY quality DESC, COALESCE(confidence, 0) DESC, COALESCE(strength, 0) DESC, id ASC LIMIT ?",
             (now_ms, limit))
         return [self._row_to_dict(r) for r in cur.fetchall()]
 
@@ -191,6 +198,7 @@ class SignalDB:
             "symbol": row["symbol"],
             "direction": row["direction"],
             "quality": row["quality"],
+            "confidence": row.get("confidence"),
             "strength": row.get("strength"),
             "entry": row["entry"],
             "entry_low": row["entry_low"],

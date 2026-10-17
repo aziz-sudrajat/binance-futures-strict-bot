@@ -195,3 +195,13 @@ def test_past_date_still_excludes_open_positions(tmp_path):
                           {"p1": {"signal_id": "s1", "symbol": "BTCUSDT"}},
                           "2026-10-10")
     assert "closed trades: 0 | wins: 0 | realized PnL: +0.00 USDT" in out
+
+
+def test_modern_stops_counted_in_report(tmp_path):
+    # Test that profit_take, trail_stop, and time_stop are counted as terminal trades
+    out = _write(tmp_path, [
+        _ev("s1", "profit_take", reason="profit_take +20%", realized=12.5, terminal=True),
+        _ev("s2", "trail_stop", reason="trail_stop pullback", realized=8.0, terminal=True),
+        _ev("s3", "time_stop", reason="time_stop after 4h", realized=-2.5, terminal=True),
+    ])
+    assert "closed trades: 3 | wins: 2 | realized PnL: +18.00 USDT" in out

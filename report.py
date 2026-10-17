@@ -74,8 +74,10 @@ def daily_report(date_str: str | None = None,
     # visible in the state counts above but are excluded from trade stats
     # (no PnL is possible, and counting them would distort the win rate).
     TERMINAL_STATES = {"tp1_hit", "tp2_hit", "tp3_hit", "sl_hit",
-                       "manual_close", "expired", "cancelled"}
-    TRADE_STATES = {"tp1_hit", "tp2_hit", "tp3_hit", "sl_hit", "manual_close"}
+                       "manual_close", "profit_take", "trail_stop", "time_stop",
+                       "expired", "cancelled"}
+    TRADE_STATES = {"tp1_hit", "tp2_hit", "tp3_hit", "sl_hit", "manual_close",
+                    "profit_take", "trail_stop", "time_stop"}
     terminal = {}
     for e in events:
         if e.get("state") not in TERMINAL_STATES:

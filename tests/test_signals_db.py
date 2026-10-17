@@ -145,3 +145,23 @@ def test_atr_storage_and_recovery(tmp_path):
     assert sig["atr"] == 3.1415
     db.close()
 
+
+def test_confidence_storage_and_ordering(tmp_path):
+    p = str(tmp_path / "test_conf.db")
+    db = SignalDB(p)
+    s1 = _sig("COIN1", q=80)
+    s1["confidence"] = 70
+    s2 = _sig("COIN2", q=80)
+    s2["confidence"] = 95
+    db.upsert_signal(s1, "S1")
+    db.upsert_signal(s2, "S2")
+
+    fresh = db.get_fresh_signals()
+    assert len(fresh) == 2
+    # COIN2 should come first due to higher confidence (95 > 70) with same quality (80)
+    assert fresh[0]["symbol"] == "COIN2"
+    assert fresh[0]["confidence"] == 95
+    sig = db.to_signal(fresh[0])
+    assert sig["confidence"] == 95
+    db.close()
+

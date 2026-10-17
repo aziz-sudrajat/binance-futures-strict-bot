@@ -238,3 +238,33 @@ def test_select_candidates_never_raises_one_symbol():
 
 def test_select_candidates_empty_universe():
     assert _select_candidates([], _bull_market(), None) == []
+
+
+def test_prefilter_adx_floor(monkeypatch):
+    m = _bull_market()
+    # When ADX minimum is set higher than market ADX (pure uptrend has ADX 100.0), prefilter should reject
+    monkeypatch.setattr(config, "PREFILTER_ADX_MIN", 101.0)
+    ok, reason = prefilter_symbol("TESTUSDT", m, tickers=None)
+    assert ok is False
+    assert "ADX" in reason
+
+    # When ADX minimum is low, prefilter passes
+    monkeypatch.setattr(config, "PREFILTER_ADX_MIN", 25.0)
+    ok, direction = prefilter_symbol("TESTUSDT", m, tickers=None)
+    assert ok is True
+    assert direction == "BULLISH"
+
+
+def test_prefilter_pattern_min(monkeypatch):
+    m = _bull_market()
+    # High pattern requirement rejects if not enough candlestick pattern points
+    monkeypatch.setattr(config, "PREFILTER_PATTERN_MIN", 5)
+    ok, reason = prefilter_symbol("TESTUSDT", m, tickers=None)
+    assert ok is False
+    assert "pattern score" in reason
+
+    # Pattern requirement 0 passes
+    monkeypatch.setattr(config, "PREFILTER_PATTERN_MIN", 0)
+    ok, direction = prefilter_symbol("TESTUSDT", m, tickers=None)
+    assert ok is True
+    assert direction == "BULLISH"

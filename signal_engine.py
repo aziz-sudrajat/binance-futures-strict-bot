@@ -714,9 +714,21 @@ def _build_signal(symbol: str, direction: str, a15: dict, live: float,
                   quality: int, mode: str, reviews: list[str],
                   deriv: dict | None = None, snap: dict | None = None,
                   deriv_missing: list | None = None,
-                  delta_notes: list | None = None) -> tuple[dict, str]:
+                  delta_notes: list | None = None,
+                  confidence: int | None = None,
+                  a30: dict | None = None,
+                  a4h: dict | None = None) -> tuple[dict, str]:
     plan = a15["trade_plan"]
     sig_dir = "SHORT" if direction == "BEARISH" else "LONG"
+    if confidence is None:
+        atr_val = float(a15.get("atr") or (plan.get("atr") if plan else 0.0) or 0.0)
+        confidence = compute_confidence(
+            a15, a30=a30, a4h=a4h,
+            volume_ratio=float(a15.get("volume_ratio") or 1.0),
+            regime=a15.get("regime") or "MIXED / TRANSITION",
+            direction=direction,
+            entry_zone=config.ENTRY_ZONE_ATR * atr_val,
+            price=live)
     signal = {
         "symbol": symbol,
         "direction": sig_dir,
@@ -728,6 +740,7 @@ def _build_signal(symbol: str, direction: str, a15: dict, live: float,
         "tp1": plan["tp1"], "tp2": plan["tp2"], "tp3": plan["tp3"],
         "rr1": plan["rr1"],
         "quality": quality,
+        "confidence": confidence,
         "mode": mode,
         "reviews": reviews,
         "strength": a15["strength"],
@@ -831,6 +844,8 @@ def prefilter_symbol(symbol: str, market, tickers: dict | None = None
     atr_floor = getattr(config, "PREFILTER_ATR_FLOOR_PCT", None)
     vol_trend = getattr(config, "PREFILTER_VOLUME_TREND_MIN", None)
     rsi_floor = getattr(config, "PREFILTER_RSI_EXTREAME", None)
+    adx_min = getattr(config, "PREFILTER_ADX_MIN", None)
+    pattern_min = getattr(config, "PREFILTER_PATTERN_MIN", None)
 
     try:
         k15 = market.get_klines(symbol, "15m")
@@ -876,6 +891,14 @@ def prefilter_symbol(symbol: str, market, tickers: dict | None = None
         # produce fake setups; hard to profit from mean reversion.
         if rsi <= rsi_floor["oversold"] or rsi >= rsi_floor["overbought"]:
             return False, f"RSI {rsi:.1f} in extreme zone ({rsi_floor})"
+    if adx_min is not None and a15.get("adx") is not None:
+        adx_val = float(a15["adx"])
+        if adx_val < float(adx_min):
+            return False, f"ADX {adx_val:.1f} below prefilter min {adx_min}"
+    if pattern_min is not None:
+        pat_score = compute_pattern_score(k15, direction)
+        if pat_score < int(pattern_min):
+            return False, f"pattern score {pat_score} below prefilter min {pattern_min}"
 
     # ---- Stage 2: MTF alignment — 4h, 1h, 30m, 15m, 5m same direction
     # (SEMUA mode). Fail-closed.
@@ -1206,6 +1229,16 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
         return None, note
     reviews.append(note)
 
+    # 4h analysis for confidence scoring (all modes). The 4h klines
+    # were just fetched by mtf_alignment_check above, so this hits
+    # the kline cache (no extra API call). None on error -> the
+    # confidence scorer skips the 4h leg gracefully.
+    a4h = None
+    try:
+        a4h = analyze_candles(symbol, "4h", market.get_klines(symbol, "4h"))
+    except Exception:  # noqa: BLE001
+        pass
+
     # ================= biasa: 15m + MTF 4h/1h/30m/15m =================
     if mode == "biasa":
         quality = _layered_quality(a15["strength"], mode)
@@ -1213,7 +1246,7 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
             return None, (f"quality {quality}/100 below biasa minimum "
                            f"{config.MIN_QUALITY_SCORE}")
         return _build_signal(symbol, direction, a15, live, quality, mode,
-                             reviews)
+                             reviews, a30=a30, a4h=a4h)
 
     # ---- Stage 3: BTC direction must match (sedang, ketat).
     if config.BTC_ALIGN_REQUIRED:
@@ -1229,7 +1262,7 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
             return None, (f"quality {quality}/100 below sedang minimum "
                            f"{config.MIN_QUALITY_SCORE}")
         return _build_signal(symbol, direction, a15, live, quality, mode,
-                             reviews)
+                             reviews, a30=a30, a4h=a4h)
 
     # ================= ketat: full review stack =================
     # Stage 4: pattern review.
@@ -1367,4 +1400,5 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
 
     return _build_signal(symbol, direction, a15, live, q["quality"], mode,
                          reviews, deriv=deriv, snap=snap,
-                         deriv_missing=deriv_missing, delta_notes=delta_notes)
+                         deriv_missing=deriv_missing, delta_notes=delta_notes,
+                         a30=a30, a4h=a4h)
