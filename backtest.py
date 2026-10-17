@@ -138,10 +138,10 @@ def load_history(symbols: list[str], days: int,
     for sym in need_symbols:
         data[sym] = {}
         for iv in _GATE_INTERVALS:
-            # Only 1h is needed for the BTCUSD T symbol itself beyond gates.
-            if sym == "BTCUSDT" and sym not in symbols and iv != "1h":
-                data[sym][iv] = []
-                continue
+            # FIX (B1/B2): ALL gate-interval history for every symbol
+            # (incl. BTCUSDT). Non-1h history was intentionally skipped,
+            # which broke multi-symbol backtests. Historical depth is what
+            # the pipeline gates on, not the symbol list.
             data[sym][iv] = fetch_history(sym, iv, days, session)
             print(f"  {sym} {iv}: {len(data[sym][iv])} closed candles",
                   flush=True)

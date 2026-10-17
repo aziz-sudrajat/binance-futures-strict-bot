@@ -237,6 +237,8 @@ class BinanceUserStream:
                         if callable(create_fn):
                             new_key = create_fn()
                             if new_key:
-                                self.listen_key = new_key
+                                with self._lock:
+                                    self.listen_key = new_key
                                 last_ping = now
                                 log.info("listenKey refreshed: %s...", new_key[:8])
+

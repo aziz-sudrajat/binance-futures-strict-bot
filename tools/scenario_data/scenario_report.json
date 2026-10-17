@@ -1,0 +1,135 @@
+{
+  "generated": 1792226501,
+  "scenarios": 8,
+  "results": [
+    {
+      "scenario": "trend_bull",
+      "direction": "BULLISH",
+      "signal": null,
+      "note": "pattern: tak ada pola candlestick 15m yang mendukung bullish (5 candle terakhir)",
+      "candle_count": 200,
+      "live_price": 101.98981933871914
+    },
+    {
+      "scenario": "trend_bear",
+      "direction": "BEARISH",
+      "signal": null,
+      "note": "bullish-only: 15m signal BEARISH WATCH",
+      "candle_count": 200,
+      "live_price": 98.00981933871915
+    },
+    {
+      "scenario": "chop",
+      "direction": "BULLISH",
+      "signal": null,
+      "note": "bullish-only: 15m signal BEARISH WATCH",
+      "candle_count": 200,
+      "live_price": 99.99819338719142
+    },
+    {
+      "scenario": "btc_dump",
+      "direction": "LONG",
+      "signal": null,
+      "note": "pattern: tak ada pola candlestick 15m yang mendukung bullish (5 candle terakhir)",
+      "candle_count": 200,
+      "live_price": 102.89058269898152
+    },
+    {
+      "scenario": "high_vol",
+      "direction": "BULLISH",
+      "signal": null,
+      "note": "freshness: live price +0.56% above entry zone \u2014 stale entry",
+      "candle_count": 200,
+      "live_price": 109.7662212787161
+    },
+    {
+      "scenario": "squeeze_long",
+      "direction": "BULLISH",
+      "signal": null,
+      "note": "bullish-only: 15m signal BEARISH WATCH",
+      "candle_count": 200,
+      "live_price": 99.25104828970339
+    },
+    {
+      "scenario": "squeeze_short",
+      "direction": "BEARISH",
+      "signal": null,
+      "note": "bullish-only: 15m signal BEARISH WATCH",
+      "candle_count": 200,
+      "live_price": 99.25104828970339
+    },
+    {
+      "scenario": "flat_no_trend",
+      "direction": "BULLISH",
+      "signal": null,
+      "note": "pattern: tak ada pola candlestick 15m yang mendukung bullish (5 candle terakhir)",
+      "candle_count": 200,
+      "live_price": 99.00024302333107
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "rejected": 8,
+    "note": ""
+  },
+  "scenario_map": {
+    "trend_bull": false,
+    "trend_bear": false,
+    "chop": false,
+    "btc_dump": false,
+    "high_vol": false,
+    "squeeze_long": false,
+    "squeeze_short": false,
+    "flat_no_trend": false
+  },
+  "failures": [
+    {
+      "scenario": "trend_bull",
+      "reason": "pattern: tak ada pola candlestick 15m yang mendukung bullish (5 candle terakhir)",
+      "direction": "BULLISH",
+      "signal": null
+    },
+    {
+      "scenario": "trend_bear",
+      "reason": "bullish-only: 15m signal BEARISH WATCH",
+      "direction": "BEARISH",
+      "signal": null
+    },
+    {
+      "scenario": "chop",
+      "reason": "bullish-only: 15m signal BEARISH WATCH",
+      "direction": "BULLISH",
+      "signal": null
+    },
+    {
+      "scenario": "btc_dump",
+      "reason": "pattern: tak ada pola candlestick 15m yang mendukung bullish (5 candle terakhir)",
+      "direction": "LONG",
+      "signal": null
+    },
+    {
+      "scenario": "high_vol",
+      "reason": "freshness: live price +0.56% above entry zone \u2014 stale entry",
+      "direction": "BULLISH",
+      "signal": null
+    },
+    {
+      "scenario": "squeeze_long",
+      "reason": "bullish-only: 15m signal BEARISH WATCH",
+      "direction": "BULLISH",
+      "signal": null
+    },
+    {
+      "scenario": "squeeze_short",
+      "reason": "bullish-only: 15m signal BEARISH WATCH",
+      "direction": "BEARISH",
+      "signal": null
+    },
+    {
+      "scenario": "flat_no_trend",
+      "reason": "pattern: tak ada pola candlestick 15m yang mendukung bullish (5 candle terakhir)",
+      "direction": "BULLISH",
+      "signal": null
+    }
+  ]
+}

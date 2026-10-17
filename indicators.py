@@ -62,8 +62,12 @@ def rsi_wilder(values, period: int = 14) -> float:
 
 def macd(values, fast: int = 12, slow: int = 26, signal_period: int = 9) -> dict:
     vals = [float(v) for v in values]
+    if not vals:
+        return {"macd_line": 0.0, "signal_line": 0.0, "histogram": 0.0}
     f, s = ema_series(vals, fast), ema_series(vals, slow)
     line = [a - b for a, b in zip(f, s)]
+    if not line:
+        return {"macd_line": 0.0, "signal_line": 0.0, "histogram": 0.0}
     sig = ema_series(line, signal_period)
     i = len(line) - 1
     return {
@@ -71,6 +75,7 @@ def macd(values, fast: int = 12, slow: int = 26, signal_period: int = 9) -> dict
         "signal_line": sig[i],
         "histogram": line[i] - sig[i],
     }
+
 
 
 def _true_range(candle, prev_close: float) -> float:

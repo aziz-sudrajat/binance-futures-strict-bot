@@ -57,6 +57,7 @@ CREATE INDEX IF NOT EXISTS idx_signals_symbol
 _COLUMNS = ("id", "symbol", "signal_id", "direction", "quality", "strength",
             "entry",
             "entry_low", "entry_high", "stop_loss", "tp1", "tp2", "tp3",
+            "atr",
             "reasons", "regime", "source", "created_at", "expires_at",
             "status", "consumed_at")
 
@@ -82,6 +83,8 @@ class SignalDB:
                 self._conn.execute("PRAGMA table_info(signals)")}
         if "strength" not in cols:
             self._conn.execute("ALTER TABLE signals ADD COLUMN strength REAL")
+        if "atr" not in cols:
+            self._conn.execute("ALTER TABLE signals ADD COLUMN atr REAL")
 
     def close(self):
         try:
@@ -117,17 +120,19 @@ class SignalDB:
         cur = self._conn.execute(
             """INSERT INTO signals
                (symbol, signal_id, direction, quality, strength, entry,
-                entry_low, entry_high, stop_loss, tp1, tp2, tp3, reasons,
+                entry_low, entry_high, stop_loss, tp1, tp2, tp3, atr, reasons,
                 regime, source, created_at, expires_at, status)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (signal["symbol"], signal_id, signal.get("direction", "LONG"),
              float(signal.get("quality") or 0),
              signal.get("strength"),
              signal.get("entry"), signal.get("entry_low"),
              signal.get("entry_high"), signal.get("stop_loss"),
              signal.get("tp1"), signal.get("tp2"), signal.get("tp3"),
+             signal.get("atr"),
              json.dumps(signal.get("reasons") or []),
              signal.get("regime"), source, now_ms, expires_at, "new"))
+
         self._conn.commit()
         return cur.lastrowid
 
@@ -186,11 +191,14 @@ class SignalDB:
             "symbol": row["symbol"],
             "direction": row["direction"],
             "quality": row["quality"],
+            "strength": row.get("strength"),
             "entry": row["entry"],
             "entry_low": row["entry_low"],
             "entry_high": row["entry_high"],
             "stop_loss": row["stop_loss"],
             "tp1": row["tp1"], "tp2": row["tp2"], "tp3": row["tp3"],
+            "atr": row.get("atr"),
             "reasons": row["reasons"],
             "regime": row["regime"],
         }
+

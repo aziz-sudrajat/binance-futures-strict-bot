@@ -990,7 +990,9 @@ class Executor:
                                    price=fill_px, qty=fill_qty, pnl=round(net, 4))
                 log.info("%s %s filled @ %s (pnl %+0.2f)", pos_id, leg,
                          fill_px, net)
-        pos["qty"] = max(0.0, remaining)
+        if remaining < 1e-12:
+            remaining = 0.0
+        pos["qty"] = remaining
 
         # H2: keep the live SL sized to the remainder and verify the SL
         # leg is still alive on the exchange.
@@ -1316,17 +1318,20 @@ class Executor:
                 self.exchange.cancel_order(symbol, order_id=oid)
 
         tick = None
+        step = None
         try:
             filters = self.exchange.get_symbol_filters(symbol) or {}
             tick = filters.get("tickSize") or None
+            step = filters.get("stepSize") or None
         except Exception:  # noqa: BLE001
             pass
 
         def _px(p: float) -> float:
             return quantize_price(p, tick)
 
+        sl_qty = floor_to_step(pos["qty"], step) if step else pos["qty"]
         sl = self.exchange.place_algo_order(
-            symbol, exit_side, "STOP_MARKET", quantity=pos["qty"],
+            symbol, exit_side, "STOP_MARKET", quantity=sl_qty,
             trigger_price=_px(pos["stop_loss"]), reduce_only=True,
             working_type="MARK_PRICE",
             client_algo_id=self._leg_id(pos_id, "SL"))
@@ -1335,7 +1340,8 @@ class Executor:
         placed_algo.append(sl["algoId"])
         pos["sl_order_id"] = sl["algoId"]
         pos["sl_is_algo"] = True
-        pos["sl_qty"] = pos["qty"]  # H2: track live SL size for resizing
+        pos["sl_qty"] = sl_qty  # H2: track live SL size for resizing
+
 
         for leg in ("tp1", "tp2", "tp3"):
             tp = pos["tp"][leg]
@@ -1392,6 +1398,8 @@ class Executor:
             pass
         if step:
             qty = floor_to_step(qty, step)
+        if qty <= 0:
+            return False
         sl = self.exchange.place_algo_order(
             symbol, exit_side, "STOP_MARKET", quantity=qty,
             trigger_price=quantize_price(pos["stop_loss"], tick),
@@ -1504,6 +1512,8 @@ class Executor:
         be_qty = pos.get("qty") or 0.0
         if step:
             be_qty = floor_to_step(be_qty, step)
+        if be_qty <= 0:
+            return
         # STOP_MARKET must go through the algo endpoint: Binance rejects it
         # on /fapi/v1/order with HTTP 400 -4120. Place the new breakeven SL
         # BEFORE cancelling the old one so the position is never unprotected.
@@ -1549,6 +1559,8 @@ class Executor:
         lock_qty = pos.get("qty") or 0.0
         if step:
             lock_qty = floor_to_step(lock_qty, step)
+        if lock_qty <= 0:
+            return
         sl = self.exchange.place_algo_order(
             symbol, exit_side, "STOP_MARKET", quantity=lock_qty,
             trigger_price=lock_px, reduce_only=True, working_type="MARK_PRICE",

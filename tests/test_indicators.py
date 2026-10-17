@@ -82,3 +82,9 @@ def test_adx_strong_uptrend():
 def test_adx_too_short():
     assert adx(candles_from_closes([100.0] * 20), 14) == {
         "adx": 0.0, "plus_di": 0.0, "minus_di": 0.0}
+
+
+def test_macd_empty_input():
+    res = macd([])
+    assert res == {"macd_line": 0.0, "signal_line": 0.0, "histogram": 0.0}
+

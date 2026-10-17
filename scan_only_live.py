@@ -5,9 +5,13 @@
 # Unauthorized copying, modification, distribution, or false claim of
 # authorship is prohibited.
 
+import os
 import sys
-sys.path.insert(0, '/home/azzatssins/binance-futures-strict-bot')
-import config, dashboard
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config
+import dashboard
+
 from data import MarketData
 from signal_engine import evaluate_symbol
 from executor import resolve_universe

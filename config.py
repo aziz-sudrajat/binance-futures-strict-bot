@@ -75,6 +75,61 @@ TP3_RR = 3.00                   # GAS: CFG.TP3_RR (L128)
 FRESHNESS_MAX_DRIFT_PCT = 0.4   # GAS: CFG.FRESHNESS_MAX_DRIFT_PCT (L103)
 MIN_24H_VOLUME_USD = 2_000_000  # GAS: CFG.MIN_24H_VOLUME_USD (L100)
 
+# ------------------------- PREFILTER (cheap pre-screen) settings
+# Optional prefilter "pre-screens" (not engine correctness): cheap, fast,
+# and config-driven. The engine remains the final authority on signal validity.
+# Each gate can be independently disabled by setting None.
+# ---
+# PREFILTER_ATR_FLOOR_PCT: skip symbols with ATR below this % of price
+#   (filter out illiquid/noisy micro-caps). None = disabled.
+# PREFILTER_VOLUME_TREND_MIN: skip symbols where 24h volume declined more
+#   than this % vs the prior 24h (weak momentum). None = disabled.
+# PREFILTER_RSI_EXTREAME: ({"oversold": 20, "overbought": 80}) — skip RSI
+#   in extreme zones (often fake setups). None = disabled.
+PREFILTER_ATR_FLOOR_PCT = None
+PREFILTER_VOLUME_TREND_MIN = None
+PREFILTER_RSI_EXTREAME = None
+PREFILTER_ADX_MIN = None          # e.g. 18 = skip symbols with ADX < 18
+PREFILTER_PATTERN_MIN = None      # e.g. 3 = min pattern score (0-5)
+
+# ------------------------------------------------- signal quality & decay
+MIN_QUALITY_SCORE = 70            # Base quality gate (STRICT). See
+                                  # get_adaptive_quality_threshold() in
+                                  # signal_engine.py for the adaptive override.
+MTF_CONFIRM_BOOST = 8             # legacy alias (removed — use MTF_30M_MODE)
+MTF_CASCADE_BOOST = 8
+
+# --- Signal effectiveness (0-100) thresholds for auto-trading ---
+# Signals below the CONFIDENCE_THRESHOLD are NOT auto-traded. Use as a
+# soft gate: 90-100 = highest quality, 75-89 = good, 60-74 = moderate.
+CONFIDENCE_THRESHOLD_STRONG = 80  # auto-trade
+CONFIDENCE_THRESHOLD_MODERATE = 65  # review, auto-trade if market conditions
+                                    # support (volume > 2x, no news risk, etc.)
+
+# Signal TTL — default 30 min. Signals older than TTL_SECC are decayed.
+SIGNAL_TTL_SEC = 1800  # 30 min
+SIGNAL_TTL_DECAY_PCT_PER_MIN = 2.0  # every minute, signal quality decays by
+
+# --- Adaptive quality threshold (see get_adaptive_quality_threshold()
+#     in signal_engine.py) ---
+# ATR % of price thresholds for the adaptive override:
+ADAPTIVE_TURBULENT_ATR_PCT = 3.0
+ADAPTIVE_STABLE_ATR_PCT = 1.0
+ADAPTIVE_QUALITY_TURBULENT = 75  # high vol -> stricter
+ADAPTIVE_QUALITY_STABLE = 65      # low vol -> more permissive
+
+# --- Position sizing ---
+# Volatility-weighted position sizing factors (see compute_position_size() in
+# signal_engine.py):
+POSITION_VOL_FACTOR_STABLE = 1.0
+POSITION_VOL_FACTOR_VOLATILE = 0.7
+POSITION_QUALITY_FACTOR_MIN = 0.8
+POSITION_QUALITY_FACTOR_MAX = 1.3
+
+# --- Signal decay ---
+SIGNAL_DECAY_STRONG = 2.0  # allowed decay % per minute
+SIGNAL_DECAY_MODERATE = 1.0
+SIGNAL_DECAY_WEAK = 0.5
 # Quality-score blend (ROADMAP ITEM 3): every scoreDelta contributor is an
 # explicit, named component in quality_deltas.py, ported from the GAS deep
 # check (prePublishDeepCheck_, L3172-3262). No synthetic blends.

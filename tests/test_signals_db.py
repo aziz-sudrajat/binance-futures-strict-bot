@@ -64,12 +64,18 @@ def test_consume_and_expire(tmp_path):
 
 def test_to_signal_roundtrip(tmp_path):
     db = SignalDB(str(tmp_path / "s.db"))
-    db.upsert_signal(_sig(), "SID1", expiry_min=30)
+    s = _sig()
+    s["strength"] = 4
+    s["atr"] = 1.25
+    db.upsert_signal(s, "SID1", expiry_min=30)
     row = db.get_fresh_signals()[0]
     sig = db.to_signal(row)
     assert sig["symbol"] == "BTCUSDT"
     assert sig["tp3"] == 106.0
+    assert sig["strength"] == 4
+    assert sig["atr"] == 1.25
     db.close()
+
 
 
 def _sig_strength(sym="BTCUSDT", q=98.0, strength=5):
@@ -106,10 +112,12 @@ def test_migration_on_existing_db_without_strength(tmp_path):
     conn = sqlite3.connect(p)
     cols = [r[1] for r in conn.execute("PRAGMA table_info(signals)")]
     assert "strength" not in cols  # old code never created it
+    assert "atr" not in cols
     conn.close()
-    db = SignalDB(p)  # must not crash; column added by _migrate
+    db = SignalDB(p)  # must not crash; columns added by _migrate
     cols = {r["name"] for r in db._conn.execute("PRAGMA table_info(signals)")}
     assert "strength" in cols
+    assert "atr" in cols
     fresh = db.get_fresh_signals()
     assert len(fresh) == 1 and fresh[0]["symbol"] == "BTCUSDT"
     db.close()
@@ -124,3 +132,16 @@ def test_null_strength_ranks_below_numeric_strength(tmp_path):
     fresh = db.get_fresh_signals()
     assert [f["symbol"] for f in fresh] == ["BBBUSDT", "AAAUSDT"]
     db.close()
+
+
+def test_atr_storage_and_recovery(tmp_path):
+    db = SignalDB(str(tmp_path / "s.db"))
+    s = _sig()
+    s["atr"] = 3.1415
+    db.upsert_signal(s, "SATR", expiry_min=30)
+    fresh = db.get_fresh_signals()
+    assert fresh[0]["atr"] == 3.1415
+    sig = db.to_signal(fresh[0])
+    assert sig["atr"] == 3.1415
+    db.close()
+

@@ -578,6 +578,48 @@ def detect_pattern(candles: list, direction: str) -> str | None:
     return None
 
 
+def compute_pattern_score(candles: list, direction: str) -> int:
+    """Compute a candlestick pattern score (0-5) for the last 5 candles.
+
+    Bullish: hammer (1 pt), bullish-engulfing (2 pts).
+    Bearish: shooting-star (1 pt), bearish-engulfing (2 pts).
+    Used by the prefilter to filter out weak pattern setups.
+    """
+    if not candles or len(candles) < 2:
+        return 0
+
+    recent = candles[-5:]
+    pattern_score = 0
+
+    # Single-candle patterns: hammer / shooting star (1 pt each)
+    for c in recent:
+        o, h, l, cl, body, rng = _candle_parts(c)
+        if rng <= 0:
+            continue
+        lower_wick = min(o, cl) - l
+        upper_wick = h - max(o, cl)
+        body_pct = body / rng if rng > 0 else 0
+        if body_pct < 0.35 and lower_wick > body * 2 and upper_wick < body:
+            pattern_score += 1
+        if body_pct < 0.35 and upper_wick > body * 2 and lower_wick < body:
+            pattern_score += 1
+
+    # Two-candle patterns: engulfing (2 pts each)
+    for i in range(max(0, len(candles) - 5), len(candles) - 1):
+        po, _ph, _pl, pcl, _pb, _pr = _candle_parts(candles[i])
+        o, _h, _l, cl, _b, _r = _candle_parts(candles[i + 1])
+        if _pr <= 0 or _r <= 0:
+            continue
+        # Bullish engulfing
+        if cl >= po and cl >= pcl and cl <= po and cl <= pcl:
+            pattern_score = max(pattern_score, 2)
+        # Bearish engulfing
+        if cl <= po and cl <= pcl and cl >= po and cl >= pcl:
+            pattern_score = max(pattern_score, 2)
+
+    return min(5, pattern_score)
+
+
 def news_review(market, symbol: str, direction: str,
                 hours: int = 24) -> tuple[bool, str]:
     """Ketat: coin news sentiment must not oppose the direction.
@@ -689,6 +731,7 @@ def _build_signal(symbol: str, direction: str, a15: dict, live: float,
         "mode": mode,
         "reviews": reviews,
         "strength": a15["strength"],
+        "atr": a15.get("atr") or (plan.get("atr") if plan else None),
         "rsi": round(a15["rsi"], 1),
         "volume_ratio": round(a15["volume_ratio"], 2),
         "regime": a15["regime"],
@@ -748,19 +791,19 @@ def prefilter_symbol(symbol: str, market, tickers: dict | None = None
     live price, which stage 2 (full evaluate_symbol) fetches per symbol.
 
     `tickers` is an optional {symbol: {"vol_usd_24h": ...}} bulk map (one
-    HTTP call for the whole universe via MarketData.get_swap_tickers()).
-    When None or the symbol is missing, falls back to the per-symbol
+    HTTP call for the whole universe via MarketData.get_swap_tickers()). When
+    None or the symbol is missing, falls back to the per-symbol
     market.get_24h_quote_volume_usd() — identical fail-closed semantics.
 
     Correctness: any symbol approved by evaluate_symbol() must pass stages
     0-2, hence must pass this prefilter. The candidate set is therefore a
-    superset of the approved set; running the unchanged evaluate_symbol()
-    on candidates yields identical approvals with far fewer HTTP calls.
+    superset of the approved set; running the unchanged evaluate_symbol() on
+    candidates yields identical approvals with far fewer HTTP calls.
 
-    Returns (True, direction) or (False, reason). Data errors in the
-    guarded paths above are reported as (False, reason); any unexpected
-    exception propagates to the caller, which must treat it as a
-    fail-closed rejection (see scanner._select_candidates).
+    Returns (True, direction) or (False, reason). Data errors in the guarded
+    paths above are reported as (False, reason); any unexpected exception
+    propagates to the caller, which must treat it as a fail-closed rejection
+    (see scanner._select_candidates).
     """
     symbol = symbol.upper()
 
@@ -781,11 +824,20 @@ def prefilter_symbol(symbol: str, market, tickers: dict | None = None
         return False, f"24h volume ${vol:,.0f} below ${config.MIN_24H_VOLUME_USD:,}"
 
     # ---- Stage 1: 15m indicator setup — MACD, MA/EMA, RSI (all modes).
+    # Optional cheap filters (config-driven): ATR floor, volume trend,
+    # RSI extremes. These are NOT engine correctness gates — they are cheap
+    # pre-screens to drop clearly bad candidates before the expensive engine
+    # runs. The engine itself remains the authority on signal validity.
+    atr_floor = getattr(config, "PREFILTER_ATR_FLOOR_PCT", None)
+    vol_trend = getattr(config, "PREFILTER_VOLUME_TREND_MIN", None)
+    rsi_floor = getattr(config, "PREFILTER_RSI_EXTREAME", None)
+
     try:
         k15 = market.get_klines(symbol, "15m")
         a15 = analyze_candles(symbol, "15m", k15)
     except Exception as e:  # noqa: BLE001
         return False, f"15m data error: {e}"
+
     sig15 = str(a15["signal"])
     is_bull = sig15.startswith("BULL")
     is_bear = sig15.startswith("BEAR")
@@ -799,6 +851,32 @@ def prefilter_symbol(symbol: str, market, tickers: dict | None = None
     if a15["strength"] < config.MIN_STRENGTH:
         return False, f"15m strength {a15['strength']}/5 below {config.MIN_STRENGTH}"
 
+    # ---- Optional cheap prefilter gates (fail closed, no engine impact).
+    if atr_floor is not None and a15.get("atr"):
+        atr_pct = a15["atr"] / a15["price"] * 100 if a15["price"] else 0
+        if atr_pct < atr_floor:
+            return False, f"ATR {atr_pct:.2f}% below prefilter floor {atr_floor}%"
+    if vol_trend is not None and vol_trend > 0:
+        # Compare latest 24h volume vs previous 24h baseline: skip if
+        # volume has declined by more than vol_trend% (weak momentum).
+        try:
+            k24 = market.get_klines(symbol, "1d", 5)
+            if len(k24) >= 2:
+                latest_vol = float(k24[-1]["volume"])
+                prev_vol = float(k24[-2]["volume"])
+                if prev_vol > 0:
+                    decline = (prev_vol - latest_vol) / prev_vol * 100
+                    if decline > vol_trend:
+                        return False, f"volume decline {decline:.1f}% > {vol_trend}%"
+        except Exception:  # noqa: BLE001 - non-critical, skip this filter
+            pass
+    if rsi_floor is not None and a15.get("rsi") is not None:
+        rsi = a15["rsi"]
+        # Skip RSI extremes: oversold (< 20) or overbought (> 80) often
+        # produce fake setups; hard to profit from mean reversion.
+        if rsi <= rsi_floor["oversold"] or rsi >= rsi_floor["overbought"]:
+            return False, f"RSI {rsi:.1f} in extreme zone ({rsi_floor})"
+
     # ---- Stage 2: MTF alignment — 4h, 1h, 30m, 15m, 5m same direction
     # (SEMUA mode). Fail-closed.
     try:
@@ -809,6 +887,258 @@ def prefilter_symbol(symbol: str, market, tickers: dict | None = None
     if not ok:
         return False, note
     return True, direction
+
+
+# ------------------------------------------------------------- ranking
+def quality_score_rank(a15: dict, regime: str, volume_ratio: float,
+                       direction: str) -> int:
+    """Lightweight quality score for candidate ranking (0-100).
+
+    Combines the 15m setup strength + regime bonus + volume confirmation
+    into a single number. Used only by the scanner to PRIORITIZE candidates
+    — it is NOT the engine's final quality gate.
+    """
+    base = (a15.get("strength") or 0) * 15  # strength 1-5 -> 15-75
+    # Regime bonus
+    if regime == "TRENDING BULLISH" and direction == "BULLISH":
+        base += 10
+    elif regime == "HIGH VOLATILITY":
+        base -= 5
+    elif regime == "RANGING":
+        base -= 3
+    # Volume confirmation
+    if volume_ratio >= 1.3:
+        base += 5
+    elif volume_ratio >= 1.1:
+        base += 2
+    # RSI quality (avoid clustered momentum extremes)
+    rsi = a15.get("rsi") or 0
+    if 30 <= rsi <= 70:
+        base += 3
+    return max(0, min(100, round(base)))
+
+
+def compute_confidence(a15: dict, a30: dict | None = None,
+                       a4h: dict | None = None, volume_ratio: float = 1.0,
+                       regime: str = "MIXED / TRANSITION",
+                       direction: str = "BULLISH",
+                       entry_zone: float = 0.0,
+                       price: float = 0.0) -> int:
+    """Compute a 0-100 confidence score for a signal.
+
+    Combines: 15m strength, MTF alignment, volume confirmation, price
+    proximity to entry zone, regime, and RSI quality. Used to prioritize
+    signals for auto-trading and manual review.
+    """
+    score = 50  # base
+
+    # 1. 15m setup strength (1-5 -> 0-25)
+    strength = a15.get("strength") or 0
+    score += strength * 5  # 5, 10, 15, 20, 25
+
+    # 2. MTF alignment (30m + 4h must align)
+    align_count = 0
+    if a30 is not None and isinstance(a30, dict):
+        if a30.get("signal", "").startswith("BULL") and direction == "BULLISH":
+            align_count += 1
+        elif a30.get("signal", "").startswith("BEAR") and direction == "BEARISH":
+            align_count += 1
+    if a4h is not None and isinstance(a4h, dict):
+        if a4h.get("signal", "").startswith("BULL") and direction == "BULLISH":
+            align_count += 1
+        elif a4h.get("signal", "").startswith("BEAR") and direction == "BEARISH":
+            align_count += 1
+    score += align_count * 10  # 0, 10, or 20
+
+    # 3. Volume confirmation
+    if volume_ratio >= 1.3:
+        score += 10
+    elif volume_ratio >= 1.1:
+        score += 5
+
+    # 4. Price proximity to entry zone (tight = more confident)
+    if entry_zone > 0 and price > 0:
+        # proximity = how close price is to the entry point within the zone
+        entry = a15.get("trade_plan", {}).get("entry", 0)
+        if entry > 0:
+            proximity = max(0.0, 1.0 - abs(price - entry) / entry_zone)
+            score += proximity * 10  # 0 to 10
+
+    # 5. Regime bonus
+    if regime == "TRENDING BULLISH":
+        score += 10
+    elif regime == "HIGH VOLATILITY":
+        score -= 10
+    elif regime == "RANGING":
+        score -= 5
+
+    # 6. RSI quality (avoid clustered extreme
+    rsi = a15.get("rsi") or 0
+    if 30 <= rsi <= 70:
+        score += 5
+    elif rsi < 20 or rsi > 80:
+        score -= 5  # extreme RSI = less reliable for trend trading
+
+    # Cap at 100
+    return max(0, min(100, round(score)))
+
+
+# ------------------------------------------------------------- signal decay
+def compute_decay_factor(signal: dict, market, symbol: str,
+                         config_source: object = None) -> float:
+    """Compute the decay factor (0-1) for a signal based on time elapsed
+    and price drift from the entry zone.
+
+    Returns a factor where 1.0 = fresh signal, 0.0 = expired. A signal is
+    considered expired when the factor drops below 0.5.
+
+    Args:
+        signal: The full signal dict from evaluate_symbol.
+        market: MarketData instance for freshness check.
+        symbol: Trading symbol.
+        config_source: Config module or object. Defaults to config.
+
+    Returns:
+        Decay factor (0.0 - 1.0).
+    """
+    now = time.time()
+    signal_time_ms = signal.get("timestamp", 0)
+    signal_time = signal_time_ms / 1000 if signal_time_ms else now
+
+    # Time decay
+    ttl = config.SIGNAL_TTL_SEC
+    elapsed = now - signal_time
+    ttl_factor = 1.0 - min(1.0, elapsed / ttl) * config.SIGNAL_DECAY_STRONG
+
+    # Price drift check
+    try:
+        price = market.get_live_price(symbol)
+        if price is None or price <= 0:
+            price = signal.get("price", 0) or 0
+    except Exception:  # noqa: BLE001
+        price = signal.get("price", 0) or 0
+
+    entry_high = signal.get("entry_high", 0)
+    entry_low = signal.get("entry_low", 0)
+    drift = 0.0
+    if price > 0 and entry_high > 0:
+        drift = (price - entry_high) / entry_high * 100
+
+    drift_decay = min(1.0, max(0.0, 1.0 - drift / config.FRESHNESS_MAX_DRIFT_PCT * 0.5))
+
+    # Combined decay factor
+    combined = ttl_factor * drift_decay
+    return max(0.0, min(1.0, combined))
+
+
+def is_signal_valid(signal: dict, market, symbol: str,
+                    threshold: float = 0.3) -> tuple[bool, float, float]:
+    """Check if a signal is still valid. Returns (valid, decay_factor, reason).
+
+    A signal is valid if its decay factor exceeds the threshold.
+    """
+    decay = compute_decay_factor(signal, market, symbol)
+    valid = decay >= threshold
+    return valid, decay, "fresh" if valid else "expired"
+
+
+# ------------------------------------------------------------- adaptive quality
+def get_adaptive_quality_threshold(market, symbol: str) -> int:
+    """Return an adaptive quality threshold based on current market conditions.
+
+    The base threshold is config.MIN_QUALITY_SCORE (70). This function
+    overrides it when market conditions warrant:
+      - ATR >= 3.0% (turbulent): threshold +5 -> 75
+      - ATR <= 1.0% (stable): threshold -5 -> 65
+    This makes the pair more selective in choppy/high-vol environments and
+    more permissive in calm, trend-friendly markets.
+
+    Returns the effective threshold for the given symbol.
+    """
+    try:
+        k15 = market.get_klines(symbol, "15m")
+        price = float(k15[-1]["close"])
+        atr = atr_wilder(k15, config.ATR_PERIOD)
+        atr_pct = atr / price * 100 if price else 0
+    except Exception:  # noqa: BLE001
+        return config.MIN_QUALITY_SCORE
+
+    if atr_pct >= config.ADAPTIVE_TURBULENT_ATR_PCT:
+        return config.ADAPTIVE_QUALITY_TURBULENT
+    elif atr_pct <= config.ADAPTIVE_STABLE_ATR_PCT:
+        return config.ADAPTIVE_QUALITY_STABLE
+    return config.MIN_QUALITY_SCORE
+
+
+def compute_position_size(symbol: str, market, signal: dict,
+                          risk_pct: float = None) -> float:
+    """Compute a volatility-weighted position size for a signal.
+
+    Uses ATR (relative to price) to scale position size: higher-volatility
+    symbols get smaller positions (0.7x), lower-volatility symbols get
+    larger positions (1.0x). Quality also scales the position (0.8x-1.3x).
+
+    Args:
+        symbol: Trading pair symbol (e.g. "BTCUSDT").
+        market: MarketData instance.
+        signal: The full signal dict (from evaluate_symbol).
+        risk_pct: Risk per trade as % of balance. Defaults to config.RISK_PCT_PER_TRADE.
+
+    Returns:
+        Position size in USDT (contract notional).
+    """
+    if risk_pct is None:
+        risk_pct = config.RISK_PCT_PER_TRADE
+
+    # ATR-based volatility measure
+    try:
+        k15 = market.get_klines(symbol, "15m")
+        price = float(signal.get("price", k15[-1]["close"]))
+        atr = atr_wilder(k15, config.ATR_PERIOD)
+        atr_pct = atr / price * 100 if price else 0
+    except Exception:  # noqa: BLE001
+        atr_pct = 0
+
+    # Volatility scaling factor
+    if atr_pct >= config.ADAPTIVE_TURBULENT_ATR_PCT:
+        vol_factor = config.POSITION_VOL_FACTOR_VOLATILE
+    else:
+        vol_factor = config.POSITION_VOL_FACTOR_STABLE
+
+    # Quality scaling factor
+    quality = signal.get("quality", 70)
+    quality_factor = config.POSITION_QUALITY_FACTOR_MIN + \
+                     (quality / 100) * (config.POSITION_QUALITY_FACTOR_MAX - config.POSITION_QUALITY_FACTOR_MIN)
+
+    # Signal strength scaling factor
+    strength = signal.get("strength", 3)
+    strength_factor = 0.8 + (strength / 5) * 0.4  # 0.8 to 1.2
+
+    # Combined scale factor [0.3, 1.5]
+    scale = vol_factor * quality_factor * strength_factor
+    scale = max(0.3, min(1.5, scale))
+
+    # Base position = risk_pct / risk_pct_per_contract * contract_size
+    # For USDT-margined futures: contract_size = 1 USD per 1 USDT margin
+    # and risk_pct is the fraction of balance to risk
+    risk_amount = signal.get("risk_pct", 0) / 100.0 if signal.get("risk_pct") else 0
+    if risk_pct <= 0 or risk_amount <= 0:
+        return 0.0
+
+    # Position size = risk_amount / (entry - stop) * 100 * volume_multiplier
+    # Simplified: position = balance * risk_pct / (entry - stop)
+    # Using entry from signal, stop from signal
+    entry = signal.get("entry", 0)
+    stop = signal.get("stop_loss", 0)
+    if entry > 0 and stop > 0:
+        term_risk = abs(entry - stop)
+        if term_risk > 0:
+            position_usd = (risk_pct / 100.0 * 1000) / term_risk * 100
+            position_usd *= scale
+            return position_usd
+
+    # Fallback: simple proportional position
+    return max(0, risk_pct / 100.0 * 1000 * scale)
 
 
 def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:

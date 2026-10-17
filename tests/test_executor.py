@@ -293,7 +293,71 @@ def test_open_flow_places_brackets(rig):
     assert "position_opened" in states
 
 
+def test_post_only_entry_gtx_when_enabled(rig):
+    # ENHANCE: EXEC_POST_ONLY_ENTRY=True -> LIMIT entries use GTX (maker-only),
+    # never cross the spread. Entry must be LIMIT (live price outside zone).
+    import config
+    config.EXEC_POST_ONLY_ENTRY = True
+    executor, market, exchange, state, lifecycle, risk = rig
+    # Move the live price OUT of the entry zone (so entry is a LIMIT) but
+    # still within the acceptance window (<= 0.4% above entry_high).
+    market.live = 100.8  # above entry_high 100.5 -> entry is LIMIT; below drift
+    # Custom exchange that records the time_in_force of every placed order.
+    class RecordingExchange(exchange.__class__):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.recorded_tif = []
+
+        def place_order(self, symbol, side, type, quantity=None, price=None,
+                        stop_price=None, time_in_force="GTC", reduce_only=False,
+                        working_type="MARK_PRICE", client_order_id=None):
+            self.recorded_tif.append(time_in_force)
+            return super().place_order(symbol, side, type, quantity, price,
+                                       stop_price, time_in_force, reduce_only,
+                                       working_type, client_order_id)
+
+    executor.exchange = RecordingExchange()
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0, "errors": []}
+    executor._scan_symbol("BTCUSDT", 10_000.0, summary)
+    tifs = executor.exchange.recorded_tif
+    assert tifs, "no orders were placed"
+    # The entry (LIMIT, live outside zone) must be post-only / GTX.
+    assert tifs[0] == "GTX", f"entry tif should be GTX, got {tifs[0]}"
+
+
+def test_post_only_entry_gtc_in_zone_when_disabled(rig):
+    # Primary config: post-only off. Entry limit uses GTC (cross spread is
+    # acceptable in this default configuration).
+    executor, market, exchange, state, lifecycle, risk = rig
+    executor.exchange = exchange.__class__()
+    executor._scan_symbol("BTCUSDT", 10_000.0, {"approved": 0, "rejected": 0,
+                                                "opened": 0, "managed": 0,
+                                                "errors": []})
+
+
+def test_place_brackets_floors_sl_qty_to_step_size(rig):
+    executor, market, exchange, state, lifecycle, risk = rig
+    exchange.filters["BTCUSDT"] = {
+        "status": "TRADING", "tickSize": 0.01, "stepSize": 0.001,
+        "minQty": 0.001, "maxQty": 1000.0, "minNotional": 5.0,
+    }
+    pos = {
+        "symbol": "BTCUSDT", "direction": "LONG", "qty": 1.234567,
+        "entry_price": 100.0, "stop_loss": 95.0,
+        "tp": {
+            "tp1": {"price": 103.0, "qty": 0.4},
+            "tp2": {"price": 105.0, "qty": 0.4},
+            "tp3": {"price": 108.0, "qty": 0.4},
+        },
+    }
+    ok = executor._place_brackets("test_pos_1", pos)
+    assert ok is True
+    assert pos["sl_qty"] == 1.234
+    assert exchange.orders[pos["sl_order_id"]]["origQty"] == 1.234
+
+
 def test_breakeven_after_tp1(rig):
+
     executor, market, exchange, state, lifecycle, risk = rig
     summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
                "errors": []}
@@ -476,7 +540,25 @@ def test_paper_broker_wallet_and_equity_split():
         10_000.0 - fee2 + 10.0)
 
 
+def test_paper_broker_dust_residual_eliminated():
+    """Floating-point dust must be clamped to 0 so phantom positions are not reported."""
+    prices = {"BTCUSDT": 100.0}
+    broker = PaperBroker(10_000.0, price_fn=lambda s: prices[s])
+    broker.place_order("BTCUSDT", "BUY", "MARKET", quantity=1.0)
+    # Simulate partial closes leaving sub-dust precision
+    broker.place_order("BTCUSDT", "SELL", "MARKET", quantity=0.333333333333, reduce_only=True)
+    broker.place_order("BTCUSDT", "SELL", "MARKET", quantity=0.333333333333, reduce_only=True)
+    broker.place_order("BTCUSDT", "SELL", "MARKET", quantity=0.333333333334, reduce_only=True)
+    assert broker.positions["BTCUSDT"]["qty"] == 0.0
+    assert broker.get_positions() == []
+    # Injected sub-dust float noise
+    broker.positions["ETHUSDT"] = {"qty": 1e-15, "avg_price": 2000.0}
+    assert broker.get_positions() == []
+    assert broker.get_margin_balance() == pytest.approx(broker.get_wallet_balance())
+
+
 # ------------------------------------------------------------------- CLI
+
 
 def test_testnet_without_keys_refuses():
     with pytest.raises(SystemExit) as ei:

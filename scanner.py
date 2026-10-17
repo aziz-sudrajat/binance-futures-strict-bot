@@ -54,7 +54,7 @@ log = logging.getLogger("scanner")
 import config
 import httputil
 from data import MarketData, normalize_symbol
-from signal_engine import evaluate_symbol, prefilter_symbol
+from signal_engine import evaluate_symbol, prefilter_symbol, analyze_candles, quality_score_rank
 from executor import signal_candle_close_ms, make_signal_id
 from signals_db import SignalDB
 
@@ -108,19 +108,67 @@ def _select_candidates(symbols: list[str], market: MarketData,
     necessary conditions (engine stages 0-2 via prefilter_symbol).
 
     One bad symbol never kills the selection; every symbol is fail-closed.
+    Returns a SUPERSET of the approved set — candidates are sorted descending
+    by lightweight quality_score_rank() for faster scoring.
     """
-    candidates = []
+    results = []
     for i, symbol in enumerate(symbols):
         try:
             ok, _reason = prefilter_symbol(symbol, market, tickers)
         except Exception:  # noqa: BLE001 - fail-closed, like the engine
             ok = False
         if ok:
-            candidates.append(symbol)
+            # Get the 15m analysis + regime for ranking (cheap vs full engine)
+            try:
+                k15 = market.get_klines(symbol, "15m")
+                a15 = analyze_candles(symbol, "15m", k15)
+                regime = a15.get("regime", "MIXED / TRANSITION")
+                vol_ratio = a15.get("volume_ratio") or 1.0
+                direction = "BULLISH" if a15["signal"].startswith("BULL") else "BEARISH"
+                rank = quality_score_rank(a15, regime, vol_ratio, direction)
+            except Exception:  # noqa: BLE001 - rank fallback
+                rank = 0
+            results.append((symbol, rank))
         if (i + 1) % 50 == 0:
             log.info("prefilter progress %d/%d", i + 1, len(symbols))
         time.sleep(THROTTLE_SEC)
-    return candidates
+    # Sort by quality score descending: highest-quality candidates first
+    results.sort(key=lambda x: x[1], reverse=True)
+    return [sym for sym, _rank in results]
+
+
+def _evaluate_priority(symbols: list[str], market: MarketData,
+                       db: SignalDB, expiry_min: int,
+                       max_workers: int) -> tuple[int, int, int]:
+    """Priority scan: sort candidates by quality rank and evaluate the
+    highest-priority symbols first. Returns stats."""
+    approved = rejected = errors = 0
+    session = getattr(market, "session", None) or httputil.ThrottledSession()
+    workers = max(1, int(max_workers))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="scan") as ex:
+        for res in ex.map(_scan_one_symbol, symbols, [session] * len(symbols)):
+            symbol = res["symbol"]
+            try:
+                if res["error"] is not None:
+                    errors += 1
+                    log.debug("scan %s failed: %s", symbol, res["error"])
+                elif res["signal"] is None:
+                    rejected += 1
+                else:
+                    db.upsert_signal(res["signal"],
+                                     res["signal_id"],
+                                     expiry_min=expiry_min)
+                    approved += 1
+                    log.info("APPROVED %s Q=%s -> db", symbol,
+                             res["signal"].get("quality"))
+            except Exception as e:  # noqa: BLE001
+                errors += 1
+                log.debug("scan %s failed: %s", symbol, e)
+            if (approved + rejected + errors) % 50 == 0:
+                log.info("progress %d/%d", approved + rejected + errors,
+                         len(symbols))
+    expired = db.expire_old()
+    return approved, rejected, errors
 
 
 def _scan_one_symbol(symbol: str, session) -> dict:
@@ -249,6 +297,10 @@ def run_pass(market: MarketData, db: SignalDB,
 
     max_workers: stage-2 thread-pool size; None -> config.SCAN_MAX_WORKERS.
     max_workers=1 takes the sequential stage-2 path (identical behavior).
+
+    Priority scan: after prefilter, candidates are ranked by lightweight
+    quality_score_rank() and evaluated in that order. Highest-quality
+    signals are found first (useful for UI/DB top-N displays).
     """
     # Studio settings apply to the scanner too (quality threshold etc.).
     from dashboard import load_settings
@@ -272,7 +324,7 @@ def run_pass(market: MarketData, db: SignalDB,
     else:
         log.info("parallel stage-2: %d workers on %d candidates",
                  max(1, int(workers)), len(eval_symbols))
-        approved, rejected, errors = _evaluate_parallel(
+        approved, rejected, errors = _evaluate_priority(
             eval_symbols, market, db, expiry_min, max(1, int(workers)))
     expired = db.expire_old()
     stats = {

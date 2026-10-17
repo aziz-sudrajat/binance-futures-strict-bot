@@ -22,6 +22,7 @@ Regression: a signal that passed before vetoes still passes when none fire.
 import pytest
 
 import config
+import time
 import vetoes
 from signal_engine import evaluate_symbol
 from tests.test_engine import FakeMarket, _benign_4h_for_sr
@@ -244,6 +245,38 @@ def test_btc_data_failure_holds():
     kind, reason = by["btc_breaker"]
     assert kind == "hold"
     assert "fail-closed" in reason
+
+
+def test_liq_wall_hold_on_order_book_failure():
+    # get_order_book raises -> liq_wall HOLD (fail-closed), never a veto.
+    m = FakeMarket()
+    m.book = None
+
+    def boom(symbol, limit=100):
+        raise RuntimeError("no order book")
+    m.get_order_book = boom
+
+    by = blocks_by_code(
+        run_vetoes("ETHUSDT", "BULLISH", m, BENIGN_SNAP))
+    assert "liq_wall" in by
+    assert by["liq_wall"][0] == "hold"
+    assert "fail-closed" in by["liq_wall"][1]
+
+
+def test_funding_window_veto_fires_near_snapshot():
+    # funding +0.12%, exactly 15m before the 8h snapshot -> veto for LONG.
+    snap = {"aggregate_funding": 0.0012}
+    import vetoes as _v
+    real_time = time.time
+    _v.time.time = lambda: 1_000_021_500  # 07:45 UTC -> 15m until snapshot
+    try:
+        by = blocks_by_code(
+            run_vetoes("BTCUSDT", "BULLISH", FakeMarket(), snap))
+    finally:
+        _v.time.time = real_time
+    assert "funding_window" in by
+    assert by["funding_window"][0] == "veto"
+    assert "0.050%" in by["funding_window"][1]
 
 
 # ------------------------------------------------- fail-closed holds

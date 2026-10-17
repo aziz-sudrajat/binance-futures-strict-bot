@@ -339,8 +339,8 @@ class PaperBroker:
         """Account equity: wallet balance + open unrealized PnL."""
         eq = self.balance
         for symbol, p in self.positions.items():
-            qty = p["qty"]
-            if not qty:
+            qty = p.get("qty", 0.0)
+            if abs(qty) < 1e-12:
                 continue
             live = self._price_fn(symbol)
             if not live:
@@ -352,7 +352,7 @@ class PaperBroker:
     def get_positions(self) -> list[dict]:
         out = []
         for symbol, p in self.positions.items():
-            if p["qty"] == 0:
+            if abs(p.get("qty", 0.0)) < 1e-12:
                 continue
             out.append({
                 "symbol": symbol,
@@ -362,6 +362,7 @@ class PaperBroker:
                 "leverage": config.MAX_LEVERAGE,
             })
         return out
+
 
     def set_leverage(self, symbol: str, leverage: int) -> bool:
         return True
@@ -524,7 +525,11 @@ class PaperBroker:
                 pos["qty"] -= close_qty  # LONG: sells reduce toward zero
             else:
                 pos["qty"] += close_qty  # SHORT: buys reduce toward zero
+            if abs(pos["qty"]) < 1e-12:
+                pos["qty"] = 0.0
+                pos["avg_price"] = 0.0
             self.balance += pnl
+
             self.realized_pnl += pnl
             order["realizedPnl"] = pnl
         return {"order": dict(order), "fill_price": fill_px, "fill_qty": qty}
