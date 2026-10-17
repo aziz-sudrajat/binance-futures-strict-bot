@@ -76,23 +76,45 @@ class LifecycleLogger:
                     )
                 elif state in (TP1_HIT, TP2_HIT, TP3_HIT):
                     leg = state.replace("_hit", "")
+                    pnl_val = fields.get("pnl") if fields.get("pnl") is not None else fields.get("realized")
+                    px_val = fields.get("price") if fields.get("price") is not None else fields.get("close_price")
                     notifier.notify_tp_hit(
                         symbol=symbol,
                         leg=leg,
-                        price=float(fields.get("price") or 0.0),
-                        net_pnl=float(fields.get("pnl") or 0.0),
+                        price=float(px_val or 0.0),
+                        net_pnl=float(pnl_val or 0.0),
                     )
                 elif state == SL_HIT:
+                    pnl_val = fields.get("pnl") if fields.get("pnl") is not None else fields.get("realized")
+                    px_val = fields.get("price") if fields.get("price") is not None else fields.get("close_price")
                     notifier.notify_sl_hit(
                         symbol=symbol,
-                        price=float(fields.get("price") or 0.0),
-                        net_pnl=float(fields.get("pnl") or 0.0),
+                        price=float(px_val or 0.0),
+                        net_pnl=float(pnl_val or 0.0),
                     )
                 elif state == PROFIT_TAKE:
+                    pnl_val = fields.get("pnl") if fields.get("pnl") is not None else fields.get("realized")
+                    px_val = fields.get("price") if fields.get("price") is not None else fields.get("close_price")
                     notifier.notify_profit_take(
                         symbol=symbol,
-                        price=float(fields.get("price") or 0.0),
-                        net_pnl=float(fields.get("pnl") or 0.0),
+                        price=float(px_val or 0.0),
+                        net_pnl=float(pnl_val or 0.0),
+                    )
+                elif state == TRAIL_STOP:
+                    pnl_val = fields.get("pnl") if fields.get("pnl") is not None else fields.get("realized")
+                    px_val = fields.get("price") if fields.get("price") is not None else fields.get("close_price")
+                    notifier.notify_trail_stop(
+                        symbol=symbol,
+                        price=float(px_val or 0.0),
+                        net_pnl=float(pnl_val or 0.0),
+                    )
+                elif state == TIME_STOP:
+                    pnl_val = fields.get("pnl") if fields.get("pnl") is not None else fields.get("realized")
+                    px_val = fields.get("price") if fields.get("price") is not None else fields.get("close_price")
+                    notifier.notify_time_stop(
+                        symbol=symbol,
+                        price=float(px_val or 0.0),
+                        net_pnl=float(pnl_val or 0.0),
                     )
         except Exception:  # noqa: BLE001 - notifications must never break logging
             pass

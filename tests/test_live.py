@@ -290,3 +290,28 @@ def test_listenkey_close_without_acquired_key_returns_false(monkeypatch):
     client, sess = _listenkey_client(monkeypatch)
     assert client.close_listen_key() is False
     assert sess.calls == []
+
+
+def test_recent_notable_events_captures_all_exits_and_realized_pnl(tmp_path):
+    from lifecycle import LifecycleLogger
+    from run_executor import _recent_notable_events
+    p = str(tmp_path / "lifecycle.jsonl")
+    life = LifecycleLogger(path=p)
+    life.log("s1", "BTCUSDT", "profit_take", realized=12.5, price=102.0)
+    life.log("s2", "ETHUSDT", "trail_stop", realized=-4.2, close_price=98.0)
+    life.log("s3", "SOLUSDT", "time_stop", realized=0.5, price=150.0)
+    life.log("s4", "ADAUSDT", "manual_close", realized=1.1, close_price=0.55)
+
+    events = _recent_notable_events(life, cycle_start_ms=0)
+    by_sym = {e["symbol"]: e for e in events}
+    assert set(by_sym.keys()) == {"BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT"}
+    assert by_sym["BTCUSDT"]["state"] == "profit_take"
+    assert by_sym["BTCUSDT"]["pnl"] == 12.5
+    assert by_sym["ETHUSDT"]["state"] == "trail_stop"
+    assert by_sym["ETHUSDT"]["pnl"] == -4.2
+    assert by_sym["ETHUSDT"]["price"] == 98.0
+    assert by_sym["SOLUSDT"]["state"] == "time_stop"
+    assert by_sym["SOLUSDT"]["pnl"] == 0.5
+    assert by_sym["ADAUSDT"]["state"] == "manual_close"
+    assert by_sym["ADAUSDT"]["pnl"] == 1.1
+    assert by_sym["ADAUSDT"]["price"] == 0.55

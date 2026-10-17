@@ -149,6 +149,28 @@ def notify_profit_take(symbol: str, price: float, net_pnl: float) -> None:
     send_message(msg)
 
 
+def notify_trail_stop(symbol: str, price: float, net_pnl: float) -> None:
+    """Format and send trailing stop exit notification."""
+    pnl_sign = "+" if net_pnl >= 0 else ""
+    msg = (
+        f"<b>🎯 TRAILING STOP EXIT — {symbol}</b>\n\n"
+        f"<b>Trailing Exit Price:</b> <code>{price:,.6g}</code>\n"
+        f"<b>Realized Net PnL:</b> <b>{pnl_sign}{net_pnl:.4f} USDT</b> 📈"
+    )
+    send_message(msg)
+
+
+def notify_time_stop(symbol: str, price: float, net_pnl: float) -> None:
+    """Format and send time stop exit notification."""
+    pnl_sign = "+" if net_pnl >= 0 else ""
+    msg = (
+        f"<b>⏰ TIME STOP EXIT — {symbol}</b>\n\n"
+        f"<b>Market Exit Price:</b> <code>{price:,.6g}</code>\n"
+        f"<b>Realized Net PnL:</b> <b>{pnl_sign}{net_pnl:.4f} USDT</b>"
+    )
+    send_message(msg)
+
+
 def notify_kill_switch(reason: str, balance: float | None = None) -> None:
     """Format and send emergency kill switch notification."""
     bal_str = f" (${balance:,.2f} USDT)" if balance is not None else ""

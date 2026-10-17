@@ -105,7 +105,7 @@ class SignalDB:
         cur = self._conn.execute(
             "SELECT id, quality, strength, expires_at FROM signals "
             "WHERE symbol = ? AND status = 'new' "
-            "ORDER BY quality DESC, strength DESC LIMIT 1",
+            "ORDER BY quality DESC, COALESCE(strength, 0) DESC LIMIT 1",
             (signal["symbol"],))
         row = cur.fetchone()
         if row and row["expires_at"] > now_ms \
@@ -153,7 +153,7 @@ class SignalDB:
         cur = self._conn.execute(
             f"SELECT {', '.join(_COLUMNS)} FROM signals "
             "WHERE status = 'new' AND expires_at > ? "
-            "ORDER BY quality DESC, strength DESC, id ASC LIMIT ?",
+            "ORDER BY quality DESC, COALESCE(strength, 0) DESC, id ASC LIMIT ?",
             (now_ms, limit))
         return [self._row_to_dict(r) for r in cur.fetchall()]
 

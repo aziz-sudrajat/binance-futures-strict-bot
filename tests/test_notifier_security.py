@@ -147,3 +147,33 @@ def test_recent_notable_events_no_cutoff():
         assert len(notable) == 2
     finally:
         os.unlink(path)
+
+
+def test_notify_trail_and_time_stop(monkeypatch):
+    sent = []
+    monkeypatch.setattr(notifier, "send_message", lambda text: sent.append(text))
+    notifier.notify_trail_stop("BTCUSDT", price=65000.0, net_pnl=12.5)
+    notifier.notify_time_stop("ETHUSDT", price=3500.0, net_pnl=-4.2)
+    assert len(sent) == 2
+    assert "TRAILING STOP" in sent[0] and "+12.5000 USDT" in sent[0]
+    assert "TIME STOP" in sent[1] and "-4.2000 USDT" in sent[1]
+
+
+def test_lifecycle_realized_fallback(monkeypatch, tmp_path):
+    from lifecycle import LifecycleLogger, SL_HIT, PROFIT_TAKE
+    dispatched = []
+    monkeypatch.setattr(notifier, "is_configured", lambda: True)
+    monkeypatch.setattr(notifier, "notify_sl_hit",
+                        lambda symbol, price, net_pnl: dispatched.append(("sl", symbol, price, net_pnl)))
+    monkeypatch.setattr(notifier, "notify_profit_take",
+                        lambda symbol, price, net_pnl: dispatched.append(("pt", symbol, price, net_pnl)))
+
+    ll = LifecycleLogger(str(tmp_path / "test_life.jsonl"))
+    # When executor passes realized= instead of pnl=
+    ll.log("S1", "BTCUSDT", SL_HIT, close_price=98.0, realized=-2.5, terminal=True)
+    ll.log("S2", "ETHUSDT", PROFIT_TAKE, price=110.0, pnl=5.0)
+
+    assert len(dispatched) == 2
+    assert dispatched[0] == ("sl", "BTCUSDT", 98.0, -2.5)
+    assert dispatched[1] == ("pt", "ETHUSDT", 110.0, 5.0)
+

@@ -78,7 +78,12 @@ from vetoes import btc_1h_change_pct, leverage_risk_index, run_vetoes, squeeze_r
 
 def _finite(v) -> bool:
     """True for a usable (non-None, non-NaN/Inf) number."""
-    return v is not None and math.isfinite(float(v))
+    if v is None:
+        return False
+    try:
+        return math.isfinite(float(v))
+    except (TypeError, ValueError):
+        return False
 
 
 # ------------------------------------------------------------------ regimes
@@ -994,26 +999,31 @@ def evaluate_symbol(symbol: str, market) -> tuple[dict | None, str]:
         # exactly like a veto block.
         try:
             adv = market.get_advanced_derivatives(symbol)
+            if not adv or not all(_finite(adv.get(k)) for k in
+                                 ("retail_long", "funding", "oi_usd", "volume_24h")):
+                return None, ("advanced derivatives inputs incomplete — "
+                              "holding (fail-closed)")
+            lev = leverage_risk_index(adv["retail_long"], adv["funding"],
+                                      adv["oi_usd"], adv["volume_24h"],
+                                      adv.get("spike") or 0.0)
+            _add("lev_warn", leverage_warn_delta(lev))
+            _add("funding", funding_delta(snap.get("aggregate_funding"), direction))
+            sq = squeeze_risk_index(adv["retail_long"], adv["funding"],
+                                    adv.get("oi_change") or 0.0,
+                                    adv.get("long_liq_usd") or 0.0,
+                                    adv.get("short_liq_usd") or 0.0,
+                                    adv.get("spike") or 0.0, direction)
+            _add("squeeze_warn", squeeze_warn_delta(sq))
+            _add("whale_warn", whale_warn_delta(adv.get("top_long"),
+                                                adv.get("divergence"), direction))
+            smart = smart_money_score(adv)
+            _add("smart_money", smart_money_delta(smart, direction))
+            regime = market_regime(adv)
+            _add("liq_event", liq_event_delta(regime))
+            _add("liq_wall_warn", liq_wall_warn_delta(book, direction))
         except Exception as e:  # noqa: BLE001 - unevaluable -> hold
             return None, (f"derivatives feed unavailable ({e}) — "
                           "holding (fail-closed)")
-        lev = leverage_risk_index(adv["retail_long"], adv["funding"],
-                                  adv["oi_usd"], adv["volume_24h"],
-                                  adv.get("spike") or 0.0)
-        _add("lev_warn", leverage_warn_delta(lev))
-        _add("funding", funding_delta(snap.get("aggregate_funding"), direction))
-        sq = squeeze_risk_index(adv["retail_long"], adv["funding"],
-                                adv["oi_change"], adv.get("long_liq_usd") or 0.0,
-                                adv.get("short_liq_usd") or 0.0,
-                                adv.get("spike") or 0.0, direction)
-        _add("squeeze_warn", squeeze_warn_delta(sq))
-        _add("whale_warn", whale_warn_delta(adv.get("top_long"),
-                                            adv.get("divergence"), direction))
-        smart = smart_money_score(adv)
-        _add("smart_money", smart_money_delta(smart, direction))
-        regime = market_regime(adv)
-        _add("liq_event", liq_event_delta(regime))
-        _add("liq_wall_warn", liq_wall_warn_delta(book, direction))
 
     deriv = derivatives_score(snap)
     q = quality_score(a15["strength"], components)

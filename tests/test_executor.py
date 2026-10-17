@@ -1229,6 +1229,65 @@ def test_vanished_close_trades_unavailable_fails_closed(short_rig):
     assert pos["realized"] == 0.0
 
 
+def test_vanished_close_with_prior_tp1_fill_records_sl_loss(short_rig):
+    """When TP1 filled earlier, and the remaining position subsequently vanishes
+    at the SL level, _close_position must classify the outcome via userTrades as
+    sl_hit (NOT tp1_hit remainder) and record the actual realized loss."""
+    executor, market, exchange, state, lifecycle, risk = short_rig
+    summary = {"approved": 0, "rejected": 0, "opened": 0, "managed": 0,
+               "errors": []}
+    pos_id, pos = _vanished_short_pos(executor, exchange, summary)
+    entry_px = pos["entry_price"]
+    # Simulate prior TP1 fill (0.4 qty of 1.0 position)
+    pos["tp"]["tp1"]["filled"] = True
+    pos["qty"] = 0.6
+    pos["realized"] = 2.0  # +$2.00 profit from TP1
+
+    # Remaining 0.6 was stopped out at SL price (105.0 for short)
+    sl_px = pos["stop_loss"]
+    sl_loss = (entry_px - sl_px) * 0.6  # negative for short: (100 - 105)*0.6 = -3.0
+    exchange.user_trades = [{
+        "symbol": "BTCUSDT", "side": "BUY", "qty": 0.6, "price": sl_px,
+        "realizedPnl": sl_loss, "commission": 0.005,
+        "time": 9_999_999_999_999,
+    }]
+    exchange.get_positions = lambda: []
+    executor._close_position(pos_id, pos, pos["signal_id"], summary,
+                             reason="position gone from exchange")
+    assert pos["closed"] is True
+    assert pos["closed_reason"] == "sl_hit"
+    expected_net_loss = sl_loss - 0.005
+    assert pos["realized"] == pytest.approx(2.0 + expected_net_loss, abs=1e-5)
+    events = lifecycle.read_all()
+    terminals = [e for e in events if e.get("terminal")]
+    assert len(terminals) == 1
+    assert terminals[0]["state"] == "sl_hit"
+
+
+def test_place_sl_floors_quantity_to_step_size(rig):
+    """_place_sl must floor quantity to stepSize to prevent Binance precision rejection."""
+    executor, market, exchange, state, lifecycle, risk = rig
+    pos = {
+        "symbol": "BTCUSDT",
+        "direction": "LONG",
+        "stop_loss": 90.0,
+        "sl_order_id": None,
+    }
+    exchange.filters = {"tickSize": 0.1, "stepSize": 0.01}
+    # Pass an un-floored quantity with float precision drift (e.g. 0.19999999999999998)
+    ok = executor._place_sl("pos1", pos, 0.19999999999999998, "SLR1")
+    assert ok is True
+    algo_order = exchange.get_algo_order("BTCUSDT", pos["sl_order_id"])
+    assert algo_order["origQty"] == 0.2
+    assert pos["sl_qty"] == 0.2
+    # Verify sub-step value floors down
+    ok2 = executor._place_sl("pos1", pos, 0.194, "SLR2")
+    assert ok2 is True
+    algo_order2 = exchange.get_algo_order("BTCUSDT", pos["sl_order_id"])
+    assert algo_order2["origQty"] == 0.19
+    assert pos["sl_qty"] == 0.19
+
+
 # --------------------------------------- reconcile terminal attribution (2026-10-15)
 
 def _bracketed_pos(sid="s1", qty=1.0):

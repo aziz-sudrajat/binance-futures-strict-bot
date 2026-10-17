@@ -1350,10 +1350,15 @@ class Executor:
         symbol = pos["symbol"]
         exit_side = "BUY" if pos.get("direction") == "SHORT" else "SELL"
         tick = None
+        step = None
         try:
-            tick = (self.exchange.get_symbol_filters(symbol) or {}).get("tickSize")
+            filters = self.exchange.get_symbol_filters(symbol) or {}
+            tick = filters.get("tickSize")
+            step = filters.get("stepSize")
         except Exception:  # noqa: BLE001
             pass
+        if step:
+            qty = floor_to_step(qty, step)
         sl = self.exchange.place_algo_order(
             symbol, exit_side, "STOP_MARKET", quantity=qty,
             trigger_price=quantize_price(pos["stop_loss"], tick),
@@ -1454,17 +1459,23 @@ class Executor:
     def _move_sl_to_breakeven(self, pos_id: str, pos: dict, sid: str) -> None:
         symbol = pos["symbol"]
         tick = None
+        step = None
         try:
-            tick = (self.exchange.get_symbol_filters(symbol) or {}).get("tickSize")
+            filters = self.exchange.get_symbol_filters(symbol) or {}
+            tick = filters.get("tickSize")
+            step = filters.get("stepSize")
         except Exception:  # noqa: BLE001
             pass
         be = quantize_price(pos["entry_price"], tick)
         exit_side = "BUY" if pos.get("direction") == "SHORT" else "SELL"
+        be_qty = pos.get("qty") or 0.0
+        if step:
+            be_qty = floor_to_step(be_qty, step)
         # STOP_MARKET must go through the algo endpoint: Binance rejects it
         # on /fapi/v1/order with HTTP 400 -4120. Place the new breakeven SL
         # BEFORE cancelling the old one so the position is never unprotected.
         sl = self.exchange.place_algo_order(
-            symbol, exit_side, "STOP_MARKET", quantity=pos["qty"],
+            symbol, exit_side, "STOP_MARKET", quantity=be_qty,
             trigger_price=be, reduce_only=True, working_type="MARK_PRICE",
             client_algo_id=self._leg_id(pos_id, "SLBE"))
         if sl and sl.get("algoId"):
@@ -1474,7 +1485,7 @@ class Executor:
             pos["sl_is_algo"] = True  # breakeven leg is an algo STOP_MARKET
             pos["breakeven_moved"] = True
             pos["stop_loss"] = be
-            pos["sl_qty"] = pos["qty"]  # H2: breakeven SL sized to remainder
+            pos["sl_qty"] = be_qty  # H2: breakeven SL sized to remainder
             log.info("%s SL moved to breakeven @ %s", pos_id, be)
             self.state.save()
         else:
@@ -1564,7 +1575,14 @@ class Executor:
         # or {}): a leg explicitly set to None must not AttributeError.
         tp = pos.get("tp") or {}
         net, avg_px = 0.0, None
-        if (tp.get("tp3") or {}).get("filled"):
+        if (pos.get("qty") or 0.0) > 0 or "gone" in reason:
+            # If the position still held an open quantity, or vanished from
+            # the exchange, ground truth for what closed the remainder lives in
+            # exchange userTrades. Prior partial TP fills (e.g. TP1) must NOT
+            # mask an SL or manual close of the remaining slice.
+            event, why, net, avg_px = self._classify_vanished_close(
+                symbol, pos, sid, pos_id)
+        elif (tp.get("tp3") or {}).get("filled"):
             event, why = TP3_HIT, "tp3_hit"
         elif (tp.get("tp2") or {}).get("filled"):
             event, why = TP2_HIT, "tp2_hit (remainder)"

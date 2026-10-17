@@ -113,3 +113,14 @@ def test_migration_on_existing_db_without_strength(tmp_path):
     fresh = db.get_fresh_signals()
     assert len(fresh) == 1 and fresh[0]["symbol"] == "BTCUSDT"
     db.close()
+
+
+def test_null_strength_ranks_below_numeric_strength(tmp_path):
+    db = SignalDB(str(tmp_path / "s.db"))
+    sig_null = _sig("AAAUSDT", q=85.0)
+    sig_num = _sig_strength("BBBUSDT", q=85.0, strength=10)
+    db.upsert_signal(sig_null, "S_NULL", expiry_min=30)
+    db.upsert_signal(sig_num, "S_NUM", expiry_min=30)
+    fresh = db.get_fresh_signals()
+    assert [f["symbol"] for f in fresh] == ["BBBUSDT", "AAAUSDT"]
+    db.close()

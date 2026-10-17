@@ -227,7 +227,9 @@ class RiskManager:
         if open_count >= self.max_positions:
             return False, (f"max concurrent positions reached "
                            f"({open_count}/{self.max_positions})")
-        balance = self.get_balance()
+        # Exposure cap is measured against account equity (wallet + unrealized),
+        # falling back to balance when equity getter is unavailable.
+        balance = (self.get_equity() if callable(self.get_equity) else None) or self.get_balance()
         if balance is None or balance <= 0:
             return False, "balance unavailable - holding (fail-closed)"
         # Read the cap live from config so dashboard overrides apply;

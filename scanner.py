@@ -289,8 +289,18 @@ def run_pass(market: MarketData, db: SignalDB,
         "expired": expired,
         "duration_s": round(time.time() - t0, 1),
     }
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(stats, f, indent=2)
+    import tempfile
+    directory = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".scan_state_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
     log.info("pass done: %s", stats)
     return stats
 

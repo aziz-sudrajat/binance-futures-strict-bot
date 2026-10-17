@@ -497,3 +497,20 @@ def test_stage10_adv_failure_holds_cleanly(monkeypatch):
     assert signal is None
     assert "derivatives feed unavailable" in reason
     assert "holding" in reason
+
+
+def test_stage10_adv_incomplete_inputs_holds_cleanly(monkeypatch):
+    """M6 extension: When adv feed returns incomplete dict with None fields,
+    Stage 10 must hold cleanly (fail-closed) rather than crashing with TypeError.
+    """
+    monkeypatch.setattr(config, "LIQ_REVIEW", False)
+    monkeypatch.setattr(config, "WHALE_REVIEW", False)
+    monkeypatch.setattr(config, "DISABLED_VETOES",
+                        frozenset({"leverage_risk", "squeeze", "whale"}))
+    m = _benign_4h_for_sr(FakeMarket(bullish=True))
+    m.adv = {"retail_long": None, "funding": 0.0001, "oi_usd": 1000.0, "volume_24h": 5000.0}
+    signal, reason = evaluate_symbol("ETHUSDT", m)
+    assert signal is None
+    assert "incomplete" in reason or "unavailable" in reason
+    assert "holding" in reason
+

@@ -288,14 +288,15 @@ def _recent_notable_events(lifecycle: LifecycleLogger,
                 if not isinstance(ts, (int, float)):
                     continue
                 if ts >= cycle_start_ms and ev.get("state") in _NOTABLE_STATES:
+                    pnl_val = ev.get("pnl") if ev.get("pnl") is not None else ev.get("realized")
                     notable.append({
                         "ts": ev.get("ts"),
                         "symbol": ev.get("symbol"),
                         "state": ev.get("state"),
                         "qty": ev.get("qty"),
                         "entry": ev.get("entry"),
-                        "price": ev.get("price"),
-                        "pnl": ev.get("pnl"),
+                        "price": ev.get("price") or ev.get("close_price"),
+                        "pnl": pnl_val,
                     })
                 # events are append-ordered; the first ts < cutoff ends the
                 # window (all earlier events are behind us)
@@ -432,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
 # Lifecycle states the scheduled worker treats as user-notifiable.
 _NOTABLE_STATES = frozenset({
     "position_opened", "tp1_hit", "tp2_hit", "tp3_hit", "sl_hit",
+    "profit_take", "trail_stop", "time_stop", "manual_close",
 })
 
 
