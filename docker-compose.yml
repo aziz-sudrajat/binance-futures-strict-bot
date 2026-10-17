@@ -1,0 +1,35 @@
+services:
+  scanner:
+    build: .
+    command: ["python", "scanner.py", "--loop", "--interval", "15"]
+    restart: unless-stopped
+    volumes:
+      - bot_data:/app
+    environment:
+      - BOT_MODE=live
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  executor:
+    build: .
+    command: ["python", "run_executor.py", "--from-db", "--loop"]
+    restart: unless-stopped
+    volumes:
+      - bot_data:/app
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - scanner
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bot_data:

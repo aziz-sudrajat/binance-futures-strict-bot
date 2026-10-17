@@ -57,6 +57,46 @@ class LifecycleLogger:
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
 
+        # Non-blocking Telegram notification dispatch
+        try:
+            import notifier
+            if notifier.is_configured():
+                if state == POSITION_OPENED:
+                    notifier.notify_position_opened(
+                        symbol=symbol,
+                        direction=fields.get("direction", "LONG"),
+                        entry_px=float(fields.get("entry") or 0.0),
+                        qty=float(fields.get("qty") or 0.0),
+                        margin_usdt=float(fields.get("margin_usdt") or 0.0),
+                        leverage=int(fields.get("leverage") or 1),
+                        sl=float(fields.get("stop_loss") or 0.0),
+                        tp1=float(fields.get("tp1") or 0.0),
+                        tp2=float(fields.get("tp2") or 0.0),
+                        tp3=float(fields.get("tp3") or 0.0),
+                    )
+                elif state in (TP1_HIT, TP2_HIT, TP3_HIT):
+                    leg = state.replace("_hit", "")
+                    notifier.notify_tp_hit(
+                        symbol=symbol,
+                        leg=leg,
+                        price=float(fields.get("price") or 0.0),
+                        net_pnl=float(fields.get("pnl") or 0.0),
+                    )
+                elif state == SL_HIT:
+                    notifier.notify_sl_hit(
+                        symbol=symbol,
+                        price=float(fields.get("price") or 0.0),
+                        net_pnl=float(fields.get("pnl") or 0.0),
+                    )
+                elif state == PROFIT_TAKE:
+                    notifier.notify_profit_take(
+                        symbol=symbol,
+                        price=float(fields.get("price") or 0.0),
+                        net_pnl=float(fields.get("pnl") or 0.0),
+                    )
+        except Exception:  # noqa: BLE001 - notifications must never break logging
+            pass
+
     def read_all(self) -> list[dict]:
         events = []
         try:

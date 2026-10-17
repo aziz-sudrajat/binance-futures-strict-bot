@@ -1,0 +1,64 @@
+# Copyright (c) 2026 aziz-sudrajat <azizsudrajat.stb4@gmail.com>
+# Binance Futures Bot — systemd service (auto-restart on failure)
+#
+# Copy (or symlink) this file to /etc/systemd/system/binance-bot.service
+# then:
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now binance-bot.service
+#   sudo systemctl status binance-bot.service
+#   sudo journalctl -u binance-bot.service -f
+#
+# The service runs the BOT in continuous scan-loop (non-interactive). It
+# is mode-aware: BOT_MODE env (or explicit --live/--testnet/--paper)
+# selects the mode. Paper mode runs without any keys.
+#
+# Safety: Restart=always + RestartSec=10 + StartLimitBurst=3 means the
+# bot auto-recovers from crashes but will stop hammering if config/key
+# is broken.
+
+[Unit]
+Description=Binance Futures Bot (continuous scan loop)
+Documentation=file:///home/azzatssins/AgentOS_Memory/binance-futures-strict-bot/README.md
+After=network-online.target
+Wants=network-online.target
+# Auto-recovery: restart on crash, but back off after repeated failures
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=azzatssins
+Group=azzatssins
+WorkingDirectory=/home/azzatssins/AgentOS_Memory/binance-futures-strict-bot
+
+# Keys are read from a mode-specific .env file (never hardcoded).
+# Generate .env.paper/.env.demo/.env.live first, then:
+#   echo "BOT_MODE=paper" > /home/azzatssins/AgentOS_Memory/binance-futures-strict-bot/.env
+# or
+#   echo "BOT_MODE=testnet" > /home/azzatssins/AgentOS_Memory/binance-futures-strict-bot/.env
+EnvironmentFile=/home/azzatssins/AgentOS_Memory/binance-futures-strict-bot/.env
+
+# Optional: expose Prometheus metrics
+Environment=METRICS_PORT=8000
+
+# The loop daemon. Paper mode needs no keys; testnet/live need env keys.
+# Override the mode at runtime with:
+#   sudo systemctl set-environment BOT_MODE=live
+#   sudo systemctl restart binance-bot.service
+ExecStart=/home/azzatssins/AgentOS_Memory/binance-futures-strict-bot/.venv/bin/python /home/azzatssins/AgentOS_Memory/binance-futures-strict-bot/run_executor.py --loop
+
+# Auto-recovery: restart on crash, but back off after repeated failures
+Restart=always
+RestartSec=10
+
+# Log to journal (view with journalctl -u binance-bot.service)
+StandardOutput=journal
+StandardError=journal
+
+# Give the bot a few seconds to come up before systemd considers it
+# failed (the loop takes a couple of seconds on first start)
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

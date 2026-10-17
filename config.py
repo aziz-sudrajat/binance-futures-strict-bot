@@ -144,6 +144,39 @@ ADV_DERIV_CACHE_SEC = 120           # Gate contract-stats cache (GAS DERIVATIVES
 ADV_DERIV_STATS_LIMIT = 48          # 48 x 15m buckets ~ 12h: 16-bucket window + history (GAS L1002)
 ORDER_BOOK_DEPTH_LIMIT = 100        # depth levels fetched for the wall veto
 
+# V19 — Funding Window Proximity Veto:
+# Avoid entering right before 8h funding fee snapshot (00:00, 08:00, 16:00 UTC)
+# if funding rate against our position is high (e.g. >= 0.05%), preventing
+# immediate fee drag. 0 = disabled.
+FUNDING_PROXIMITY_VETO_ENABLED = True
+FUNDING_PROXIMITY_WINDOW_MIN = 15      # minutes before funding snapshot
+FUNDING_PROXIMITY_MAX_RATE = 0.0005     # 0.05% threshold (5 bps)
+
+# Sector Concentration Risk:
+# Cluster definitions for crypto sectors. Limits concurrent exposure to
+# any single narrative/sector (prevents correlated liquidations).
+# 0 = disabled (no sector limit).
+MAX_POSITIONS_PER_SECTOR = 0
+
+SECTOR_CLUSTERS = {
+    "MEME": {"DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "BONKUSDT", "WIFUSDT", "FLOKIUSDT", "PUMPUSDT", "BOMEUSDT", "NEIROUSDT"},
+    "AI_DATA": {"FETUSDT", "RENDERUSDT", "TAOUSDT", "NEARUSDT", "WLDUSDT", "GRTUSDT", "ARKMUSDT", "IOUSDT"},
+    "L1_MAJORS": {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"},
+    "ALT_L1_L2": {"ADAUSDT", "AVAXUSDT", "SUIUSDT", "SEIUSDT", "APTUSDT", "DOTUSDT", "TONUSDT", "TRXUSDT", "ARBUSDT", "OPUSDT", "POLUSDT"},
+    "DEFI": {"AAVEUSDT", "UNIUSDT", "MKRUSDT", "LDOUSDT", "CRVUSDT", "SNXUSDT", "INJUSDT", "JUPUSDT", "ENAUSDT"},
+    "GAMING_METAVERSE": {"GALAUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "NOTUSDT", "BEAMUSDT", "PIXELUSDT"},
+    "INFRA_STORAGE": {"LINKUSDT", "FILUSDT", "ARUSDT", "HBARUSDT", "TIAUSDT", "STXUSDT", "PYTHUSDT"},
+}
+
+
+def get_symbol_sector(symbol: str) -> str | None:
+    """Return the sector name for a symbol, or None if uncategorized."""
+    sym = (symbol or "").upper()
+    for sector, members in SECTOR_CLUSTERS.items():
+        if sym in members:
+            return sector
+    return None
+
 # ------------------------------------------------------------- risk defaults
 # User-correctable. Consumed by the Phase 2 executor; Phase 1 is paper-only.
 RISK_PCT_PER_TRADE = 1.0       # % of futures balance risked per trade
@@ -415,6 +448,7 @@ DASH_NUMERIC_OVERRIDES = {
     # loss cooldown: a longer pause is stricter.
     "consecutive_loss_cooldown_hours": ("CONSECUTIVE_LOSS_COOLDOWN_HOURS",
                                         4.0, 72.0),
+    "max_positions_per_sector": ("MAX_POSITIONS_PER_SECTOR", 0, 5),
 }
 # Boolean engine knobs: setting name -> config attribute.
 DASH_BOOL_OVERRIDES = {
@@ -437,13 +471,14 @@ DASH_BOOL_OVERRIDES = {
     "exec_post_only_entry": "EXEC_POST_ONLY_ENTRY",
     "cancel_orphan_orders_on_startup": "CANCEL_ORPHAN_ORDERS_ON_STARTUP",
     "adaptive_volatility_targets": "ADAPTIVE_VOLATILITY_TARGETS",
+    "veto_funding_window": "FUNDING_PROXIMITY_VETO_ENABLED",
 }
 # MTF 30m leg mode: STRICT (default) or LEAN (GAS default behavior).
 DASH_MTF_MODES = ("STRICT", "LEAN")
 # Deterministic veto codes the dashboard can toggle (default: all enabled).
 # Disabling a veto is an explicit operator choice and is logged as such.
 DASH_VETO_CODES = ("leverage_risk", "funding", "squeeze", "whale",
-                   "liq_wall", "btc_breaker", "sr_zone")
+                   "liq_wall", "btc_breaker", "sr_zone", "funding_window")
 # Signal strictness presets: ketat | sedang | biasa.
 # Choosing a mode applies its bundle to the individual dashboard settings
 # (quality gate, MTF 30m leg, 1d cascade leg, bullish-only, volume gate,
@@ -486,6 +521,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_liq_wall": True,
         "veto_btc_breaker": True,
         "veto_sr_zone": True,
+        "veto_funding_window": True,
     },
     "sedang": {
         "min_quality_score": 60,
@@ -507,6 +543,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_liq_wall": False,
         "veto_btc_breaker": True,
         "veto_sr_zone": True,
+        "veto_funding_window": True,
     },
     "biasa": {
         "min_quality_score": 50,
@@ -528,6 +565,7 @@ SIGNAL_MODE_PRESETS = {
         "veto_liq_wall": False,
         "veto_btc_breaker": False,
         "veto_sr_zone": False,
+        "veto_funding_window": False,
     },
 }
 # Vetoes currently disabled by the dashboard (populated by
@@ -595,6 +633,7 @@ DASHBOARD_DEFAULTS = {
     "veto_liq_wall": True,
     "veto_btc_breaker": True,
     "veto_sr_zone": True,       # S/R location: no short into 4h support / long into 4h resistance
+    "veto_funding_window": True,
     # universe
     "universe_mode": "top_movers",  # curated | top_volume | top_movers | all (GAS parity: top_movers)
     "universe_top_n": 30,        # 10-100, used when top_volume/top_movers
@@ -606,6 +645,7 @@ DASHBOARD_DEFAULTS = {
     "fixed_usdt": 10.0,          # USDT margin per position when fixed_usdt
     # risk: max position notional as % of balance (default 20 = safe)
     "max_exposure_pct_per_symbol": 20.0,
+    "max_positions_per_sector": 0,
     # profit take: close whole position at +% of margin (0 = off)
     "profit_take_pct": 0.0,
     # trailing stop: trigger +% of margin, distance % from peak (0 = off)

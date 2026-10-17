@@ -64,8 +64,14 @@ _COLUMNS = ("id", "symbol", "signal_id", "direction", "quality", "strength",
 class SignalDB:
     def __init__(self, path: str = "signals.db"):
         self.path = path
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = sqlite3.connect(path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.DatabaseError:
+            pass
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._conn.commit()

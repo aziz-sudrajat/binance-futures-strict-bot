@@ -238,6 +238,27 @@ class RiskManager:
         if notional > cap:
             return False, (f"notional ${notional:,.2f} exceeds per-symbol cap "
                            f"${cap:,.2f} ({cap_pct}% of balance)")
+
+        # Sector / Cluster Concentration Guard:
+        # Prevents opening multiple positions in the same sector (e.g. multiple Meme coins)
+        # to avoid highly correlated liquidation cascades.
+        max_per_sector = int(getattr(config, "MAX_POSITIONS_PER_SECTOR", 1) or 0)
+        if max_per_sector > 0:
+            get_sec = getattr(config, "get_symbol_sector", None)
+            sector = get_sec(symbol) if callable(get_sec) else None
+            if sector and self.state and hasattr(self.state, "get"):
+                open_positions = self.state.get("positions", {}) or {}
+                sector_positions = []
+                for p in open_positions.values():
+                    if not p.get("closed") and p.get("symbol"):
+                        p_sym = p.get("symbol")
+                        if callable(get_sec) and get_sec(p_sym) == sector:
+                            sector_positions.append(p_sym)
+                if len(sector_positions) >= max_per_sector:
+                    return False, (f"sector concentration limit reached for '{sector}': "
+                                   f"already holding {', '.join(sector_positions)} "
+                                   f"(max {max_per_sector} per sector)")
+
         return True, "ok"
 
     def record_realized(self, pnl: float) -> None:

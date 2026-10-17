@@ -87,6 +87,12 @@ auto-trade jalan. TUI curses lama (`tui.py`) tetap ada sebagai alternatif.
   posisi di-market-close. Tercatat sebagai event `profit_take` di lifecycle.
 - **Veto S/R** (`sr_zone`): menolak SHORT ke area support dan LONG ke area
   resistance (histori 4h ~2–3 bulan, zona 2.5× ATR). Aktif di mode ketat/sedang.
+- **Veto Funding Window** (`veto_funding_window`): menolak entri dalam jendela 15 menit
+  sebelum jam snapshot funding fee (00:00, 08:00, 16:00 UTC) jika funding rate berlawanan
+  dengan arah posisi melampaui 0.05% (5 bps). Menghilangkan instant fee drag & arb dump.
+- **Proteksi Klaster Sektor** (`max_positions_per_sector`, default 0 = off): membatasi
+  jumlah posisi aktif simultan dalam satu klaster sektor (MEME, AI_DATA, L1_MAJORS,
+  ALT_L1_L2, DEFI, GAMING_METAVERSE, INFRA_STORAGE) guna mencegah korelasi drawdown serentak.
 
 Mode adalah preset, bukan kunci — knob individual tetap bisa di-fine-tune
 manual setelahnya (`set` / editor `setting`). Berlaku tanpa restart.

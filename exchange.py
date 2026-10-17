@@ -66,6 +66,10 @@ class ExchangeClient:
         self.session = session or requests.Session()
         self._exchange_info: dict | None = None
         self._exchange_info_ts: float = 0.0
+        # listenKey acquired via create_listen_key(); required as a query
+        # param on the keepalive/close endpoints (they reject signed payloads
+        # AND unsigned requests missing the param).
+        self._listen_key: str | None = None
 
     # ------------------------------------------------------------ plumbing
     def _sign(self, params: dict) -> dict:
@@ -458,15 +462,29 @@ class ExchangeClient:
         """Create a user data stream listenKey (valid for 60m)."""
         try:
             res = self._request("POST", "/fapi/v1/listenKey", signed=False, key_only=True)
-            return res.get("listenKey") if isinstance(res, dict) else None
+            key = res.get("listenKey") if isinstance(res, dict) else None
+            self._listen_key = key  # keepalive/close need it as query param
+            return key
         except ExchangeError as e:
             log.warning("create_listen_key failed: %s", e)
+            self._listen_key = None
             return None
 
     def keepalive_listen_key(self) -> bool:
-        """Ping user data stream listenKey to prevent expiry."""
+        """Ping user data stream listenKey to prevent expiry.
+
+        Binance requires the listenKey as a query parameter on this
+        endpoint; without it the request is rejected (HTTP 400) and the
+        stream expires. Returns False if no key has been acquired yet.
+        """
+        key = self._listen_key
+        if not key:
+            log.warning("keepalive_listen_key: no listenKey acquired yet")
+            return False
         try:
-            self._request("PUT", "/fapi/v1/listenKey", signed=False, key_only=True)
+            self._request("PUT", "/fapi/v1/listenKey",
+                          params={"listenKey": key},
+                          signed=False, key_only=True)
             return True
         except ExchangeError as e:
             log.warning("keepalive_listen_key failed: %s", e)
@@ -474,10 +492,18 @@ class ExchangeClient:
 
     def close_listen_key(self) -> bool:
         """Close user data stream listenKey."""
+        key = self._listen_key
+        if not key:
+            log.warning("close_listen_key: no listenKey acquired yet")
+            return False
         try:
-            self._request("DELETE", "/fapi/v1/listenKey", signed=False, key_only=True)
+            self._request("DELETE", "/fapi/v1/listenKey",
+                          params={"listenKey": key},
+                          signed=False, key_only=True)
             return True
         except ExchangeError as e:
             log.warning("close_listen_key failed: %s", e)
             return False
+        finally:
+            self._listen_key = None
 

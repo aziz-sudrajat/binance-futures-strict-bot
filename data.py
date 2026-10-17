@@ -472,7 +472,15 @@ class MarketData:
         if not body or str(body.get("code")) != "0":
             raise ValueError(f"OKX {path}: code={body.get('code') if body else None}")
         data = body.get("data")
-        return data if isinstance(data, list) else []
+        rows = data if isinstance(data, list) else []
+        # M7: rubik endpoints don't guarantee chronological order, but every
+        # consumer reads rows[-1] as "latest". Sort oldest->newest by ts.
+        if "rubik" in path and rows and isinstance(rows[0], (list, tuple)):
+            try:
+                rows = sorted(rows, key=lambda r: r[0] if len(r) else 0)
+            except Exception:  # noqa: BLE001
+                pass
+        return rows
 
     @staticmethod
     def _num(v):

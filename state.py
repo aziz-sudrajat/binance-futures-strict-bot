@@ -18,9 +18,7 @@ Schema:
       "sl_order_id": int|None, "breakeven_moved": bool,
       "opened_at": ms, "unmanaged": bool, "entry_order_id": int|None } },
   "daily":  {"date": "YYYY-MM-DD", "start_balance": float, "realized_pnl": float},
-  "kill_switch": {"date": "YYYY-MM-DD", "active": bool, "reason": str},
-  "last_cycle_ts": ms epoch of the most recent executor scan cycle
-    (heartbeat for the dashboard /api/health check; 0 = never)
+  "kill_switch": {"date": "YYYY-MM-DD", "active": bool, "reason": str}
 }
 
 restart recovery: reconcile() compares state positions against the exchange's

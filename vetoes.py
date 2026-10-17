@@ -349,6 +349,29 @@ def run_vetoes(symbol: str, direction: str, market, snap: dict,
             _block("oi_flush", "veto",
                    f"OI flush cascade (OI {float(oi_chg):+.1f}% with {float(spike):.1f}x liq spike) — high slippage & cascade risk")
 
+    # V19 — Funding Window Proximity Veto:
+    # Protects against entering right before 8h funding fee snapshot (00:00, 08:00, 16:00 UTC)
+    # when funding rate is high against the position, preventing immediate fee drag.
+    if getattr(config, "FUNDING_PROXIMITY_VETO_ENABLED", True) and snap is not None:
+        funding_val = snap.get("aggregate_funding")
+        if _finite(funding_val):
+            f_val = float(funding_val)
+            max_rate = getattr(config, "FUNDING_PROXIMITY_MAX_RATE", 0.0005)
+            window_min = getattr(config, "FUNDING_PROXIMITY_WINDOW_MIN", 15)
+            now_sec = time.time()
+            sec_until_funding = 28800 - (now_sec % 28800)
+            min_until_funding = sec_until_funding / 60.0
+
+            if min_until_funding <= window_min:
+                if direction == "BULLISH" and f_val >= max_rate:
+                    _block("funding_window", "veto",
+                           f"Within {min_until_funding:.1f}m of 8h funding snapshot with high funding "
+                           f"{f_val*100:+.3f}% (>= +{max_rate*100:.3f}%) paying shorts — immediate funding drag")
+                elif direction == "BEARISH" and f_val <= -max_rate:
+                    _block("funding_window", "veto",
+                           f"Within {min_until_funding:.1f}m of 8h funding snapshot with negative funding "
+                           f"{f_val*100:+.3f}% (<= -{max_rate*100:.3f}%) paying longs — immediate funding drag")
+
     return blocks
 
 

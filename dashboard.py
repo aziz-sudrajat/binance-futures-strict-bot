@@ -412,6 +412,8 @@ SETTING_FIELDS: list[tuple[str, str, str]] = [
     ("veto_liq_wall", "Veto: liquidity wall", "bool"),
     ("veto_btc_breaker", "Veto: BTC breaker", "bool"),
     ("veto_sr_zone", "Veto: S/R zone", "bool"),
+    ("veto_funding_window", "Veto: funding window proximity", "bool"),
+    ("max_positions_per_sector", "Max positions / sector (0=off)", "int"),
     ("max_drawdown_cap_pct", "Max drawdown cap %", "float"),
     ("max_consecutive_losses", "Max consecutive losses", "int"),
     ("consecutive_loss_cooldown_hours", "Loss cooldown (jam)", "float"),

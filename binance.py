@@ -374,8 +374,8 @@ class BinanceShell:
             descs = {
                 "ketat": "GAS STRICT — quality ≥70, MTF STRICT, long-only, "
                          "semua veto ON",
-                "sedang": "quality ≥60, MTF LEAN, long-only, veto liq-wall OFF",
-                "biasa": "quality ≥50, MTF LEAN, SHORT diizinkan, veto inti "
+                "sedang": "quality ≥60, MTF STRICT, long-only, veto liq-wall OFF",
+                "biasa": "quality ≥50, MTF LEAN, SHORT diizinkan, semua veto OFF "
                          "saja",
             }
             for m in modes:

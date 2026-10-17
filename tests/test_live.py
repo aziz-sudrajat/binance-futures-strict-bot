@@ -231,17 +231,62 @@ def test_listenkey_create_sends_api_key_without_signature(monkeypatch):
 
 def test_listenkey_keepalive_sends_api_key_without_signature(monkeypatch):
     client, sess = _listenkey_client(monkeypatch, {"listenKey": "k" * 60})
+    assert client.create_listen_key() == "k" * 60
     assert client.keepalive_listen_key() is True
-    call = sess.calls[0]
+    call = sess.calls[1]
     assert call["method"] == "PUT"
     assert call["headers"].get("X-MBX-APIKEY") == "KEY123"
     assert "signature" not in call["params"]
+    assert "timestamp" not in call["params"]
+
+
+def test_listenkey_keepalive_sends_mandatory_listenkey_param(monkeypatch):
+    """Binance rejects PUT /fapi/v1/listenKey without the listenKey param."""
+    client, sess = _listenkey_client(monkeypatch, {"listenKey": "k" * 60})
+    assert client.create_listen_key() == "k" * 60
+    assert client.keepalive_listen_key() is True
+    call = sess.calls[1]
+    assert call["params"].get("listenKey") == "k" * 60
+
+
+def test_listenkey_keepalive_without_acquired_key_returns_false(monkeypatch):
+    """No HTTP call may be made when no listenKey was acquired."""
+    client, sess = _listenkey_client(monkeypatch)
+    assert client.keepalive_listen_key() is False
+    assert sess.calls == []
 
 
 def test_listenkey_close_sends_api_key_without_signature(monkeypatch):
     client, sess = _listenkey_client(monkeypatch, {"listenKey": "k" * 60})
+    assert client.create_listen_key() == "k" * 60
     assert client.close_listen_key() is True
-    call = sess.calls[0]
+    call = sess.calls[1]
     assert call["method"] == "DELETE"
     assert call["headers"].get("X-MBX-APIKEY") == "KEY123"
     assert "signature" not in call["params"]
+    assert "timestamp" not in call["params"]
+
+
+def test_listenkey_close_sends_mandatory_listenkey_param(monkeypatch):
+    """Binance rejects DELETE /fapi/v1/listenKey without the listenKey param."""
+    client, sess = _listenkey_client(monkeypatch, {"listenKey": "k" * 60})
+    assert client.create_listen_key() == "k" * 60
+    assert client.close_listen_key() is True
+    call = sess.calls[1]
+    assert call["params"].get("listenKey") == "k" * 60
+
+
+def test_listenkey_close_clears_stored_key(monkeypatch):
+    """After close, keepalive must refuse instead of pinging a dead key."""
+    client, sess = _listenkey_client(monkeypatch, {"listenKey": "k" * 60})
+    assert client.create_listen_key() == "k" * 60
+    assert client.close_listen_key() is True
+    n_calls = len(sess.calls)
+    assert client.keepalive_listen_key() is False
+    assert len(sess.calls) == n_calls
+
+
+def test_listenkey_close_without_acquired_key_returns_false(monkeypatch):
+    client, sess = _listenkey_client(monkeypatch)
+    assert client.close_listen_key() is False
+    assert sess.calls == []
